@@ -252,6 +252,16 @@ config THERMAL_MMIO
 	  register or shared memory, is a potential candidate to work with this
 	  driver.
 
+config HI3798_THERMAL
+	tristate "HiSilicon Hi3798MV200/MV300 temperature sensor"
+	depends on ARCH_HISI || COMPILE_TEST
+	depends on HAS_IOMEM
+	depends on OF
+	help
+	  Temperature sensor in the PMC block of the Hi3798MV200 and
+	  Hi3798MV300 set-top box SoCs. Unrelated to HISI_THERMAL, which
+	  drives a different sensor on Hi6220 and Hi3660.
+
 config HISI_THERMAL
 	tristate "Hisilicon thermal driver"
 	depends on ARCH_HISI || COMPILE_TEST
