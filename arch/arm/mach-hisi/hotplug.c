@@ -54,7 +54,7 @@
 #define CPU0_SRST_REQ_EN		(1 << 0)
 
 #define HIX5HD2_PERI_CRG20		0x50
-#define CRG20_CPU1_RESET		(1 << 17)
+#define CRG20_ARM_SRST(i)		BIT((i) + 16)
 
 #define HIX5HD2_PERI_PMC0		0x1000
 #define PMC0_CPU1_WAIT_MTCOMS_ACK	(1 << 8)
@@ -203,7 +203,7 @@ void hix5hd2_set_cpu(int cpu, bool enable)
 		writel_relaxed(val, ctrl_base + HIX5HD2_PERI_PMC0);
 		/* unreset */
 		val = readl_relaxed(ctrl_base + HIX5HD2_PERI_CRG20);
-		val &= ~CRG20_CPU1_RESET;
+		val &= ~CRG20_ARM_SRST(cpu);
 		writel_relaxed(val, ctrl_base + HIX5HD2_PERI_CRG20);
 	} else {
 		/* power down cpu1 */
@@ -211,10 +211,9 @@ void hix5hd2_set_cpu(int cpu, bool enable)
 		val |= PMC0_CPU1_PMC_ENABLE | PMC0_CPU1_POWERDOWN;
 		val &= ~PMC0_CPU1_WAIT_MTCOMS_ACK;
 		writel_relaxed(val, ctrl_base + HIX5HD2_PERI_PMC0);
-
 		/* reset */
 		val = readl_relaxed(ctrl_base + HIX5HD2_PERI_CRG20);
-		val |= CRG20_CPU1_RESET;
+		val |= CRG20_ARM_SRST(cpu);
 		writel_relaxed(val, ctrl_base + HIX5HD2_PERI_CRG20);
 	}
 }
