@@ -717,6 +717,94 @@
 			compatible = "hisilicon,histb-rng";
 			reg = <0xf8005000 0x1000>;
 		};
+
+		/*
+		 * USB2 host: two windows for one physical port set, which is how the
+		 * generic host drivers expect it -- EHCI takes high-speed, OHCI the
+		 * full/low-speed side. Both addresses are the vendor system's own
+		 * claims (`hiusb-ehci.0` 0xf9890000, `hiusb-ohci.0` 0xf9880000 in its
+		 * /proc/iomem, each one a 64 KiB window), and the interrupt IDs 98/99
+		 * in its /proc/interrupts
+		 * (`ehci_hcd:usb1`, `ohci_hcd:usb2`) are SPI 66/67 under the rule the
+		 * console uart, aiao and the MAC already confirm here.
+		 *
+		 * The clock handles are what keep the probe honest rather than what
+		 * turns the block on -- CRG46/CRG47 are raised by the clock provider
+		 * itself -- but naming them means the host drivers cannot bind before
+		 * the CRG has probed.
+		 */
+		usb2: usb@f9890000 {
+			compatible = "generic-ehci";
+			reg = <0xf9890000 0x10000>;
+			interrupts = <GIC_SPI 66 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&crg HI3716CV200_USB_BUS_CLK>,
+				 <&crg HI3716CV200_USB_PHY_CLK>;
+		};
+
+		usb3: usb@f9880000 {
+			compatible = "generic-ohci";
+			reg = <0xf9880000 0x10000>;
+			interrupts = <GIC_SPI 67 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&crg HI3716CV200_USB_BUS_CLK>,
+				 <&crg HI3716CV200_USB_PHY_CLK>;
+		};
+
+		/*
+		 */
+		usb4: usb@f98c0000 {
+			compatible = "snps,dwc2";
+			reg = <0xf98c0000 0x40000>;
+			interrupts = <GIC_SPI 68 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&crg HI3716CV200_USB_BUS_CLK>;
+			clock-names = "otg";
+			dr_mode = "peripheral";
+		};
+
+		/*
+		 * The PERI block: the supply and hold bits for the on-chip
+		 * peripherals, including the SATA disk supply the PHY driver
+		 * switches. The internal DAC lives in the same window and keeps
+		 * its own node.
+		 */
+		peri_syscon: system-control@f8a20000 {
+			compatible = "hisilicon,hi3716cv200-peri-syscon",
+				"syscon";
+			reg = <0xf8a20000 0x1000>;
+		};
+
+		/*
+		 * The SATA PHY shares the controller's window, and the block
+		 * answers nothing until CRG42's bus and cko-alive reset bits
+		 * have been pulsed -- measured on this board, where writing
+		 * HOST_CTL.AHCI_EN with the clocks already at the vendor's 0x1F
+		 * read back as zero until the pair was asserted and released.
+		 */
+		sata_phy: sata-phy@f9900000 {
+			compatible = "hisilicon,hi3716cv200-sata-phy";
+			reg = <0xf9900000 0x1000>;
+			resets = <&crg 0xa8 8>, <&crg 0xa8 9>;
+			#phy-cells = <0>;
+			hisilicon,peri-syscon = <&peri_syscon>;
+			hisilicon,power-reg = <0x8 10>;
+		};
+
+		/*
+		 * SATA: the vendor system claims `ahci.0` at 0xf9900000 with a 64 KiB
+		 * window and its `ahci` interrupt at ID 102, i.e. GIC_SPI 70. The
+		 * in-tree ahci_platform driver carries the Hisi case by name, so the
+		 * compatible is the one upstream already understands. Note the number
+		 * trap: 70 here is an SPI *index* (INTID 102), while the I2C adapters
+		 * above sit at INTIDs 70..73 -- different columns, no overlap.
+		 */
+		sata: sata@f9900000 {
+			compatible = "hisilicon,hisi-ahci";
+			reg = <0xf9900000 0x10000>;
+			interrupts = <GIC_SPI 70 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&crg HI3716CV200_SATA_BUS_CLK>,
+				 <&crg HI3716CV200_SATA_PHY_CLK>;
+			phys = <&sata_phy>;
+			phy-names = "sata-phy";
+		};
 	};
 };
 
