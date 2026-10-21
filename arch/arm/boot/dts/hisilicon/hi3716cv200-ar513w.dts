@@ -1,0 +1,31 @@
+// SPDX-License-Identifier: GPL-2.0-or-later OR MIT
+/*
+ * Huawei AR513W-V3M8: Hi3716CV200 (bigfish) with 1 GiB NAND,
+ * console on uart0. The NAND partition table belongs to the
+ * platform that owns it and is not described here.
+ */
+
+/dts-v1/;
+
+#include "hi3716cv200.dtsi"
+
+/ {
+	model = "Huawei AR513W-V3M8 (Hi3716CV200)";
+	compatible = "hisilicon,ar513w", "hisilicon,hi3716cv200";
+};
+
+
+/* The JPEG codec pair: transfers ran on this board. */
+&jpgd { status = "okay"; };
+&jpge { status = "okay"; };
+
+/*
+ * The video codecs. No `memory-region`: both queues are dma-contig
+ * and the driver binds the region that property names if there is
+ * one, but this kernel already reserves a 128 MiB default CMA area
+ * (CONFIG_CMA_SIZE_MBYTES), which is where the JPEG pair allocated
+ * on this board. A dedicated pool is only worth pricing in once a
+ * session needs more than that area can give.
+ */
+&vdec { status = "okay"; };
+&venc { status = "okay"; };
