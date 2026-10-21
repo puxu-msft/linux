@@ -873,6 +873,93 @@
 			 */
 			status = "disabled";
 		};
+
+		/*
+		 * Port 1 of the gigabit switch fabric, the one wired to the Hi3620 side
+		 * of this board (the vendor fastboot tftp path, and the vendor Linux
+		 * hix5hd2_gmac driver: STATION_ADDR_LOW 0x0, MAC_DUPLEX_HALF_CTRL 0x8,
+		 * PORT_MODE 0x40, PORT_EN 0x44, REC_FILT_CONTROL 0x64, RX_FQ_* 0x500+
+		 * match boot/fastboot/drivers/net/higmacv300/ctrl.h one for one, so no
+		 * new driver is needed. The interrupt is the gmac line the vendor
+		 * system's own /proc/interrupts reports (103 for gmac0, 104 for gmac1:
+		 * s40 machine header mach-s40/include/mach/irqs.h is not usable as a
+		 * table for this chip -- it puts INTNR_ETH at 32 + 51 = 83 and gives
+		 * I2C2/I2C3 the same numbers as I2C0/I2C1.
+		 */
+		/*
+		 */
+		gmac0: ethernet@f9840000 {
+			compatible = "hisilicon,hi3716cv200-gmac",
+				     "hisilicon,hisi-gmac-v1";
+			/*
+			 */
+			status = "disabled";
+			reg = <0xf9840000 0x1000>, <0xf984300c 0x4>;
+			interrupts = <GIC_SPI 71 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&crg HI3716CV200_GMAC0_CLK>;
+			clock-names = "mac_core";
+			resets = <&crg 0xcc 10>;
+			reset-names = "mac_ifc";
+			local-mac-address = [00 07 83 02 1a 28];
+			phy-mode = "mii";
+			phy-handle = <&phy0>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			phy0: ethernet-phy@1 {
+				reg = <1>;
+			};
+		};
+
+		gmac1: ethernet@f9841000 {
+			compatible = "hisilicon,hi3716cv200-gmac",
+				     "hisilicon,hisi-gmac-v1";
+			/*
+			 * The MAC register block and the external interface control
+			 * register the driver writes port speed/duplex into: for this
+			 * port that word is HIGMAC_MACIF1_CTRL
+			 * (boot/fastboot/drivers/net/higmacv300/ctrl.c:48 -- index 1
+			 * writes MACIF1, ctrl.h:16 -- 0xF9843010).
+			 */
+			reg = <0xf9841000 0x1000>, <0xf9843010 0x4>;
+			/*
+			 * GIC interrupt ID 104. Taken from the vendor system's own
+			 * raw.txt:153-159, where uart-pl011 is 81 -- the value my kernel
+			 * measures for the same device -- so that table is in interrupt
+			 * IDs, not Linux virtual numbers): gmac0 is 103, gmac1 is 104.
+			 * mach-s40/include/mach/irqs.h:39's single INTNR_ETH = 32 + 51 is
+			 * wrong the same way its I2C entries were.
+			 */
+			interrupts = <GIC_SPI 72 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&crg HI3716CV200_GMAC1_CLK>;
+			clock-names = "mac_core";
+			/*
+			 */
+			resets = <&crg 0xcc 11>;
+			reset-names = "mac_ifc";
+			/* the MAC the fastboot programs into SA_LOW/SA_HIGH for this port */
+			local-mac-address = [00 07 83 02 1a 29];
+			/*
+			 * No source available here describes the delays on this
+			 * PCB, so the port keeps plain rgmii: no tx or rx offset, no id.
+			 */
+			phy-mode = "rgmii";
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			/*
+			 * Measured: a single-command MDIO read of address 1 on this
+			 * port's bus (0xf98413c0/0xf98413c4) returns nothing while the
+			 * other port's bus has a device, yet the fastboot moves traffic
+			 * here -- the peer is the Hi3620's own MAC, so the link is
+			 * declared rather than negotiated.
+			 */
+			fixed-link {
+				speed = <1000>;
+				full-duplex;
+				pause;
+			};
+		};
 	};
 };
 
