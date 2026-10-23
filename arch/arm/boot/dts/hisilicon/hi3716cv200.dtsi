@@ -805,6 +805,74 @@
 			phys = <&sata_phy>;
 			phy-names = "sata-phy";
 		};
+
+		/*
+		 * NAND: the hinfc610 block the box roots itself on. Two windows because
+		 * the controller separates its register file from the byte window the
+		 * command, address and status bytes travel through -- the vendor driver
+		 * ioremaps the second one straight into the chip's IO_ADDR_R (the
+		 * node's own `reg` pair in the vendor tree is the same two ranges).
+		 * The ECC pair is what the running vendor system reports: CON reads
+		 * 0x383 with ECCTYPE 1, which this block's table calls 8 bits per
+		 * 1024-byte step, over a 2 KiB page.
+		 */
+		nandc: nand-controller@f9810000 {
+			compatible = "hisilicon,hi3716cv200-nand-controller";
+			reg = <0xf9810000 0x100>, <0xfe000000 0x2176>;
+			clocks = <&crg HI3716CV200_NAND_CLK>;
+			/* CRG24[4] nf_srst_req, the reset beside CRG24[0] nf_cken */
+			resets = <&crg 0x60 4>;
+			nand-ecc-strength = <8>;
+			nand-ecc-step-size = <1024>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+		};
+
+		/*
+		 * The two DesignWare MSH hosts the vendor calls SDIO0 and SDIO1
+		 *
+		 *
+		 *
+		 *
+		 *
+		 *
+		 */
+		sdio0: mmc@f9820000 {
+			compatible = "snps,dw-mshc";
+			reg = <0xf9820000 0x10000>;
+			interrupts = <GIC_SPI 34 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&crg HI3716CV200_SDIO0_CLK>,
+				 <&crg HI3716CV200_SDIO0_CLK>;
+			clock-names = "biu", "ciu";
+			bus-width = <4>;
+			max-frequency = <50000000>;
+			cap-sd-highspeed;
+			status = "disabled";
+		};
+
+		sdio1: mmc@f9830000 {
+			compatible = "snps,dw-mshc";
+			reg = <0xf9830000 0x10000>;
+			interrupts = <GIC_SPI 35 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&crg HI3716CV200_SDIO1_CLK>,
+				 <&crg HI3716CV200_SDIO1_CLK>;
+			clock-names = "biu", "ciu";
+			bus-width = <8>;
+			max-frequency = <50000000>;
+			cap-mmc-highspeed;
+			/*
+			 */
+			/*
+			 * The rail word (0xf8a2011c) reads 0x60, the vendor's 3.3 V setting
+			 * (himci_s40.c:181-191), and nothing here writes 0x20 for 1.8 V, so the
+			 * host stays on 3.3 V signalling.
+			 */
+			no-1-8-v;
+			/*
+			 *
+			 */
+			status = "disabled";
+		};
 	};
 };
 
