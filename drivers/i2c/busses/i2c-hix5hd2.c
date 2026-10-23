@@ -327,8 +327,28 @@ static int hix5hd2_i2c_xfer_msg(struct hix5hd2_i2c_priv *priv,
 	reinit_completion(&priv->msg_complete);
 	hix5hd2_i2c_message_start(priv, stop);
 
-	time_left = wait_for_completion_timeout(&priv->msg_complete,
-						priv->adap.timeout);
+	/*
+	 * The event does arrive, only later than the driver is willing to
+	 * wait: on a Hi3716CV200 the handler reported I2C_OVER_INTR (SR bit 0)
+	 * about 30 ms after a 100-jiffies wait -- 1 s at HZ=100 -- had given
+	 * up, ten times in a row.  Why the delivery is late is not settled
+	 * yet; until it is, wait in slices against a fixed 2 s deadline so a
+	 * late but real completion returns the transaction's own ACK/NACK
+	 * rather than -ETIMEDOUT.
+	 */
+	{
+		unsigned long deadline = jiffies + msecs_to_jiffies(2000);
+		unsigned int slice = 0;
+
+		time_left = 0;
+		while (slice < 200 && time_after(deadline, jiffies)) {
+			time_left = wait_for_completion_timeout(&priv->msg_complete,
+								msecs_to_jiffies(10));
+			if (time_left)
+				break;
+			slice++;
+		}
+	}
 	if (time_left == 0) {
 		priv->state = HIX5I2C_STAT_RW_ERR;
 		priv->err = -ETIMEDOUT;
