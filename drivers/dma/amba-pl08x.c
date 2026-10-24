@@ -75,6 +75,7 @@
 #include <linux/of.h>
 #include <linux/of_dma.h>
 #include <linux/pm_runtime.h>
+#include <linux/reset.h>
 #include <linux/seq_file.h>
 #include <linux/slab.h>
 #include <linux/amba/pl080.h>
@@ -863,7 +864,8 @@ static void pl08x_phy_alloc_and_start(struct pl08x_dma_chan *plchan)
 
 	ch = pl08x_get_phy_channel(pl08x, plchan);
 	if (!ch) {
-		dev_dbg(&pl08x->adev->dev, "no physical channel available for xfer on %s\n", plchan->name);
+		dev_dbg(&pl08x->adev->dev, "no physical channel available for xfer "
+			"on %s\n", plchan->name);
 		plchan->state = PL08X_CHAN_WAITING;
 		plchan->waiting_at = jiffies;
 		return;
@@ -1455,7 +1457,8 @@ static int pl08x_fill_llis_for_desc(struct pl08x_driver_data *pl08x,
 
 		if (total_bytes != dsg->len) {
 			dev_err(&pl08x->adev->dev,
-				"%s size of encoded lli:s don't match total txd, transferred 0x%08zx from size 0x%08zx\n",
+				"%s size of encoded lli:s don't match total txd, transferred "
+				"0x%08zx from size 0x%08zx\n",
 				__func__, total_bytes, dsg->len);
 			return 0;
 		}
@@ -2695,6 +2698,7 @@ static int pl08x_probe(struct amba_device *adev, const struct amba_id *id)
 	struct pl08x_driver_data *pl08x;
 	struct vendor_data *vd = id->data;
 	struct device_node *np = adev->dev.of_node;
+	struct reset_control *rst;
 	u32 tsfr_size;
 	int ret = 0;
 	int i;
@@ -2724,6 +2728,20 @@ static int pl08x_probe(struct amba_device *adev, const struct amba_id *id)
 		ret = -ENOMEM;
 		goto out_no_ioremap;
 	}
+
+	/*
+	 * Nothing below, not even the feature register, is readable while the
+	 * block is held in reset, and bootloaders increasingly leave unused
+	 * peripherals in reset for Linux to release.
+	 */
+	rst = devm_reset_control_get_optional_exclusive(&adev->dev, NULL);
+	if (IS_ERR(rst)) {
+		ret = PTR_ERR(rst);
+		goto out_no_ioremap;
+	}
+	ret = reset_control_deassert(rst);
+	if (ret)
+		goto out_no_ioremap;
 
 	if (vd->ftdmac020) {
 		u32 val;
@@ -2897,7 +2915,8 @@ static int pl08x_probe(struct amba_device *adev, const struct amba_id *id)
 
 			val = readl(ch->reg_config);
 			if (val & (PL080N_CONFIG_ITPROT | PL080N_CONFIG_SECPROT)) {
-				dev_info(&adev->dev, "physical channel %d reserved for secure access only\n", i);
+				dev_info(&adev->dev, "physical channel %d reserved for secure "
+					 "access only\n", i);
 				ch->locked = true;
 			}
 		}
