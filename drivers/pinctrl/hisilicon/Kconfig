@@ -14,4 +14,15 @@ config PINCTRL_HISTB
 	help
 	  Support HiSTB SoCs pinctrl module
 
+menu "HiSTB pinctrl drivers"
+	depends on PINCTRL_HISTB
+
+config PINCTRL_HI3798MV2X
+	tristate "HiSilicon Hi3798MV2X pinctrl driver"
+	depends on PINCTRL_HISTB
+	help
+	  Support IOCONFIG core on Hi3798MV2X SoCs
+
+endmenu
+
 endif
