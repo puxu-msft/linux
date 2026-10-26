@@ -1781,7 +1781,8 @@ static bool dw_mci_reset(struct dw_mci *host)
 		/* if the controller reset bit did clear, then set clock regs */
 		if (!(mci_readl(host, CTRL) & SDMMC_CTRL_RESET)) {
 			dev_err(host->dev,
-				"%s: fifo/dma reset bits didn't clear but ciu was reset, doing clock update\n",
+				"%s: fifo/dma reset bits didn't clear but ciu was reset, doing "
+				"clock update\n",
 				__func__);
 			goto ciu_out;
 		}
@@ -3125,7 +3126,8 @@ static int dw_mci_parse_dt(struct dw_mci *host)
 
 	if (!host->fifo_depth && device_property_read_u32(dev, "fifo-depth", &host->fifo_depth))
 		dev_info(dev,
-			 "fifo-depth property not found, using value of FIFOTH register as default\n");
+			 "fifo-depth property not found, using value of FIFOTH register as "
+			 "default\n");
 
 	if (!host->detect_delay_ms)
 		device_property_read_u32(dev, "card-detect-delay",
