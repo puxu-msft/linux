@@ -1,0 +1,1159 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+/*
+ * HiSilicon Hi3798MV100 / Hi3716CV200 stateless decoder backend.
+ *
+ * This generation decodes out of the VDM message pool: the protocol sources
+ * pack the parsed syntax into fixed message slots, the VDM is programmed and
+ * the doorbell rung, and a threaded interrupt finishes the frame.  The V4L2
+ * node, the queues and the request validation live in histb_vdec_core.c.
+ */
+
+#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
+
+#include <linux/bitfield.h>
+#include <linux/clk.h>
+#include <linux/dma-buf.h>
+#include <linux/dma-mapping.h>
+#include <linux/interrupt.h>
+#include <linux/io.h>
+#include <linux/mutex.h>
+#include <linux/of_device.h>
+#include <linux/of_reserved_mem.h>
+#include <linux/platform_device.h>
+#include <linux/pm.h>
+#include <linux/pm_runtime.h>
+#include <linux/reset.h>
+#include <linux/slab.h>
+#include <linux/spinlock.h>
+#include <linux/workqueue.h>
+#include <media/media-device.h>
+#include <media/media-request.h>
+#include <media/v4l2-dev.h>
+#include <media/v4l2-event.h>
+#include <media/v4l2-ioctl.h>
+#include <media/videobuf2-dma-contig.h>
+
+#include "histb_vdec_v2.h"
+
+/* The core casts the allocation to its prefix; both layouts must agree. */
+static_assert(offsetof(struct histb_vdec_ctx, fh) == offsetof(struct histb_vdec_core_ctx, fh));
+static_assert(offsetof(struct histb_vdec_ctx, ctrl_hdl) ==
+	      offsetof(struct histb_vdec_core_ctx, ctrl_hdl));
+static_assert(offsetof(struct histb_vdec_ctx, desc) == offsetof(struct histb_vdec_core_ctx, desc));
+static_assert(offsetof(struct histb_vdec_ctx, out_fmt) ==
+	      offsetof(struct histb_vdec_core_ctx, out_fmt));
+static_assert(offsetof(struct histb_vdec_ctx, cap_fmt) ==
+	      offsetof(struct histb_vdec_core_ctx, cap_fmt));
+
+/*
+ * The core hands v4l2 the common prefix and this backend casts it back, which
+ * holds while that prefix sits at offset zero.
+ */
+static_assert(offsetof(struct histb_vdec_dev, common) == 0);
+
+
+static const struct histb_vdec_codec_ops *
+histb_vdec_v2_ops(const struct histb_vdec_ctx *ctx)
+{
+	return ctx->desc->ops;
+}
+
+/*
+ * The codec descriptors are extern objects, so C can not aggregate them into
+ * the by-value histb_vdec_fmts[] array the driver contract declares; the list
+ * is carried as pointers instead.
+ */
+static const histb_vdec_fmt_desc *const histb_vdec_fmt_list[] = {
+	&histb_vdec_h264_fmt,
+	&histb_vdec_hevc_fmt,
+	&histb_vdec_mpeg2_fmt,
+	&histb_vdec_mpeg4_fmt,
+	&histb_vdec_h263_fmt,
+};
+
+/*
+ * Hi3716CV200 runs an older VDH generation than Hi3798MV100. Its register
+ * offsets and every message block this driver programs are the same, but HEVC
+ * is missing outright: that generation has no HEVC header at all, its report
+ * word keeps the two CTB-size bits reserved, and the chip's own capability
+ * list is the Hi3798MV100 list without HEVC. So this list is the one above
+ * minus HEVC, and the first entry stays the default fourcc for both.
+ */
+static const histb_vdec_fmt_desc *const histb_vdec_fmt_list_cv200[] = {
+	&histb_vdec_h264_fmt,
+	&histb_vdec_mpeg2_fmt,
+	&histb_vdec_mpeg4_fmt,
+	&histb_vdec_h263_fmt,
+};
+
+static const struct histb_vdec_chip histb_vdec_v2_chip_mv100 = {
+	.model = "HI3798MV100 VDH",
+	.fmts = histb_vdec_fmt_list,
+	.num_fmts = ARRAY_SIZE(histb_vdec_fmt_list),
+};
+
+static const struct histb_vdec_chip histb_vdec_v2_chip_cv200 = {
+	.model = "HI3716CV200 VDH",
+	.fmts = histb_vdec_fmt_list_cv200,
+	.num_fmts = ARRAY_SIZE(histb_vdec_fmt_list_cv200),
+};
+
+static struct histb_vdec_dev *histb_vdec_dev_of(struct histb_vdec_ctx *ctx)
+{
+	return video_get_drvdata(ctx->fh.vdev);
+}
+
+static unsigned int histb_vdec_stride(const struct histb_vdec_ctx *ctx,
+				      unsigned int width)
+{
+	return ctx->desc->stride(width);
+}
+
+static unsigned int histb_vdec_frame_size(const struct histb_vdec_ctx *ctx,
+					  unsigned int width,
+					  unsigned int height)
+{
+	return histb_vdec_frame_bytes(histb_vdec_stride(ctx, width),
+				      ALIGN(height, ctx->desc->grid_align));
+}
+
+static void histb_vdec_set_frame_size(struct histb_vdec_ctx *ctx,
+				      struct v4l2_format *f,
+				      unsigned int width, unsigned int height)
+{
+	struct v4l2_pix_format_mplane *pix = &f->fmt.pix_mp;
+
+	pix->width = width;
+	pix->height = height;
+	pix->plane_fmt[0].bytesperline = histb_vdec_stride(ctx, width);
+	pix->plane_fmt[0].sizeimage = histb_vdec_frame_size(ctx, width, height);
+}
+
+static void histb_vdec_set_cap_size(struct histb_vdec_ctx *ctx,
+				    struct v4l2_format *f,
+				    unsigned int width, unsigned int height)
+{
+	struct v4l2_pix_format_mplane *pix = &f->fmt.pix_mp;
+	unsigned int bpl;
+
+	bpl = max_t(u32, ALIGN(width, 16),
+		    round_up(pix->plane_fmt[0].bytesperline, 16));
+	pix->width = width;
+	pix->height = height;
+	pix->plane_fmt[0].bytesperline = bpl;
+	pix->plane_fmt[0].sizeimage = (size_t)bpl * height * 3 / 2;
+}
+
+int histb_vdec_cap_dims(struct histb_vdec_ctx *ctx, unsigned int *w,
+			unsigned int *h)
+{
+	const struct v4l2_pix_format_mplane *pix =
+		&ctx->cap_fmt.fmt.pix_mp;
+
+	*w = pix->width;
+	*h = pix->height;
+	return 0;
+}
+
+void histb_vdec_buf_geom(struct histb_vdec_ctx *ctx, unsigned int *stride,
+			 unsigned int *lines)
+{
+	unsigned int w, h;
+
+	histb_vdec_cap_dims(ctx, &w, &h);
+	*stride = histb_vdec_stride(ctx, w);
+	*lines = ALIGN(h, ctx->desc->grid_align);
+}
+
+static struct histb_vdec_frame *
+histb_vdec_frame_get(struct histb_vdec_ctx *ctx, unsigned int index)
+{
+	struct histb_vdec_dev *dev = histb_vdec_dev_of(ctx);
+	struct histb_vdec_frame *frame;
+	unsigned int stride, lines, w, h;
+	size_t size;
+
+	if (index >= HISTB_VDEC_MAX_DPB_SLOTS)
+		return NULL;
+	frame = &ctx->frame[index];
+	histb_vdec_buf_geom(ctx, &stride, &lines);
+	histb_vdec_cap_dims(ctx, &w, &h);
+	size = histb_vdec_frame_size(ctx, w, h);
+	if (frame->dma && frame->stride == stride && frame->lines == lines &&
+	    frame->size >= size)
+		return frame;
+
+	if (frame->dma)
+		dma_free_wc(dev->memdev, frame->size, frame->va, frame->dma);
+	memset(frame, 0, sizeof(*frame));
+	frame->va = dma_alloc_wc(dev->memdev, size, &frame->dma, GFP_KERNEL);
+	if (!frame->va) {
+		memset(frame, 0, sizeof(*frame));
+		return NULL;
+	}
+	frame->size = size;
+	frame->stride = stride;
+	frame->lines = lines;
+	return frame;
+}
+
+dma_addr_t histb_vdec_frame_dma(struct histb_vdec_ctx *ctx,
+				struct vb2_buffer *vb)
+{
+	struct histb_vdec_frame *frame = histb_vdec_frame_get(ctx, vb->index);
+
+	return frame ? frame->dma : 0;
+}
+
+
+
+void histb_vdec_frames_free(struct histb_vdec_ctx *ctx)
+{
+	struct histb_vdec_dev *dev = histb_vdec_dev_of(ctx);
+	unsigned int i;
+
+	for (i = 0; i < HISTB_VDEC_MAX_DPB_SLOTS; i++) {
+		struct histb_vdec_frame *frame = &ctx->frame[i];
+
+		if (!frame->dma)
+			continue;
+		dma_free_wc(dev->memdev, frame->size, frame->va, frame->dma);
+		memset(frame, 0, sizeof(*frame));
+	}
+}
+
+static void histb_vdec_frame_to_linear(struct histb_vdec_ctx *ctx,
+				       struct vb2_v4l2_buffer *dst)
+{
+	struct v4l2_pix_format_mplane *pix =
+		&ctx->cap_fmt.fmt.pix_mp;
+	struct histb_vdec_frame *frame;
+	struct vb2_buffer *vb = &dst->vb2_buf;
+	struct dma_buf *dbuf = vb->planes[0].dbuf;
+	unsigned int w = pix->width, h = pix->height;
+	unsigned int bpl = pix->plane_fmt[0].bytesperline;
+	/*
+	 * The VDM's tile chroma is Cr first, i.e. NV21; measured on a stream
+	 * whose U and V differ (a red frame and a flat 64/192 fixture, both
+	 * checked against an ffmpeg decode of the same bitstream: V=191, U=65,
+	 * and the tile frame carries bf 41). An NV12 frame therefore swaps the
+	 * pair and an NV21 frame takes it as is.
+	 */
+	bool swap_uv = pix->pixelformat == V4L2_PIX_FMT_NV12;
+	unsigned int uv, x, y, cy;
+	const u8 *src;
+	u8 *out;
+
+	if (vb->index >= HISTB_VDEC_MAX_DPB_SLOTS)
+		goto no_frame;
+	frame = &ctx->frame[vb->index];
+	out = vb2_plane_vaddr(vb, 0);
+	if (!frame->va || !out)
+		goto no_frame;
+
+	uv = frame->stride * ALIGN(frame->lines, 32) +
+	     16 * ALIGN(frame->lines, 32);
+	src = frame->va;
+	/* The CPU writes this plane; whoever imported it reads it afterwards. */
+	if (dbuf && dma_buf_begin_cpu_access(dbuf, DMA_TO_DEVICE))
+		goto no_frame;
+
+	for (y = 0; y < h; y++) {
+		const u8 *srow = src + (y / 16) * frame->stride * 16 +
+				 (y % 16) * 256;
+		u8 *drow = out + (size_t)y * bpl;
+
+		for (x = 0; x < w; x += 256)
+			memcpy(drow + x, srow + (x / 256) * 4096,
+			       min(256u, w - x));
+	}
+	for (cy = 0; cy < h / 2; cy++) {
+		const u8 *srow = src + uv + (cy / 8) * frame->stride * 8 +
+				 (cy % 8) * 256;
+		u8 *drow = out + (size_t)bpl * h + (size_t)cy * bpl;
+
+		for (x = 0; x < w; x += 256) {
+			const u8 *s = srow + (x / 256) * 2048;
+			u8 *d = drow + x;
+			unsigned int chunk = min(256u, w - x);
+			unsigned int i;
+
+			if (!swap_uv) {
+				memcpy(d, s, chunk);
+				continue;
+			}
+			for (i = 0; i + 1 < chunk; i += 2) {
+				d[i] = s[i + 1];
+				d[i + 1] = s[i];
+			}
+		}
+	}
+	if (dbuf)
+		dma_buf_end_cpu_access(dbuf, DMA_TO_DEVICE);
+
+	vb2_set_plane_payload(vb, 0, (size_t)bpl * h * 3 / 2);
+	return;
+
+no_frame:
+	/* No deliverable copy: say so with an empty payload instead of stale
+	 * bytes from the previous job (a refusal has to be visible).
+	 */
+	vb2_set_plane_payload(vb, 0, 0);
+}
+
+static bool histb_vdec_job_take(struct histb_vdec_dev *dev,
+				struct histb_vdec_job *out)
+{
+	struct histb_vdec_common *common = &dev->common;
+	unsigned long flags;
+
+	spin_lock_irqsave(&common->job_lock, flags);
+	if (!dev->common.job_running) {
+		spin_unlock_irqrestore(&common->job_lock, flags);
+		return false;
+	}
+	*out = common->job;
+	dev->common.job_running = false;
+	common->job = (struct histb_vdec_job){};
+	spin_unlock_irqrestore(&common->job_lock, flags);
+	return true;
+}
+
+/*
+ * @produced tells the two error paths apart. The engine raising DEC_ERR over a
+ * picture it wrote is not the same event as a job that never reached the
+ * engine: the stateless API asks the driver to hand back the (likely corrupted)
+ * frame in the first case and nothing at all in the second, and only the second
+ * is what a refusal looks like from the client side.
+ */
+static void histb_vdec_job_complete(struct histb_vdec_dev *dev,
+				    const struct histb_vdec_job *job,
+				    enum vb2_buffer_state state, bool produced)
+{
+	struct vb2_v4l2_buffer *dst =
+		v4l2_m2m_next_dst_buf(job->ctx->fh.m2m_ctx);
+
+	if (dst) {
+		if (produced)
+			histb_vdec_frame_to_linear((struct histb_vdec_ctx *)job->ctx, dst);
+		else
+			vb2_set_plane_payload(&dst->vb2_buf, 0, 0);
+	}
+	v4l2_m2m_buf_done_and_job_finish(dev->common.m2m_dev, job->ctx->fh.m2m_ctx,
+					 state);
+	pm_runtime_put_autosuspend(dev->dev);
+}
+
+static unsigned int histb_vdec_count_slices(u32 state)
+{
+	unsigned int num = FIELD_GET(VDM_STATE_SLICE_NUM, state);
+
+	/*
+	 * The upstream pool carries one 4-word report per decoded slice; the
+	 * per-slice status fields are not interpreted yet, the count only feeds
+	 * the debug output.
+	 */
+	return min_t(unsigned int, num, HISTB_VDEC_MAX_UP_SLICES);
+}
+
+static void histb_vdec_dump_up(struct histb_vdec_dev *dev, unsigned int slices,
+			       bool failed)
+{
+	const u32 *up = histb_vdec_up_msgs(&dev->pool);
+	unsigned int n = min_t(unsigned int, slices, 16);
+	unsigned int i;
+
+	for (i = 0; i < n; i++)
+		dev_dbg(dev->dev, "up%u=%08x %08x %08x %08x\n", i,
+			up[4 * i], up[4 * i + 1], up[4 * i + 2],
+			up[4 * i + 3]);
+	if (failed && slices)
+		dev_err(dev->dev, "failed frame: %u slice reports\n", slices);
+}
+
+static void histb_vdec_report_failure(struct histb_vdec_dev *dev, u32 state,
+				      unsigned int slices)
+{
+	const u32 *up = histb_vdec_up_msgs(&dev->pool);
+	unsigned int n = min_t(unsigned int, slices, HISTB_VDEC_MAX_UP_SLICES);
+	unsigned int i, lines = 0;
+	u32 max_end = 0;
+	u32 off;
+
+	for (i = 0; i < n; i++)
+		max_end = max(max_end, up[4 * i + 2]);
+
+	dev_err(dev->dev,
+		"engine-flagged frame: state=%#010x slices=%u end_mb=%u/%u\n",
+		state, slices, max_end, dev->mb_total);
+
+	for (off = VDM_SED_STA; off <= VDM_SED_LAST && lines < 4; off += 0x10) {
+		u32 a = vdm_read(dev, off), b = vdm_read(dev, off + 4);
+		u32 c = vdm_read(dev, off + 8), d = vdm_read(dev, off + 12);
+
+		if (!(a | b | c | d))
+			continue;
+		dev_err(dev->dev,
+			"sed %03x=%08x %03x=%08x %03x=%08x %03x=%08x\n",
+			off, a, off + 4, b, off + 8, c, off + 12, d);
+		lines++;
+	}
+}
+
+irqreturn_t histb_vdec_irq_handler(int irq, void *priv)
+{
+	struct histb_vdec_dev *dev = priv;
+	struct histb_vdec_job job;
+	unsigned int slices;
+	bool short_cov, deliver_err;
+	u32 state;
+
+	/*
+	 * Use the state the primary handler captured: clearing INT_STATE drops
+	 * the latched frame-done condition, so a re-read here would already
+	 * show an idle VDM and the job would never be completed.
+	 */
+	state = dev->irq_state;
+	if (!(state & VDM_STATE_DEC_OVER))
+		return IRQ_HANDLED;
+
+	if (!histb_vdec_job_take(dev, &job))
+		return IRQ_HANDLED;
+
+	slices = histb_vdec_count_slices(state);
+	dev_dbg(dev->dev, "frame done: %u slices%s\n", slices,
+		(state & VDM_STATE_DEC_ERR) ? ", decode error" : "");
+	histb_vdec_dump_up(dev, slices, state & VDM_STATE_DEC_ERR);
+
+	/*
+	 * One 4-word report per slice; word 2 is the last macroblock the slice
+	 * covered (measured: a 300-MB picture reports 0x12b, and a stream cut
+	 * mid-slice reports the shorter end). Coverage is judged whenever the front
+	 * end reports a macroblock total, and a frame whose reports stop short is
+	 * always recovered from below; only for MPEG-2 does it also decide what the
+	 * client is told, because that front end raises DEC_ERR on pictures this
+	 * check can prove complete.
+	 */
+	short_cov = false;
+	if (dev->mb_total && slices) {
+		const u32 *up = histb_vdec_up_msgs(&dev->pool);
+		u32 max_end = 0;
+		bool bad = false;
+		unsigned int i;
+
+		for (i = 0; i < slices && i < HISTB_VDEC_MAX_UP_SLICES; i++) {
+			u32 end = up[4 * i + 2];
+
+			if (end >= dev->mb_total)
+				bad = true;
+			max_end = max(max_end, end);
+		}
+		if (!bad && max_end != dev->mb_total - 1)
+			bad = true;
+		if (bad) {
+			dev_err(dev->dev,
+				"frame decoded only %u of %u macroblocks\n",
+				max_end + 1, dev->mb_total);
+			short_cov = true;
+		}
+	}
+
+	/*
+	 * A picture the engine flagged leaves the VDM pipeline in a state the next
+	 * frame cannot be programmed out of: measured on the board, an MPEG-2
+	 * picture that ended with DEC_ERR set made every subsequent frame hang
+	 * (H.264 alone 4/4 clean, H.264 right after one MPEG-2 picture 8/8 timed
+	 * out with the engine not reading a single macroblock), and only the CRG
+	 * reset recovered it. Reset here so an errored stream cannot poison the
+	 * next job, whatever opened it.
+	 */
+	if ((state & VDM_STATE_DEC_ERR) || short_cov) {
+		if (!((struct histb_vdec_ctx *)job.ctx)->diag_reported) {
+			histb_vdec_report_failure(dev, state, slices);
+			((struct histb_vdec_ctx *)job.ctx)->diag_reported = true;
+		}
+		histb_vdec_hw_reset(dev);
+	}
+
+	/*
+	 * The engine raises DEC_ERR on pictures whose data ends exactly at the
+	 * declared length even when every macroblock was decoded; measured on the
+	 * board, an MPEG-2 picture carrying the bit still matches a software decode
+	 * in luma (MSE 4, corr 0.9993). For the protocols whose front end reports a
+	 * macroblock total (MPEG-1/2) coverage decides delivery and the bit alone is
+	 * not a failure; the other front ends keep the old rule.
+	 */
+	if (dev->mb_total && slices &&
+	    job.ctx->desc->vidstd == HISTB_VIDSTD_MPEG2)
+		deliver_err = short_cov;
+	else
+		deliver_err = state & VDM_STATE_DEC_ERR;
+
+	cancel_delayed_work(&dev->watchdog);
+	histb_vdec_job_complete(dev, &job,
+				deliver_err ? VB2_BUF_STATE_ERROR :
+					      VB2_BUF_STATE_DONE, true);
+	return IRQ_HANDLED;
+}
+
+static bool histb_vdec_hw_irq_status(struct histb_vdec_dev *dev, u32 *state)
+{
+	u32 val = vdm_read(dev, VDM_STATE);
+
+	if (!(val & VDM_STATE_DEC_OVER))
+		return false;
+
+	*state = val;
+	vdm_write(dev, VDM_INT_STATE, 0xffffffff);
+	return true;
+}
+
+static irqreturn_t histb_vdec_hardirq(int irq, void *priv)
+{
+	struct histb_vdec_dev *dev = priv;
+	u32 state;
+
+	if (!histb_vdec_hw_irq_status(dev, &state))
+		return IRQ_NONE;
+
+	dev->irq_state = state;
+	return IRQ_WAKE_THREAD;
+}
+
+static void histb_vdec_watchdog(struct work_struct *work)
+{
+	struct histb_vdec_dev *dev =
+		container_of(to_delayed_work(work), struct histb_vdec_dev,
+			     watchdog);
+	struct histb_vdec_job job;
+
+	if (!histb_vdec_job_take(dev, &job))
+		return;
+
+	/* Claimed: the frame is ours to recover, and no IRQ thread can complete
+	 * it from under us any more.
+	 *
+	 * The state and the per-picture counters have to be read here: the
+	 * reset below wipes them, and a timeout whose engine never asked for a
+	 * single read is a different bug from one that decoded the whole
+	 * picture without ever raising end-of-video.
+	 */
+	dev_err(dev->dev,
+		"frame decode timed out (state=%#010x int=%#010x cycle=%u rd=%u wr=%u), resetting "
+		"the VDM\n",
+		vdm_read(dev, VDM_STATE), vdm_read(dev, VDM_INT_STATE),
+		vdm_read(dev, VDM_DEC_CYCLE_PER_PIC),
+		vdm_read(dev, VDM_RD_REQ_PER_PIC),
+		vdm_read(dev, VDM_WR_REQ_PER_PIC));
+	histb_vdec_hw_reset(dev);
+	histb_vdec_job_complete(dev, &job, VB2_BUF_STATE_ERROR, false);
+}
+
+static void histb_vdec_device_run(void *priv)
+{
+	struct histb_vdec_ctx *ctx = priv;
+	struct histb_vdec_dev *dev = histb_vdec_dev_of(ctx);
+	struct histb_vdec_common *common = &dev->common;
+	struct histb_vdec_job job_record;
+	struct vb2_v4l2_buffer *src, *dst;
+	unsigned int gen;
+	unsigned long flags;
+	int ret;
+
+	src = v4l2_m2m_next_src_buf(ctx->fh.m2m_ctx);
+	dst = v4l2_m2m_next_dst_buf(ctx->fh.m2m_ctx);
+	if (WARN_ON(!src) || WARN_ON(!dst))
+		return;
+
+	if (READ_ONCE(dev->common.removing)) {
+		/*
+		 * v4l2_m2m_suspend() waits for the context that is current, not
+		 * for every one that is queued, so a job can still be scheduled
+		 * while the teardown runs. Hand the buffers back rather than
+		 * doorbell a block that is about to lose its clock.
+		 */
+		goto err_finish_no_pm;
+	}
+
+	ret = pm_runtime_resume_and_get(dev->dev);
+	if (ret) {
+		dev_dbg(dev->dev, "pm resume failed: %d\n", ret);
+		goto err_finish_no_pm;
+	}
+
+	mutex_lock(&dev->hw_lock);
+
+	spin_lock_irqsave(&common->job_lock, flags);
+	if (WARN_ON(dev->common.job_running)) {
+		spin_unlock_irqrestore(&common->job_lock, flags);
+		mutex_unlock(&dev->hw_lock);
+		pm_runtime_put_autosuspend(dev->dev);
+		return;
+	}
+	dev->common.job_running = true;
+	common->job_gen++;
+	common->job = (struct histb_vdec_job){ (struct histb_vdec_core_ctx *)ctx, common->job_gen };
+	gen = common->job.gen;
+	spin_unlock_irqrestore(&common->job_lock, flags);
+
+	/*
+	 * Apply the controls attached to the source buffer's request; the
+	 * request is completed right away because the message assembly below
+	 * has already consumed the control values.
+	 */
+	/* The front end reports the macroblocks it submitted, if it knows. */
+	dev->mb_total = 0;
+	ret = v4l2_ctrl_request_setup(src->vb2_buf.req_obj.req,
+				      &ctx->ctrl_hdl);
+	if (ret) {
+		dev_dbg(dev->dev, "request setup failed: %d\n", ret);
+		goto err_job;
+	}
+
+	v4l2_m2m_buf_copy_metadata(src, dst);
+
+	/*
+	 * The protocol front ends walks the bitstream with the CPU to pack the
+	 * message slots, so the whole of that walk goes inside one access window
+	 * on the source plane.
+	 */
+	ret = histb_vdec_src_cpu_begin(&src->vb2_buf);
+	if (ret) {
+		dev_dbg(dev->dev, "source cpu access failed: %d\n", ret);
+		goto err_job;
+	}
+	ret = histb_vdec_v2_ops(ctx)->run(ctx, src, dst);
+	histb_vdec_src_cpu_end(&src->vb2_buf);
+	if (ret) {
+		dev_dbg(dev->dev, "run refused: %d (out fourcc %4.4s)\n", ret,
+			(char *)&ctx->desc->fourcc);
+		/*
+		 * The empty payload this path ends up delivering is the only
+		 * signal that separates a refusal from a picture the engine
+		 * flagged. Measured on the board, V4L2_BUF_FLAG_ERROR is set on
+		 * every capture buffer of these streams - the pictures that
+		 * decoded byte-exactly included - so the flag cannot tell the
+		 * two apart, while a client that reads the flag alone would
+		 * display the previous contents of the buffer as new output.
+		 */
+		goto err_job;
+	}
+
+	/*
+	 * The message assembly above consumed this request's control values, so
+	 * its control object can be completed right away; the buffer object is
+	 * completed when the job finishes.
+	 */
+	v4l2_ctrl_request_complete(src->vb2_buf.req_obj.req, &ctx->ctrl_hdl);
+
+	/* hw_lock only guards the assembly and the doorbell; completion paths
+	 * never take it, so it must not stay held across the wait.
+	 */
+	mutex_unlock(&dev->hw_lock);
+	schedule_delayed_work(&dev->watchdog, HISTB_VDEC_TIMEOUT);
+	dev_dbg(dev->dev, "job %u programmed\n", gen);
+	return;
+
+err_job:
+	v4l2_ctrl_request_complete(src->vb2_buf.req_obj.req, &ctx->ctrl_hdl);
+	mutex_unlock(&dev->hw_lock);
+	if (histb_vdec_job_take(dev, &job_record))
+		histb_vdec_job_complete(dev, &job_record,
+					VB2_BUF_STATE_ERROR, false);
+	return;
+
+err_finish_no_pm:
+	v4l2_ctrl_request_complete(src->vb2_buf.req_obj.req, &ctx->ctrl_hdl);
+	v4l2_m2m_buf_done_and_job_finish(dev->common.m2m_dev, ctx->fh.m2m_ctx,
+					 VB2_BUF_STATE_ERROR);
+}
+
+static void histb_vdec_job_abort(void *priv)
+{
+	struct histb_vdec_ctx *ctx = priv;
+	struct histb_vdec_dev *dev = histb_vdec_dev_of(ctx);
+	struct histb_vdec_job job;
+	bool got;
+
+	/*
+	 * hw_lock keeps the claim from landing in the middle of device_run's
+	 * assembly: the job is marked running before the registers are written, so
+	 * without it the reset below could interleave with those writes and the
+	 * doorbell could still be rung afterwards.
+	 */
+	mutex_lock(&dev->hw_lock);
+	got = histb_vdec_job_take(dev, &job);
+	mutex_unlock(&dev->hw_lock);
+	if (!got)
+		return;
+
+	cancel_delayed_work_sync(&dev->watchdog);
+	dev_dbg(dev->dev, "job %u aborted\n", job.gen);
+	histb_vdec_hw_reset(dev);
+	histb_vdec_job_complete(dev, &job, VB2_BUF_STATE_ERROR, false);
+}
+
+static const struct v4l2_m2m_ops histb_vdec_m2m_ops = {
+	.device_run = histb_vdec_device_run,
+	.job_abort = histb_vdec_job_abort,
+};
+
+static int histb_vdec_runtime_suspend(struct device *dev)
+{
+	struct histb_vdec_dev *vdec = dev_get_drvdata(dev);
+
+	/* Stop first, then make sure no latched report can fire on the way
+	 * down; the clocks are the last thing to go.
+	 */
+	vdm_write(vdec, VDM_START, 0);
+	vdm_write(vdec, VDM_INT_MASK, 0xffffffff);
+	vdm_write(vdec, VDM_INT_STATE, 0xffffffff);
+	clk_bulk_disable_unprepare(vdec->num_clks, vdec->clks);
+	return 0;
+}
+
+static int histb_vdec_runtime_resume(struct device *dev)
+{
+	struct histb_vdec_dev *vdec = dev_get_drvdata(dev);
+
+	int ret;
+
+	ret = clk_bulk_prepare_enable(vdec->num_clks, vdec->clks);
+	if (ret)
+		return ret;
+
+	/* Registers return whatever the power domain left; mask and clear so a
+	 * stale report cannot be taken for the next job's completion.
+	 */
+	return histb_vdec_hw_init(vdec);
+}
+
+static int histb_vdec_pool_alloc(struct histb_vdec_dev *dev)
+{
+	struct histb_vdec_msgpool *pool = &dev->pool;
+
+	/*
+	 * pic slot, slice slots, upstream report slots and the protocol table
+	 * area (CABAC M/N tables, tile info, ppfd and the band-line scratch
+	 * blocks) must all fit in the single pool.
+	 */
+	BUILD_BUG_ON(ALIGN(HISTB_VDEC_SLOT_BYTES +
+			   HISTB_VDEC_MAX_SLICE_SLOTS * HISTB_VDEC_SLOT_BYTES +
+			   HISTB_VDEC_MAX_UP_SLICES *
+			   HISTB_VDEC_UP_MSG_WORDS * 4, 64) +
+		     HISTB_TABLE_OFF_SCRATCH(HISTB_VDEC_NUM_SCRATCH - 1) +
+		     HISTB_VDEC_SCRATCH_SIZE > HISTB_VDEC_POOL_SIZE);
+
+	pool->size = HISTB_VDEC_POOL_SIZE;
+	pool->va = dma_alloc_wc(dev->memdev, pool->size, &pool->dma, GFP_KERNEL);
+	if (!pool->va)
+		return -ENOMEM;
+
+	pool->pic_off = 0;
+	pool->slice_off = HISTB_VDEC_SLOT_BYTES;
+	pool->up_off = pool->slice_off +
+		       HISTB_VDEC_MAX_SLICE_SLOTS * HISTB_VDEC_SLOT_BYTES;
+	pool->table_off = ALIGN(pool->up_off + HISTB_VDEC_MAX_UP_SLICES *
+				HISTB_VDEC_UP_MSG_WORDS * 4, 64);
+
+	memset(pool->va, 0, pool->size);
+	return 0;
+}
+
+static void histb_vdec_pool_free(void *data)
+{
+	struct histb_vdec_dev *dev = data;
+
+	dma_free_wc(dev->memdev, dev->pool.size, dev->pool.va, dev->pool.dma);
+	dev->pool.va = NULL;
+}
+
+static const u32 *histb_vdec_required_ctrls(const struct histb_vdec_ctx *ctx,
+					    unsigned int *num)
+{
+	static const u32 h264[] = {
+		V4L2_CID_STATELESS_H264_SPS,
+		V4L2_CID_STATELESS_H264_PPS,
+		V4L2_CID_STATELESS_H264_DECODE_PARAMS,
+		V4L2_CID_STATELESS_H264_SLICE_PARAMS,
+	};
+	static const u32 hevc[] = {
+		V4L2_CID_STATELESS_HEVC_SPS,
+		V4L2_CID_STATELESS_HEVC_PPS,
+		V4L2_CID_STATELESS_HEVC_DECODE_PARAMS,
+		V4L2_CID_STATELESS_HEVC_SLICE_PARAMS,
+	};
+	static const u32 mpeg2[] = {
+		V4L2_CID_STATELESS_MPEG2_SEQUENCE,
+		V4L2_CID_STATELESS_MPEG2_PICTURE,
+		V4L2_CID_STATELESS_MPEG2_QUANTISATION,
+	};
+
+	switch (ctx->desc->fourcc) {
+	case V4L2_PIX_FMT_H264_SLICE:
+		*num = ARRAY_SIZE(h264);
+		return h264;
+	case V4L2_PIX_FMT_HEVC_SLICE:
+		*num = ARRAY_SIZE(hevc);
+		return hevc;
+	case V4L2_PIX_FMT_MPEG2_SLICE:
+		*num = ARRAY_SIZE(mpeg2);
+		return mpeg2;
+	default:
+		*num = 0;
+		return NULL;
+	}
+}
+/* ---------------------------------------------------------------- probe */
+
+static void histb_vdec_v2_memdev_put(void *data)
+{
+	struct histb_vdec_dev *dev = data;
+
+	put_device(dev->memdev);
+}
+
+int histb_vdec_v2_probe(struct platform_device *pdev,
+			const struct histb_vdec_gen *gen)
+{
+	struct histb_vdec_dev *dev;
+	struct platform_device *mem;
+	int ret;
+
+	dev = devm_kzalloc(&pdev->dev, sizeof(*dev), GFP_KERNEL);
+	if (!dev)
+		return -ENOMEM;
+
+	dev->dev = &pdev->dev;
+	dev->chip = gen->chip;
+	dev->common.priv = dev;
+	platform_set_drvdata(pdev, dev);
+
+	mutex_init(&dev->hw_lock);
+	mutex_init(&dev->common.vdev_lock);
+	spin_lock_init(&dev->common.job_lock);
+	INIT_DELAYED_WORK(&dev->watchdog, histb_vdec_watchdog);
+
+	dev->vdm = devm_platform_ioremap_resource_byname(pdev, "vdm");
+	if (IS_ERR(dev->vdm))
+		return PTR_ERR(dev->vdm);
+
+	dev->scd = devm_platform_ioremap_resource_byname(pdev, "scd");
+	if (IS_ERR(dev->scd))
+		return PTR_ERR(dev->scd);
+
+	ret = devm_clk_bulk_get_all(&pdev->dev, &dev->clks);
+	if (ret < 0)
+		return ret;
+	dev->num_clks = ret;
+
+	/*
+	 * Both reset lines have to be released: the subsystem-wide one keeps
+	 * the whole VDM register window reading zero while asserted.
+	 */
+	dev->rst = devm_reset_control_array_get_exclusive(&pdev->dev);
+	if (IS_ERR(dev->rst))
+		return PTR_ERR(dev->rst);
+
+	ret = platform_get_irq(pdev, 0);
+	if (ret < 0)
+		return ret;
+	dev->irq = ret;
+
+	ret = dma_set_coherent_mask(&pdev->dev, DMA_BIT_MASK(32));
+	if (ret) {
+		dev_err(&pdev->dev, "failed to set DMA mask\n");
+		return ret;
+	}
+	mem = platform_device_alloc("histb-vdec-dma", PLATFORM_DEVID_NONE);
+	if (!mem)
+		return -ENOMEM;
+	dev->memdev = &mem->dev;
+	platform_device_set_of_node_from_dev(mem, &pdev->dev);
+	ret = dev_set_name(dev->memdev, "%s-dma", dev_name(&pdev->dev));
+	if (ret)
+		return ret;
+	ret = devm_add_action_or_reset(&pdev->dev, histb_vdec_v2_memdev_put,
+				       dev);
+	if (ret)
+		return ret;
+	ret = of_dma_configure(dev->memdev, dev->memdev->of_node, true);
+	if (ret)
+		return ret;
+	ret = dma_set_mask_and_coherent(dev->memdev, DMA_BIT_MASK(32));
+	if (ret)
+		return ret;
+	vb2_dma_contig_set_max_seg_size(dev->memdev, DMA_BIT_MASK(32));
+	/* Exported buffers retain their allocator even after unbind and rebind. */
+	ret = devm_of_reserved_mem_device_init(dev->memdev);
+	if (ret && ret != -ENODEV) {
+		dev_err(&pdev->dev, "failed to bind reserved memory\n");
+		return ret;
+	}
+
+	ret = histb_vdec_pool_alloc(dev);
+	if (ret)
+		return ret;
+	ret = devm_add_action_or_reset(&pdev->dev, histb_vdec_pool_free, dev);
+	if (ret)
+		return ret;
+
+	histb_vdec_hw_init_tables(dev);
+
+	pm_runtime_set_autosuspend_delay(&pdev->dev, 100);
+	pm_runtime_use_autosuspend(&pdev->dev);
+	/* The block must come up through the resume callback: the gates the
+	 * bootloader may have left on are not ours to rely on.
+	 */
+	pm_runtime_set_suspended(&pdev->dev);
+	pm_runtime_enable(&pdev->dev);
+	ret = pm_runtime_resume_and_get(&pdev->dev);
+	if (ret)
+		goto err_disable_pm;
+
+	/*
+	 * The decoder comes up held in reset; release it, mask every interrupt
+	 * source and only then register the handler.
+	 */
+	ret = reset_control_deassert(dev->rst);
+	if (ret)
+		goto err_disable_pm;
+
+	ret = histb_vdec_hw_init(dev);
+	if (ret)
+		goto err_assert_reset;
+
+	ret = devm_request_threaded_irq(&pdev->dev, dev->irq,
+					histb_vdec_hardirq,
+					histb_vdec_irq_handler,
+					IRQF_ONESHOT, dev_name(&pdev->dev), dev);
+	if (ret) {
+		dev_err(&pdev->dev, "failed to request irq\n");
+		goto err_assert_reset;
+	}
+
+	ret = histb_vdec_core_init(&dev->common, pdev, gen);
+	if (ret)
+		goto err_assert_reset;
+
+
+	dev_info(&pdev->dev, "video decoder, %s\n", dev->chip->model);
+	pm_runtime_put_autosuspend(&pdev->dev);
+
+	return 0;
+
+err_assert_reset:
+	reset_control_assert(dev->rst);
+	pm_runtime_put_sync(&pdev->dev);
+err_disable_pm:
+	pm_runtime_dont_use_autosuspend(&pdev->dev);
+	pm_runtime_disable(&pdev->dev);
+	pm_runtime_set_suspended(&pdev->dev);
+	return ret;
+}
+
+void histb_vdec_v2_remove(struct platform_device *pdev)
+{
+	struct histb_vdec_dev *dev = platform_get_drvdata(pdev);
+
+	histb_vdec_core_stop(&dev->common);
+	disable_irq(dev->irq);
+	cancel_delayed_work_sync(&dev->watchdog);
+	histb_vdec_core_exit(&dev->common);
+	pm_runtime_dont_use_autosuspend(&pdev->dev);
+	pm_runtime_disable(&pdev->dev);
+	reset_control_assert(dev->rst);
+	if (!pm_runtime_status_suspended(&pdev->dev))
+		histb_vdec_runtime_suspend(&pdev->dev);
+	pm_runtime_set_suspended(&pdev->dev);
+}
+
+
+/* ------------------------------------------------------------- gen ops */
+
+static const u32 histb_vdec_v2_cap_formats[] = {
+	V4L2_PIX_FMT_NV21,
+	V4L2_PIX_FMT_NV12,
+};
+
+static struct device *histb_vdec_v2_dma_dev(struct histb_vdec_common *common)
+{
+	struct histb_vdec_dev *dev = common->priv;
+
+	return dev->memdev;
+}
+
+static void histb_vdec_v2_buf_geom_hook(struct histb_vdec_core_ctx *cctx,
+					struct histb_vdec_geom *g)
+{
+	struct histb_vdec_ctx *ctx = (struct histb_vdec_ctx *)cctx;
+
+	g->uv_offset = 0;
+	histb_vdec_buf_geom(ctx, &g->pitch, &g->lines);
+}
+
+static int histb_vdec_v2_buf_prepare_hook(struct histb_vdec_core_ctx *cctx,
+					  struct vb2_buffer *vb)
+{
+	dma_addr_t dma = vb2_dma_contig_plane_dma_addr(vb, 0);
+
+	/*
+	 * The bitstream segment descriptors carry the length in 24 bits;
+	 * anything larger would wrap around silently.
+	 */
+	if (vb2_get_plane_payload(vb, 0) > BIT(24) - 1)
+		return -EINVAL;
+	if (vb->planes[0].data_offset + vb2_get_plane_payload(vb, 0) >
+	    vb2_plane_size(vb, 0))
+		return -EINVAL;
+
+	/*
+	 * The message words carry the bitstream start in one 32-bit field
+	 * (lower_32_bits), so a plane that ends above 4 GiB would be read from a
+	 * truncated address. This device's mask keeps its own allocations inside
+	 * that window; say it here rather than rely on the mask alone.
+	 */
+	if ((u64)dma + vb2_plane_size(vb, 0) - 1 > DMA_BIT_MASK(32))
+		return -ERANGE;
+
+	return 0;
+}
+
+static unsigned int histb_vdec_v2_min_coded_width(u32 fourcc)
+{
+	/*
+	 * An H.264 picture one macroblock column wide cannot be delivered at
+	 * all: the shared luma write path needs two macroblock columns, measured
+	 * on the board with a 32-wide stream declared as one column.
+	 */
+	return fourcc == V4L2_PIX_FMT_H264_SLICE ? 32 : 16;
+}
+
+static int histb_vdec_v2_start(struct histb_vdec_core_ctx *cctx,
+			       const struct vb2_queue *q)
+{
+	struct histb_vdec_ctx *ctx = (struct histb_vdec_ctx *)cctx;
+	if (!V4L2_TYPE_IS_OUTPUT(q->type))
+		return 0;
+
+	ctx->diag_reported = false;
+	if (histb_vdec_v2_ops(ctx)->start)
+		return histb_vdec_v2_ops(ctx)->start(ctx);
+
+	return 0;
+}
+
+static void histb_vdec_v2_stop(struct histb_vdec_core_ctx *cctx,
+			       const struct vb2_queue *q)
+{
+	struct histb_vdec_ctx *ctx = (struct histb_vdec_ctx *)cctx;
+	if (V4L2_TYPE_IS_OUTPUT(q->type) && histb_vdec_v2_ops(ctx)->stop)
+		histb_vdec_v2_ops(ctx)->stop(ctx);
+
+	/* With the stream stopped no dpb index survives, so neither do the
+	 * tile frames that stood in for the client buffers.
+	 */
+	histb_vdec_frames_free(ctx);
+}
+
+static void histb_vdec_v2_release_ctx(struct histb_vdec_core_ctx *cctx)
+{
+	histb_vdec_frames_free((struct histb_vdec_ctx *)cctx);
+}
+
+static void histb_vdec_v2_protocol_changed(struct histb_vdec_core_ctx *cctx)
+{
+	struct histb_vdec_ctx *ctx = (struct histb_vdec_ctx *)cctx;
+
+	/* The dpb -> pmv slot map is per-protocol. */
+	memset(ctx->pmv_map, 0, sizeof(ctx->pmv_map));
+	ctx->pmv_next = 0;
+}
+
+static int histb_vdec_v2_try_ctrl(const struct histb_vdec_fmt *fmt,
+				  struct v4l2_ctrl *ctrl)
+{
+	const struct histb_vdec_codec_ops *ops = fmt->ops;
+
+	if (ops->try_ctrl)
+		return ops->try_ctrl(ctrl);
+
+	return 0;
+}
+
+static void histb_vdec_v2_set_out_size(struct histb_vdec_core_ctx *cctx,
+				       struct v4l2_format *f,
+				       unsigned int width, unsigned int height)
+{
+	histb_vdec_set_frame_size((struct histb_vdec_ctx *)cctx, f, width,
+				  height);
+}
+
+static void histb_vdec_v2_set_cap_size(struct histb_vdec_core_ctx *cctx,
+				       struct v4l2_format *f,
+				       unsigned int width, unsigned int height)
+{
+	histb_vdec_set_cap_size((struct histb_vdec_ctx *)cctx, f, width,
+				height);
+}
+
+static const u32 *histb_vdec_v2_required_ctrls(
+				const struct histb_vdec_core_ctx *cctx,
+				unsigned int *num)
+{
+	return histb_vdec_required_ctrls((const struct histb_vdec_ctx *)cctx,
+					 num);
+}
+
+#define HISTB_VDEC_V2_GEN(_chip, _caps)					\
+	{								\
+		.name			= "histb-vdec",			\
+		.ctx_size		= sizeof(struct histb_vdec_ctx),	\
+		.chip			= _chip,				\
+		.max_width		= HISTB_VDEC_MAX_WIDTH,		\
+		.max_height		= HISTB_VDEC_MAX_HEIGHT,		\
+		.max_cap_buffers	= HISTB_VDEC_MAX_APC_SLOTS,	\
+		.min_queued_buffers	= 4,					\
+		.cap_clamp		= true,				\
+		.cap_formats		= _caps,				\
+		.num_cap_formats	= ARRAY_SIZE(_caps),			\
+		.dma_dev		= histb_vdec_v2_dma_dev,		\
+		.set_out_size		= histb_vdec_v2_set_out_size,		\
+		.set_cap_size		= histb_vdec_v2_set_cap_size,		\
+		.set_cap_reset		= histb_vdec_v2_set_out_size,		\
+		.buf_geom		= histb_vdec_v2_buf_geom_hook,		\
+		.buf_prepare		= histb_vdec_v2_buf_prepare_hook,	\
+		.min_coded_width	= histb_vdec_v2_min_coded_width,	\
+		.start			= histb_vdec_v2_start,			\
+		.stop			= histb_vdec_v2_stop,			\
+		.release		= histb_vdec_v2_release_ctx,		\
+		.required_ctrls		= histb_vdec_v2_required_ctrls,		\
+		.try_ctrl		= histb_vdec_v2_try_ctrl,		\
+		.protocol_changed	= histb_vdec_v2_protocol_changed,	\
+		.m2m_ops		= &histb_vdec_m2m_ops,			\
+	}
+
+static const struct histb_vdec_gen histb_vdec_v2_gen_mv100 =
+	HISTB_VDEC_V2_GEN(&histb_vdec_v2_chip_mv100, histb_vdec_v2_cap_formats);
+static const struct histb_vdec_gen histb_vdec_v2_gen_cv200 =
+	HISTB_VDEC_V2_GEN(&histb_vdec_v2_chip_cv200, histb_vdec_v2_cap_formats);
+
+const struct histb_vdec_variant histb_vdec_v2_mv100_variant = {
+	.gen			= &histb_vdec_v2_gen_mv100,
+	.probe			= histb_vdec_v2_probe,
+	.remove			= histb_vdec_v2_remove,
+	.runtime_suspend	= histb_vdec_runtime_suspend,
+	.runtime_resume		= histb_vdec_runtime_resume,
+	.system_suspend		= pm_runtime_force_suspend,
+	.system_resume		= pm_runtime_force_resume,
+};
+
+const struct histb_vdec_variant histb_vdec_v2_cv200_variant = {
+	.gen			= &histb_vdec_v2_gen_cv200,
+	.probe			= histb_vdec_v2_probe,
+	.remove			= histb_vdec_v2_remove,
+	.runtime_suspend	= histb_vdec_runtime_suspend,
+	.runtime_resume		= histb_vdec_runtime_resume,
+	.system_suspend		= pm_runtime_force_suspend,
+	.system_resume		= pm_runtime_force_resume,
+};
