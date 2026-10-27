@@ -243,6 +243,14 @@ static irqreturn_t hix5hd2_ir_rx_interrupt(int irq, void *data)
 static const struct of_device_id hix5hd2_ir_table[] = {
 	{ .compatible = "hisilicon,hix5hd2-ir", &hix5hd2_data, },
 	{ .compatible = "hisilicon,hi3796cv300-ir", &hi3796cv300_data, },
+	/*
+	 * Hi3716CV200 keeps the same register map and the same gate
+	 * (SYS_CTRL + 0x48, bit 4 enable, bit 5 reset), and its boot
+	 * leaves 0x3e80 in the symbol-width field this driver programs,
+	 * so it reuses the hix5hd2 data. It needs no extra power-enable
+	 * bit.
+	 */
+	{ .compatible = "hisilicon,hi3716cv200-ir", &hix5hd2_data, },
 	{},
 };
 MODULE_DEVICE_TABLE(of, hix5hd2_ir_table);
