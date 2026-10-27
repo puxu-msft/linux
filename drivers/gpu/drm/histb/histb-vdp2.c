@@ -17,6 +17,10 @@
  * about the pixel clock. The driver enables the CRG54 gates by hand and pulses
  * CRG54 bit 30 before it configures anything, so the display controller comes
  * up from its reset defaults rather than from the state it was handed over in.
+ *
+ * WBC_HD0 taps that mixed output and can write one frame back to memory;
+ * it is exposed as a DRM writeback connector, and only produces data while
+ * the channel is running.
  */
 
 #include <linux/bitfield.h>
@@ -31,11 +35,14 @@
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
 #include <linux/reset.h>
+#include <linux/slab.h>
 
 #include <drm/drm_atomic.h>
 #include <drm/drm_atomic_helper.h>
 #include <drm/drm_bridge.h>
 #include <drm/drm_bridge_connector.h>
+#include <drm/drm_edid.h>
+#include <drm/drm_blend.h>
 #include <drm/drm_crtc.h>
 #include <drm/drm_damage_helper.h>
 #include <drm/drm_drv.h>
@@ -43,15 +50,23 @@
 #include <drm/drm_fbdev_dma.h>
 #include <drm/drm_fourcc.h>
 #include <drm/drm_framebuffer.h>
+#include <drm/drm_gem.h>
+#include <drm/drm_gem_framebuffer_helper.h>
+#include <drm/drm_plane.h>
+#include <drm/drm_util.h>
+#include <drm/drm_framebuffer.h>
 #include <drm/drm_fb_dma_helper.h>
 #include <drm/drm_gem_dma_helper.h>
 #include <drm/drm_gem_framebuffer_helper.h>
 #include <drm/drm_managed.h>
 #include <drm/drm_mode_config.h>
+#include <drm/drm_modeset_helper.h>
 #include <drm/drm_of.h>
+#include <drm/drm_print.h>
 #include <drm/drm_plane_helper.h>
 #include <drm/drm_probe_helper.h>
 #include <drm/drm_vblank.h>
+#include <drm/drm_writeback.h>
 
 #include "histb-vdp2-regs.h"
 
@@ -108,9 +123,9 @@ static const struct histb_vdp2_zme histb_vdp2_zme_cv200 = {
  * same registers on a part that is displaying: the vendor's live values on
  * Hi3716CV200 are VO_MUX 0x9 (sddate_sel and hdmi_sel set, ie its primary
  * display is channel 1), GP0_CTRL 0x80001230 (CSC order, no zoom stage) and
- * DHD0_CTRL 0x80008010 (interface B bit absent), while the Hi3798MV100 pipeline
- * this driver first ran on had 0x8000C010 with interface B set and its mux
- * already routed by the boot.
+ * DHD0_CTRL 0x80008010 (the HDMI_MODE bit is absent, interface B is set),
+ * while the Hi3798MV100 pipeline this driver first ran on had 0x8000C010
+ * with both bits and its mux already routed by the boot.
  */
 struct histb_vdp2_chip {
 	const struct histb_vdp2_zme	*zme;
@@ -119,6 +134,15 @@ struct histb_vdp2_chip {
 	bool				dhd_hdmi_mode;
 	bool				mux_hdmi_dhd0;
 	bool				hdate_hdmi_out;
+	/*
+	 * Expose the write-back taps: WBC_HD0 (the composited HD channel, block
+	 * at 0xac00) and WBC_GP0 (graphics layer, 0xa800). Hi3798MV100 has both
+	 * board-verified. Hi3716CV200's own register file has the same two blocks
+	 * at the same offsets with the same bit positions, accumulated from
+	 * S_VOU_CV200_REGS_TYPE in vdp_v1_0/hal/cv200/vdp_reg.h, and its cast path
+	 * drives WBC_HD0 the way this driver does, so the map is shared.
+	 */
+	bool				has_wbc;
 	/*
 	 * Run the GP0 CSC stage as the component-line unrotation plus the
 	 * limited-range shaping. That contract was established on Hi3716CV200
@@ -135,6 +159,7 @@ static const struct histb_vdp2_chip histb_vdp2_mv100 = {
 	.dhd_intf_b = true,
 	.dhd_hdmi_mode = true,
 	.mux_hdmi_dhd0 = false,
+	.has_wbc = true,
 	.gp0_csc_cycle = false,
 };
 
@@ -150,6 +175,7 @@ static const struct histb_vdp2_chip histb_vdp2_cv200 = {
 	.dhd_hdmi_mode = false,
 	.mux_hdmi_dhd0 = true,
 	.hdate_hdmi_out = true,
+	.has_wbc = true,
 };
 
 struct histb_vdp2 {
@@ -183,6 +209,19 @@ struct histb_vdp2_display {
 	struct drm_plane	primary;
 	struct drm_crtc		crtc;
 	struct drm_encoder	encoder;
+
+	struct drm_encoder	wb_enc;
+	struct drm_writeback_connector	wb;
+	struct drm_encoder	wb_gp0_enc;
+	struct drm_writeback_connector	wb_gp0;
+	/*
+	 * One slot per write-back block: wb_pending[t] says a job is armed on
+	 * block t and wb_running[t] names the connector to signal. Only the
+	 * commit tail sets wb_pending; the interrupt handler, or a channel that
+	 * goes down with a job still armed, clears it.
+	 */
+	bool			wb_pending[2];
+	struct drm_writeback_connector *wb_running[2];
 };
 
 static inline struct histb_vdp2 *plane_to_vdp(struct drm_plane *plane)
@@ -244,17 +283,41 @@ static u32 vo_rmw_field(struct histb_vdp2 *vdp, u32 off, u32 mask, u32 val)
 	return ctrl;
 }
 
+/*
+ * Wait for a layer's shadow-latch request to be consumed. The update
+ * register's bit 0 is a self-clearing strobe on this part: writing DHD0_CTRL
+ * with bit 0 set read back with it clear immediately afterwards, and G0_UPD does
+ * the same, so the poll proves the write was taken rather than that the block
+ * re-sampled at a vsync boundary. The layer paths need that because the
+ * framebuffer can be freed right after the commit returns, and a surface_en
+ * clear still sitting unconsumed would then be lost.
+ */
+static void histb_vdp2_wait_upd(struct histb_vdp2 *vdp, u32 off)
+{
+	int i;
+
+	for (i = 0; i < 100; i++) {
+		if (!(vo_read(vdp, off) & G0_UPD_REGUP))
+			return;
+		udelay(10);
+	}
+
+	dev_warn(vdp->dev, "register update at 0x%04x did not finish\n", off);
+}
+
 /* ------------------------------------------------------------------ */
 /* Plane (G0 graphics layer)                                           */
 /* ------------------------------------------------------------------ */
 
 /*
- * No per-pixel alpha is programmed in the atomic update path, so the ARGB
- * format is deliberately not exposed (drm core would warn about alpha formats
- * without blend mode support).
+ * ARGB8888 is accepted as storage for a 32bpp surface but its alpha byte is
+ * ignored (see the format switch in histb_vdp2_g0_set()), which is what the
+ * plane's "pixel blend mode" = None declares.
  */
 static const u32 histb_vdp2_formats[] = {
 	DRM_FORMAT_XRGB8888,
+	DRM_FORMAT_ARGB8888,
+	DRM_FORMAT_RGB565,
 };
 
 /* `value - 1`, clamped so that a zero porch/sync width never underflows */
@@ -263,10 +326,12 @@ static u32 histb_vdp2_m1(u32 v)
 	return max(v, 1u) - 1;
 }
 
-static void histb_vdp2_g0_set(struct histb_vdp2 *vdp, const struct drm_framebuffer *fb,
-			    struct drm_gem_dma_object *gem, bool enable)
+static void histb_vdp2_g0_set(struct histb_vdp2 *vdp, struct drm_framebuffer *fb,
+			    struct drm_gem_dma_object *gem,
+			    const struct drm_plane_state *pstate, bool enable)
 {
 	u32 ctrl, ifmt, palpha;
+	u32 src_x, src_y, src_w, src_h, dst_x, dst_y, dst_w, dst_h;
 
 	if (!enable) {
 		ctrl = vo_read(vdp, G0_CTRL);
@@ -276,6 +341,17 @@ static void histb_vdp2_g0_set(struct histb_vdp2 *vdp, const struct drm_framebuff
 		return;
 	}
 
+	src_x = (pstate->src_x >> 16) & GENMASK(11, 0);
+	src_y = (pstate->src_y >> 16) & GENMASK(11, 0);
+	src_w = min_t(u32, pstate->src_w >> 16, fb->width - src_x);
+	src_h = min_t(u32, pstate->src_h >> 16, fb->height - src_y);
+	dst_x = pstate->crtc_x & GENMASK(11, 0);
+	dst_y = pstate->crtc_y & GENMASK(11, 0);
+	dst_w = min_t(u32, pstate->crtc_w, 4096 - dst_x);
+	dst_h = min_t(u32, pstate->crtc_h, 4096 - dst_y);
+	if (!src_w || !src_h || !dst_w || !dst_h)
+		return;
+
 	/*
 	 * Pixel format. The A-prefixed hardware codes consume the buffer's
 	 * alpha byte, so an XRGB framebuffer must not be described as ARGB8888:
@@ -283,9 +359,19 @@ static void histb_vdp2_g0_set(struct histb_vdp2 *vdp, const struct drm_framebuff
 	 * fully transparent.
 	 */
 	switch (fb->format->format) {
+	case DRM_FORMAT_RGB565:
+		ifmt = G0_IFMT_RGB565;
+		palpha = 0;
+		break;
 	case DRM_FORMAT_ARGB8888:
-		ifmt = G0_IFMT_ARGB8888;
-		palpha = G0_CBMPARA_PALPHA_EN;
+		/*
+		 * Scanned out through the opaque 32bpp coding: the alpha byte
+		 * would reach the mixer as a 7-bit field, which is neither the
+		 * coverage nor the premultiplied formula, so the byte is ignored
+		 * and the plane declares blend mode "None".
+		 */
+		ifmt = G0_IFMT_KRGB888;
+		palpha = 0;
 		break;
 	default:
 		ifmt = G0_IFMT_KRGB888;
@@ -306,50 +392,74 @@ static void histb_vdp2_g0_set(struct histb_vdp2 *vdp, const struct drm_framebuff
 		G0_CTRL_READ_MODE | G0_CTRL_UPD_MODE;
 	vo_write(vdp, G0_CTRL, ctrl);
 
-	/* opaque surface, no colour key, no per-pixel alpha */
+	/* global alpha is opaque; only ARGB8888 turns per-pixel alpha on */
 	ctrl = vo_read(vdp, G0_CBMPARA);
 	ctrl &= ~(G0_CBMPARA_GALPHA | G0_CBMPARA_PALPHA_EN |
 		  G0_CBMPARA_KEY_EN | G0_CBMPARA_KEY_MODE);
 	ctrl |= FIELD_PREP(G0_CBMPARA_GALPHA, 0xff) | palpha;
 	vo_write(vdp, G0_CBMPARA, ctrl);
 
-	vo_write(vdp, G0_ADDR, (u32)(gem->dma_addr + fb->offsets[0]));
+	/*
+	 * The layer has no source-rectangle register worth the name: G0_SFPOS's
+	 * src_xfpos is 7 bits and there is no src_y (hi_reg_vdp.h U_G0_SFPOS), so
+	 * the source corner is taken by advancing the base address and the extent
+	 * by G0_IRESO. The stride keeps describing the surface, so a cropped region
+	 * still reads whole rows of it.
+	 */
+	vo_write(vdp, G0_ADDR,
+		 (u32)(gem->dma_addr + fb->offsets[0] +
+		       (dma_addr_t)src_y * fb->pitches[0] +
+		       (dma_addr_t)src_x *
+			       drm_format_info_min_pitch(fb->format, 0, 1)));
 	/* G0_STRIDE is programmed in units of 16 bytes */
 	vo_write(vdp, G0_STRIDE,
 		 FIELD_PREP(G0_STRIDE_MASK, fb->pitches[0] / 16));
 	vo_write(vdp, G0_IRESO,
-		 FIELD_PREP(G0_IRESO_IW, fb->width - 1) |
-		 FIELD_PREP(G0_IRESO_IH, fb->height - 1));
-
-	/* source position 0,0 and 1:1 placement on the display */
-	vo_write(vdp, G0_DFPOS, 0);
-	vo_write(vdp, G0_DLPOS,
-		 FIELD_PREP(G0_DLPOS_X, fb->width - 1) |
-		 FIELD_PREP(G0_DLPOS_Y, fb->height - 1));
-	vo_write(vdp, G0_VFPOS, 0);
-	vo_write(vdp, G0_VLPOS,
-		 FIELD_PREP(G0_DLPOS_X, fb->width - 1) |
-		 FIELD_PREP(G0_DLPOS_Y, fb->height - 1));
+		 FIELD_PREP(G0_IRESO_IW, src_w - 1) |
+		 FIELD_PREP(G0_IRESO_IH, src_h - 1));
 
 	/*
-	 * GP0 passes the G0 surface through: same resolution, full-screen
-	 * display window (DFPOS 0,0 / DLPOS (w-1, h-1), 12-bit x[11:0] y[23:12]
-	 * fields).
+	 * V* is where the fetched region lands on the panel (the SDK's "video
+	 * position", VDP_GFX_SetVideoPos) and D* is the display window around it
+	 * (VDP_GFX_SetDispPos); with no scaling allowed both are the destination
+	 * rectangle. Writing the source corner into V* instead, as an earlier
+	 * revision did, moved the surface on screen rather than cropping it: the
+	 * top-left text row came back at (320,180) under a 320,180 "source" commit.
+	 */
+	vo_write(vdp, G0_VFPOS,
+		 FIELD_PREP(G0_DFPOS_X, dst_x) |
+		 FIELD_PREP(G0_DFPOS_Y, dst_y));
+	vo_write(vdp, G0_VLPOS,
+		 FIELD_PREP(G0_DLPOS_X, dst_x + dst_w - 1) |
+		 FIELD_PREP(G0_DLPOS_Y, dst_y + dst_h - 1));
+	vo_write(vdp, G0_DFPOS,
+		 FIELD_PREP(G0_DFPOS_X, dst_x) |
+		 FIELD_PREP(G0_DFPOS_Y, dst_y));
+	vo_write(vdp, G0_DLPOS,
+		 FIELD_PREP(G0_DLPOS_X, dst_x + dst_w - 1) |
+		 FIELD_PREP(G0_DLPOS_Y, dst_y + dst_h - 1));
+
+	/*
+	 * GP0 post-processes the window G0 produced, not the whole surface:
+	 * its input resolution and output window both follow the destination
+	 * rectangle.
 	 */
 	vo_write(vdp, GP0_IRESO,
-		 FIELD_PREP(G0_IRESO_IW, fb->width - 1) |
-		 FIELD_PREP(G0_IRESO_IH, fb->height - 1));
+		 FIELD_PREP(G0_IRESO_IW, dst_w - 1) |
+		 FIELD_PREP(G0_IRESO_IH, dst_h - 1));
 	vo_write(vdp, GP0_ORESO,
-		 FIELD_PREP(GP0_ORESO_OW, fb->width - 1) |
-		 FIELD_PREP(GP0_ORESO_OH, fb->height - 1));
-	vo_write(vdp, GP0_DFPOS, 0);
+		 FIELD_PREP(GP0_ORESO_OW, dst_w - 1) |
+		 FIELD_PREP(GP0_ORESO_OH, dst_h - 1));
+	vo_write(vdp, GP0_DFPOS,
+		 FIELD_PREP(G0_DFPOS_X, dst_x) |
+		 FIELD_PREP(G0_DFPOS_Y, dst_y));
 	vo_write(vdp, GP0_DLPOS,
-		 FIELD_PREP(G0_DLPOS_X, fb->width - 1) |
-		 FIELD_PREP(G0_DLPOS_Y, fb->height - 1));
+		 FIELD_PREP(G0_DLPOS_X, dst_x + dst_w - 1) |
+		 FIELD_PREP(G0_DLPOS_Y, dst_y + dst_h - 1));
 	vo_write(vdp, GP0_VFPOS, 0);
 	vo_write(vdp, GP0_VLPOS,
-		 FIELD_PREP(G0_DLPOS_X, fb->width - 1) |
-		 FIELD_PREP(G0_DLPOS_Y, fb->height - 1));
+		 FIELD_PREP(G0_DLPOS_X, dst_w - 1) |
+		 FIELD_PREP(G0_DLPOS_Y, dst_h - 1));
 
 	/*
 	 * The zoom engine walks the source with its own step registers, so
@@ -392,7 +502,7 @@ static void histb_vdp2_plane_atomic_update(struct drm_plane *plane,
 	if (!gem)
 		return;
 
-	histb_vdp2_g0_set(vdp, fb, gem, new_state->visible);
+	histb_vdp2_g0_set(vdp, fb, gem, new_state, new_state->visible);
 }
 
 static void histb_vdp2_plane_atomic_disable(struct drm_plane *plane,
@@ -400,7 +510,9 @@ static void histb_vdp2_plane_atomic_disable(struct drm_plane *plane,
 {
 	struct histb_vdp2 *vdp = plane_to_vdp(plane);
 
-	histb_vdp2_g0_set(vdp, NULL, NULL, false);
+	histb_vdp2_g0_set(vdp, NULL, NULL, NULL, false);
+	histb_vdp2_wait_upd(vdp, GP0_UPD);
+	histb_vdp2_wait_upd(vdp, G0_UPD);
 }
 
 static int histb_vdp2_plane_atomic_check(struct drm_plane *plane,
@@ -425,7 +537,8 @@ static int histb_vdp2_plane_atomic_check(struct drm_plane *plane,
 		return 0;
 
 	crtc_state = drm_atomic_get_new_crtc_state(state, new_state->crtc);
-	if (IS_ERR(crtc_state))
+	/* The new-state getter is a slot read, so it yields NULL. */
+	if (!crtc_state)
 		return PTR_ERR(crtc_state);
 
 	if (new_state->crtc_w > 4095 || new_state->crtc_h > 4095)
@@ -434,14 +547,15 @@ static int histb_vdp2_plane_atomic_check(struct drm_plane *plane,
 	/*
 	 * This is what fills in new_state->visible, and atomic_update acts on
 	 * it: without the helper visible stays false, so every plane commit
-	 * switches the surface off again. can_position is false because the
-	 * driver always places the surface at 0,0 with the framebuffer's own
-	 * size.
+	 * switches the surface off again. can_position is true because the
+	 * destination window is programmed through DFPOS/DLPOS; fixing it to
+	 * the CRTC size made the helper reject every cropped source rectangle
+	 * ("Plane must cover entire CRTC") even though the hardware can show it.
 	 */
 	return drm_atomic_helper_check_plane_state(new_state, crtc_state,
 						   DRM_PLANE_NO_SCALING,
 						   DRM_PLANE_NO_SCALING,
-						   false, true);
+						   true, true);
 }
 
 static const struct drm_plane_helper_funcs histb_vdp2_plane_helper_funcs = {
@@ -463,6 +577,432 @@ static const struct drm_plane_funcs histb_vdp2_plane_funcs = {
 	.atomic_duplicate_state	= drm_atomic_helper_plane_duplicate_state,
 	.atomic_destroy_state	= drm_atomic_helper_plane_destroy_state,
 };
+
+/* ------------------------------------------------------------------ */
+/* Write-back (WBC_DHD0, WBC_GP0)                                      */
+/* ------------------------------------------------------------------ */
+
+/*
+ * The block copies whatever it taps and never colour-converts it: over eight
+ * colour bars a planar target carries the red sample in the luma byte and
+ * green and blue in the Cb and Cr ones, so those entries are byte packings of
+ * an RGB image rather than YCbCr. A consumer that wants the frame as it is
+ * displayed takes the graphics tap instead, which writes 32-bit pixels with
+ * the lanes in B, G, R, X order and X filled with 0xff - XBGR8888.
+ */
+struct histb_wb_fmt {
+	u32	format;
+	u8	wbc_format;
+	u8	planes;
+	bool	uv_order;	/* chroma order of the planar formats */
+	u16	base;		/* which write-back block produces it */
+};
+
+static const struct histb_wb_fmt histb_wb_fmts[] = {
+	{ DRM_FORMAT_NV12, WBC_FORMAT_SP420, 2, true, WBC_BASE_DHD0 },
+	{ DRM_FORMAT_NV21, WBC_FORMAT_SP420, 2, false, WBC_BASE_DHD0 },
+	{ DRM_FORMAT_NV16, WBC_FORMAT_SP422, 2, true, WBC_BASE_DHD0 },
+	{ DRM_FORMAT_NV61, WBC_FORMAT_SP422, 2, false, WBC_BASE_DHD0 },
+	{ DRM_FORMAT_UYVY, WBC_FORMAT_PKG_UYVY, 1, false, WBC_BASE_DHD0 },
+	{ DRM_FORMAT_YUYV, WBC_FORMAT_PKG_YUYV, 1, false, WBC_BASE_DHD0 },
+	{ DRM_FORMAT_YVYU, WBC_FORMAT_PKG_YVYU, 1, false, WBC_BASE_DHD0 },
+	{ DRM_FORMAT_XBGR8888, WBC_FORMAT_ARGB8888, 1, false, WBC_BASE_GP0 },
+};
+
+static const u32 histb_wb_format_list[] = {
+	DRM_FORMAT_NV12,
+	DRM_FORMAT_NV21,
+	DRM_FORMAT_NV16,
+	DRM_FORMAT_NV61,
+	DRM_FORMAT_UYVY,
+	DRM_FORMAT_YUYV,
+	DRM_FORMAT_YVYU,
+};
+
+static const u32 histb_wb_gp0_format_list[] = {
+	DRM_FORMAT_XBGR8888,
+};
+
+static const struct histb_wb_fmt *histb_wb_fmt_find(u32 format)
+{
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(histb_wb_fmts); i++)
+		if (histb_wb_fmts[i].format == format)
+			return &histb_wb_fmts[i];
+
+	return NULL;
+}
+
+/* the capture is one frame of what the channel mixes, read
+ * progressively as the vendor's snapshot path does
+ * (drv_disp_hal.c:2583), at 1:1
+ */
+static void histb_wb_setup(struct histb_vdp2 *vdp, const struct histb_wb_fmt *fmt,
+			   struct drm_framebuffer *fb)
+{
+	struct drm_gem_dma_object *gem;
+	dma_addr_t addr;
+	u32 ctrl, stride, reso;
+	int plane;
+
+	u32 base = fmt->base;
+
+	ctrl = vo_read(vdp, base + WBC_OFS_CTRL);
+	ctrl &= ~(WBC_CTRL_FORMAT | WBC_CTRL_MODE | WBC_CTRL_3D_MODE);
+	ctrl |= FIELD_PREP(WBC_CTRL_FORMAT, fmt->wbc_format) |
+		FIELD_PREP(WBC_CTRL_MODE, WBC_MODE_PROGRESSIVE);
+	if (fmt->planes == 2) {
+		ctrl &= ~WBC_CTRL_UV_ORDER;
+		if (fmt->uv_order)
+			ctrl |= WBC_CTRL_UV_ORDER;
+	}
+	/* the caller enables, once the target is fully described */
+	vo_write(vdp, base + WBC_OFS_CTRL, ctrl);
+
+	if (base == WBC_BASE_GP0) {
+		/* 10-bit surfaces dither down to the 8-bit target the block writes */
+		vo_write(vdp, WBC_GP0_DITHER_CTRL,
+			 FIELD_PREP(WBC_GP0_DITHER_MD, WBC_GP0_DITHER_SPA_8));
+	}
+
+	stride = FIELD_PREP(WBC_STRIDE_L, fb->pitches[0]) |
+		 FIELD_PREP(WBC_STRIDE_C, fb->pitches[fmt->planes - 1]);
+	vo_write(vdp, base + WBC_OFS_STRIDE, stride);
+
+	reso = FIELD_PREP(WBC_ORESO_W, fb->width - 1) |
+	       FIELD_PREP(WBC_ORESO_H, fb->height - 1);
+	vo_write(vdp, base + WBC_OFS_ORESO, reso);
+
+	/*
+	 * The crop window has to be stated as well: both edges default to zero,
+	 * and a window that ends at the first pixel has nothing to write.
+	 */
+	vo_write(vdp, base + WBC_OFS_FCROP, 0);
+	vo_write(vdp, base + WBC_OFS_LCROP,
+		 FIELD_PREP(WBC_LCROP_W, fb->width - 1) |
+		 FIELD_PREP(WBC_LCROP_H, fb->height - 1));
+
+	/*
+	 * The channel tap scales through its own ZME before writing, so a 1:1
+	 * capture still has to state the ratio: both directions carry the value
+	 * that means "one output line per input line" with the filters off.
+	 * The graphics tap has no ZME of its own.
+	 */
+	if (base == WBC_BASE_DHD0) {
+		vo_write(vdp, WBC_DHD0_ZME_HSP, WBC_ZME_HPREC);
+		vo_write(vdp, WBC_DHD0_ZME_HLOFFSET, 0);
+		vo_write(vdp, WBC_DHD0_ZME_HCOFFSET, 0);
+		vo_write(vdp, WBC_DHD0_ZME_VSR, WBC_ZME_VPREC);
+		vo_write(vdp, WBC_DHD0_ZME_VOFFSET, 0);
+	}
+
+	for (plane = 0; plane < fmt->planes; plane++) {
+		gem = drm_fb_dma_get_gem_obj(fb, plane);
+		if (!gem)
+			return;
+		addr = gem->dma_addr + fb->offsets[plane];
+		/* a packed capture ignores the chroma address */
+		vo_write(vdp, base + (plane ? WBC_OFS_CADDR : WBC_OFS_YADDR),
+			 addr);
+	}
+}
+
+/* The two write-back blocks, in the order their connectors are listed. */
+static u32 histb_wb_base_of(unsigned int tap)
+{
+	return tap ? WBC_BASE_GP0 : WBC_BASE_DHD0;
+}
+
+static u32 histb_wb_vte_bit(u32 base)
+{
+	return base == WBC_BASE_DHD0 ? VO_INT_DWBC0_VTTHD : VO_INT_GWBC0_VTTHD;
+}
+
+static void histb_wb_start(struct histb_vdp2_display *disp,
+			   unsigned int tap,
+			   const struct histb_wb_fmt *fmt,
+			   struct drm_framebuffer *fb,
+			   struct drm_writeback_connector *wb)
+{
+	struct histb_vdp2 *vdp = disp->vdp;
+	u32 base = fmt->base;
+
+	histb_wb_setup(vdp, fmt, fb);
+	/*
+	 * The block's own frame-done source is what retires the job, so it
+	 * delivers only while a capture runs: clear a latch left over from
+	 * the previous one, then ask for it.
+	 */
+	vo_write(vdp, VO_MSKINTSTA, histb_wb_vte_bit(base));
+	vo_write(vdp, VO_INTMSK,
+		 vo_read(vdp, VO_INTMSK) | histb_wb_vte_bit(base));
+	vo_write(vdp, base + WBC_OFS_CTRL,
+		 vo_read(vdp, base + WBC_OFS_CTRL) | WBC_CTRL_EN);
+
+	/* the block latches everything it was pointed at with one update bit */
+	vo_write(vdp, base + WBC_OFS_UPD, WBC_UPD_REGUP);
+	disp->wb_running[tap] = wb;
+	WRITE_ONCE(disp->wb_pending[tap], true);
+}
+
+static void histb_wb_stop(struct histb_vdp2 *vdp, u16 base)
+{
+	u32 ctrl = vo_read(vdp, base + WBC_OFS_CTRL);
+
+	ctrl &= ~WBC_CTRL_EN;
+	vo_write(vdp, base + WBC_OFS_CTRL, ctrl);
+	vo_write(vdp, base + WBC_OFS_UPD, WBC_UPD_REGUP);
+	vo_write(vdp, VO_INTMSK,
+		 vo_read(vdp, VO_INTMSK) & ~histb_wb_vte_bit(base));
+}
+
+/*
+ * The block raises its frame-done bit once per arm, so the first delivery
+ * retires the job (board: after that one bit no second arrived for five
+ * seconds while the block kept its enable bit set). The channel's vblank is
+ * not the completion: the tap's own bit is the direct evidence that the
+ * picture reached memory, and it does not depend on the core holding a
+ * reference for the committing file.
+ */
+static void histb_wb_update(struct histb_vdp2_display *disp, u32 sta)
+{
+	struct histb_vdp2 *vdp = disp->vdp;
+	unsigned int tap;
+
+	for (tap = 0; tap < ARRAY_SIZE(disp->wb_pending); tap++) {
+		u32 base = histb_wb_base_of(tap);
+
+		if (!READ_ONCE(disp->wb_pending[tap]))
+			continue;
+		if (!(sta & histb_wb_vte_bit(base)))
+			continue;
+
+		histb_wb_stop(vdp, base);
+		WRITE_ONCE(disp->wb_pending[tap], false);
+		drm_writeback_signal_completion(disp->wb_running[tap], 0);
+		disp->wb_running[tap] = NULL;
+	}
+}
+
+static int histb_wb_enc_atomic_check(struct drm_encoder *encoder,
+				     struct drm_crtc_state *crtc_state,
+				     struct drm_connector_state *conn_state)
+{
+	struct drm_device *drm = encoder->dev;
+	struct drm_framebuffer *fb;
+	const struct histb_wb_fmt *fmt;
+	const struct drm_display_mode *mode = &crtc_state->mode;
+	struct histb_vdp2_display *disp;
+
+	disp = container_of(crtc_state->crtc, struct histb_vdp2_display, crtc);
+
+	fb = conn_state->writeback_job ? conn_state->writeback_job->fb : NULL;
+	if (!conn_state->writeback_job || !conn_state->writeback_job->fb)
+		return 0;
+
+	fmt = histb_wb_fmt_find(fb->format->format);
+	if (!fmt) {
+		drm_dbg_kms(drm, "wbc: format %p4cc is not written by this block\n",
+			    &fb->format->format);
+		return -EINVAL;
+	}
+
+	/*
+	 * The format picks the block, so an encoder must not be handed a target
+	 * that the other tap produces: the check below would otherwise arm the
+	 * wrong block and report the other tap's pixels as this one's.
+	 */
+	if (fmt->base != (encoder == &disp->wb_enc ? WBC_BASE_DHD0 : WBC_BASE_GP0)) {
+		drm_dbg_kms(drm, "wbc: %p4cc belongs to the other tap\n",
+			    &fb->format->format);
+		return -EINVAL;
+	}
+
+	/*
+	 * The write-back takes the mixed picture at 1:1, so the target has to be
+	 * the frame the channel is scanning out.
+	 */
+	if (fb->width != mode->hdisplay || fb->height != mode->vdisplay) {
+		drm_dbg_kms(drm, "wbc: %ux%u target does not match %ux%u mode\n",
+			    fb->width, fb->height, mode->hdisplay,
+			    mode->vdisplay);
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+static int histb_wb_conn_get_modes(struct drm_connector *connector)
+{
+	return drm_add_modes_noedid(connector, connector->dev->mode_config.max_width,
+				    connector->dev->mode_config.max_height);
+}
+
+static const struct drm_encoder_helper_funcs histb_wb_enc_helper_funcs = {
+	.atomic_check		= histb_wb_enc_atomic_check,
+};
+
+static const struct drm_connector_helper_funcs histb_wb_conn_helper_funcs = {
+	.get_modes		= histb_wb_conn_get_modes,
+};
+
+static const struct drm_connector_funcs histb_wb_conn_funcs = {
+	.reset			= drm_atomic_helper_connector_reset,
+	.fill_modes		= drm_helper_probe_single_connector_modes,
+	.atomic_duplicate_state	= drm_atomic_helper_connector_duplicate_state,
+	.atomic_destroy_state	= drm_atomic_helper_connector_destroy_state,
+};
+
+static int histb_wb_one(struct histb_vdp2_display *disp,
+			struct drm_encoder *enc, struct drm_writeback_connector *wb,
+			const u32 *fmts, unsigned int n_fmts, const char *name)
+{
+	struct drm_device *drm = disp->drm;
+	int ret;
+
+	enc->possible_crtcs = drm_crtc_mask(&disp->crtc);
+	ret = drmm_encoder_init(drm, enc, NULL, DRM_MODE_ENCODER_VIRTUAL, name);
+	if (ret)
+		return ret;
+	drm_encoder_helper_add(enc, &histb_wb_enc_helper_funcs);
+
+	drm_connector_helper_add(&wb->base, &histb_wb_conn_helper_funcs);
+
+	return drmm_writeback_connector_init(drm, wb, &histb_wb_conn_funcs, enc,
+					     fmts, n_fmts);
+}
+
+static int histb_wb_init(struct histb_vdp2_display *disp)
+{
+	unsigned int both;
+	int ret;
+
+	if (!disp->vdp->chip->has_wbc)
+		return 0;
+
+	/*
+	 * The write-back has no enable sequence of its own: the block is armed
+	 * from the CRTC's flush, so a job that arrives while the channel is off
+	 * simply never sees a vblank.
+	 */
+	ret = histb_wb_one(disp, &disp->wb_enc, &disp->wb, histb_wb_format_list,
+			   ARRAY_SIZE(histb_wb_format_list), "histb-vdp2-wb-enc");
+	if (ret)
+		return ret;
+
+	ret = histb_wb_one(disp, &disp->wb_gp0_enc, &disp->wb_gp0,
+			   histb_wb_gp0_format_list,
+			   ARRAY_SIZE(histb_wb_gp0_format_list),
+			   "histb-vdp2-wb-gp0-enc");
+	if (ret)
+		return ret;
+
+	/*
+	 * Capturing while displaying attaches both encoders to the one CRTC, and
+	 * the core requires every encoder of a CRTC to list the others as
+	 * cloneable before it accepts such a commit.
+	 */
+	/* every encoder of the CRTC has to list the others as cloneable */
+	both = drm_encoder_mask(&disp->encoder) | drm_encoder_mask(&disp->wb_enc) |
+	       drm_encoder_mask(&disp->wb_gp0_enc);
+	disp->encoder.possible_clones = both;
+	disp->wb_enc.possible_clones = both;
+	disp->wb_gp0_enc.possible_clones = both;
+
+	return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* Framebuffer creation                                                */
+/* ------------------------------------------------------------------ */
+
+static const struct drm_framebuffer_funcs histb_wb_fb_funcs = {
+	.destroy		= drm_gem_fb_destroy,
+	.create_handle		= drm_gem_fb_create_handle,
+};
+
+/*
+ * The generic helper refuses a format that no plane can scan out. A write-back
+ * target is written by WBC_HD0 and read by no plane at all, so the plane list
+ * cannot describe it and those framebuffers are assembled here.
+ */
+static struct drm_framebuffer *
+histb_vdp2_fb_create(struct drm_device *drm, struct drm_file *file,
+		     const struct drm_format_info *info,
+		     const struct drm_mode_fb_cmd2 *mode_cmd)
+{
+	struct drm_gem_object *objs[DRM_FORMAT_MAX_PLANES] = { NULL };
+	struct drm_framebuffer *fb;
+	unsigned int i;
+	int ret;
+
+	if (drm_any_plane_has_format(drm, mode_cmd->pixel_format,
+				     mode_cmd->modifier[0]))
+		return drm_gem_fb_create(drm, file, info, mode_cmd);
+
+	if (!histb_wb_fmt_find(mode_cmd->pixel_format)) {
+		drm_dbg_kms(drm, "%p4cc is neither scanned out nor written back\n",
+			    &mode_cmd->pixel_format);
+		return ERR_PTR(-EINVAL);
+	}
+
+	for (i = 0; i < info->num_planes; i++) {
+		unsigned int width = drm_format_info_plane_width(info,
+							mode_cmd->width, i);
+		unsigned int height = drm_format_info_plane_height(info,
+							mode_cmd->height, i);
+		unsigned int min_size;
+
+		objs[i] = drm_gem_object_lookup(file, mode_cmd->handles[i]);
+		if (!objs[i]) {
+			drm_dbg_kms(drm, "no GEM object behind handle %u\n",
+				    mode_cmd->handles[i]);
+			ret = -ENOENT;
+			goto err_put;
+		}
+
+		min_size = (height - 1) * mode_cmd->pitches[i] +
+			   drm_format_info_min_pitch(info, i, width) +
+			   mode_cmd->offsets[i];
+		if (objs[i]->size < min_size) {
+			drm_dbg_kms(drm, "buffer of %zu bytes is short of the %u needed for plane "
+				    "%u\n",
+				    objs[i]->size, min_size, i);
+			ret = -EINVAL;
+			goto err_put;
+		}
+	}
+
+	/*
+	 * Plain slab allocation, not a drmm action: the destroy callback this
+	 * framebuffer uses is drm_gem_fb_destroy(), which frees with kfree().
+	 */
+	fb = kzalloc_obj(*fb);
+	if (!fb) {
+		ret = -ENOMEM;
+		goto err_put;
+	}
+
+	drm_helper_mode_fill_fb_struct(drm, fb, info, mode_cmd);
+	for (i = 0; i < info->num_planes; i++)
+		fb->obj[i] = objs[i];
+
+	ret = drm_framebuffer_init(drm, fb, &histb_wb_fb_funcs);
+	if (ret) {
+		kfree(fb);
+		goto err_put;
+	}
+
+	return fb;
+
+err_put:
+	while (i > 0) {
+		--i;
+		drm_gem_object_put(objs[i]);
+	}
+	return ERR_PTR(ret);
+}
 
 /* ------------------------------------------------------------------ */
 /* CRTC (DHD0 channel)                                                 */
@@ -733,6 +1273,24 @@ static enum drm_mode_status histb_vdp2_crtc_mode_valid(struct drm_crtc *crtc,
 	if (mode->hdisplay % 2 || mode->vdisplay % 2)
 		return MODE_BAD;
 
+	/*
+	 * DHD0_VSYNC/VPLUS hold VBB/VFB in 8 bits and DHD0_PWR holds VPW in
+	 * 8 bits; H porch/sync fields are 16 bits. FIELD_PREP would truncate
+	 * an out-of-range timing into a different picture, so reject it here.
+	 */
+	{
+		unsigned int vsync = mode->vsync_end - mode->vsync_start;
+		unsigned int vbb = vsync + mode->vtotal - mode->vsync_end;
+		unsigned int vfb = mode->vsync_start - mode->vdisplay;
+		unsigned int hsync = mode->hsync_end - mode->hsync_start;
+		unsigned int hbb = hsync + mode->htotal - mode->hsync_end;
+		unsigned int hfb = mode->hsync_start - mode->hdisplay;
+
+		if (vsync > 255 || vbb > 255 || vfb > 255 ||
+		    hsync > 65535 || hbb > 65535 || hfb > 65535)
+			return MODE_BAD;
+	}
+
 	/* the HD PLL and channel divider can only produce certain rates */
 	rate = clk_round_rate(vdp->clk_pix, mode->clock * 1000);
 	if (rate < 0)
@@ -804,6 +1362,48 @@ static void histb_vdp2_hdate_setup(struct histb_vdp2 *vdp,
 	vo_write(vdp, HDATE_EN, HDATE_EN_HD);
 }
 
+/*
+ * Routing a capture onto the channel's tap changes no timing, so it must not be
+ * read as a mode change: a commit that re-modesets the channel drops the
+ * transmitter's clock, and the sink then takes seconds to find the picture
+ * again (board: a capture and a bare CRTC off/on cycle cost the same 4.8 s gap).
+ * Only the write-back connector's reroute is excused here; any other reroute,
+ * or a real mode or active change, still modesets. The Arm display drivers take
+ * the same step for their write-back taps.
+ */
+static int histb_vdp2_crtc_atomic_check(struct drm_crtc *crtc,
+					struct drm_atomic_commit *state)
+{
+	struct drm_crtc_state *new_state =
+		drm_atomic_get_new_crtc_state(state, crtc);
+	struct drm_connector *conn;
+	struct drm_connector_state *conn_state;
+	unsigned int i;
+	bool rerouted = false;
+
+	if (!new_state->connectors_changed || new_state->mode_changed ||
+	    new_state->active_changed)
+		return 0;
+
+	for_each_new_connector_in_state(state, conn, conn_state, i) {
+		struct drm_connector_state *old_state =
+			drm_atomic_get_old_connector_state(state, conn);
+
+		if (old_state->crtc == conn_state->crtc)
+			continue;
+		if (old_state->crtc != crtc && conn_state->crtc != crtc)
+			continue;
+		if (conn->connector_type != DRM_MODE_CONNECTOR_WRITEBACK)
+			return 0;
+		rerouted = true;
+	}
+
+	if (rerouted)
+		new_state->connectors_changed = false;
+
+	return 0;
+}
+
 static void histb_vdp2_crtc_atomic_enable(struct drm_crtc *crtc,
 					struct drm_atomic_commit *state)
 {
@@ -859,7 +1459,7 @@ static void histb_vdp2_crtc_atomic_enable(struct drm_crtc *crtc,
 	if (fb) {
 		gem = drm_fb_dma_get_gem_obj(fb, 0);
 		if (gem)
-			histb_vdp2_g0_set(vdp, fb, gem, pstate->visible);
+			histb_vdp2_g0_set(vdp, fb, gem, pstate, pstate->visible);
 	}
 
 	drm_crtc_vblank_on(crtc);
@@ -869,7 +1469,24 @@ static void histb_vdp2_crtc_atomic_disable(struct drm_crtc *crtc,
 					 struct drm_atomic_commit *state)
 {
 	struct histb_vdp2 *vdp = crtc_to_vdp(crtc);
+	struct histb_vdp2_display *disp = container_of(crtc,
+						  struct histb_vdp2_display, crtc);
+	unsigned int tap;
 	u32 ctrl;
+
+	/*
+	 * A capture still armed when the channel goes down never sees its frame
+	 * done: close it out here so the client gets a signalled fence rather
+	 * than waiting on an interrupt that cannot come.
+	 */
+	for (tap = 0; tap < ARRAY_SIZE(disp->wb_pending); tap++) {
+		if (!READ_ONCE(disp->wb_pending[tap]))
+			continue;
+		histb_wb_stop(vdp, histb_wb_base_of(tap));
+		WRITE_ONCE(disp->wb_pending[tap], false);
+		drm_writeback_signal_completion(disp->wb_running[tap], 0);
+		disp->wb_running[tap] = NULL;
+	}
 
 	drm_crtc_vblank_off(crtc);
 
@@ -880,6 +1497,13 @@ static void histb_vdp2_crtc_atomic_disable(struct drm_crtc *crtc,
 	ctrl &= ~DHD_CTRL_INTF_EN;
 	ctrl |= DHD_CTRL_REGUP;
 	vo_write(vdp, DHD0_CTRL, ctrl);
+	/*
+	 * No wait here, unlike the layer latch above: the DHD block only consumes
+	 * its update request while the interface is enabled, so a write that clears
+	 * INTF_EN leaves REGUP set forever (board: the same write with INTF_EN kept
+	 * set read back cleared at once, the clear-INTF_EN one warned three times
+	 * in a row). The SDK never waits here either.
+	 */
 }
 
 static int histb_vdp2_crtc_enable_vblank(struct drm_crtc *crtc)
@@ -889,9 +1513,8 @@ static int histb_vdp2_crtc_enable_vblank(struct drm_crtc *crtc)
 	if (vdp->irq < 0)
 		return -EOPNOTSUPP;
 
-	/* unmask the DHD0 threshold-1 interrupt */
 	vo_write(vdp, VO_INTMSK,
-		 vo_read(vdp, VO_INTMSK) & ~VO_INT_DHD0_VTTHD1);
+		 vo_read(vdp, VO_INTMSK) | VO_INT_DHD0_VTTHD1);
 	return 0;
 }
 
@@ -903,21 +1526,65 @@ static void histb_vdp2_crtc_disable_vblank(struct drm_crtc *crtc)
 		return;
 
 	vo_write(vdp, VO_INTMSK,
-		 vo_read(vdp, VO_INTMSK) | VO_INT_DHD0_VTTHD1);
+		 vo_read(vdp, VO_INTMSK) & ~VO_INT_DHD0_VTTHD1);
 }
 
 static void histb_vdp2_crtc_atomic_flush(struct drm_crtc *crtc,
 				       struct drm_atomic_commit *state)
 {
 	struct drm_crtc_state *new_state = drm_atomic_get_new_crtc_state(state, crtc);
+	struct histb_vdp2_display *disp = container_of(crtc,
+						  struct histb_vdp2_display, crtc);
+	struct drm_connector_state *conn_state;
+	struct drm_framebuffer *fb;
+	const struct histb_wb_fmt *fmt;
+
+	struct drm_writeback_connector *wbs[2] = { &disp->wb, &disp->wb_gp0 };
+	unsigned int tap;
+
+	for (tap = 0; tap < ARRAY_SIZE(wbs); tap++) {
+		struct drm_writeback_connector *wb = wbs[tap];
+
+		conn_state = drm_atomic_get_new_connector_state(state, &wb->base);
+		if (!conn_state || !conn_state->writeback_job ||
+		    !conn_state->writeback_job->fb)
+			continue;
+		/*
+		 * A job whose block is still busy stays queued for the next commit
+		 * rather than being dropped silently, which would leave the client
+		 * waiting for a writeback fence.
+		 */
+		if (READ_ONCE(disp->wb_pending[tap]))
+			continue;
+		fb = conn_state->writeback_job->fb;
+		fmt = histb_wb_fmt_find(fb->format->format);
+		if (!fmt)
+			continue;
+		histb_wb_start(disp, tap, fmt, fb, wb);
+		drm_writeback_queue_job(wb, conn_state);
+	}
 
 	/*
 	 * The VDP latches the whole frame at once and the vblank IRQ only marks
 	 * the count, so send the flip event right after the commit.
 	 */
 	if (new_state->event) {
+		int ret = drm_crtc_vblank_get(crtc);
+
 		spin_lock_irq(&crtc->dev->event_lock);
-		drm_crtc_send_vblank_event(crtc, new_state->event);
+		if (ret) {
+			/*
+			 * No vblank reference: deliver it now rather than leave
+			 * the client waiting for an interrupt that will not come.
+			 */
+			drm_crtc_send_vblank_event(crtc, new_state->event);
+		} else {
+			/*
+			 * The block latches at REGUP, but the client's notion of
+			 * "on screen" is the frame boundary; arm the event there.
+			 */
+			drm_crtc_arm_vblank_event(crtc, new_state->event);
+		}
 		new_state->event = NULL;	/* consumed: keep hw_done quiet */
 		spin_unlock_irq(&crtc->dev->event_lock);
 	}
@@ -925,6 +1592,7 @@ static void histb_vdp2_crtc_atomic_flush(struct drm_crtc *crtc,
 
 static const struct drm_crtc_helper_funcs histb_vdp2_crtc_helper_funcs = {
 	.mode_valid		= histb_vdp2_crtc_mode_valid,
+	.atomic_check		= histb_vdp2_crtc_atomic_check,
 	.atomic_enable		= histb_vdp2_crtc_atomic_enable,
 	.atomic_disable		= histb_vdp2_crtc_atomic_disable,
 	.atomic_flush		= histb_vdp2_crtc_atomic_flush,
@@ -946,7 +1614,9 @@ static irqreturn_t histb_vdp2_irq_handler(int irq, void *data)
 	struct histb_vdp2 *vdp = data;
 	struct histb_vdp2_display *disp = READ_ONCE(vdp->disp);
 	u32 all = vo_read(vdp, VO_INTSTA);
-	u32 sta = all & ~vo_read(vdp, VO_INTMSK);
+	u32 expected;
+	u32 sta = all & vo_read(vdp, VO_INTMSK);
+	unsigned int t;
 
 	if (!all)
 		return IRQ_NONE;
@@ -961,13 +1631,26 @@ static irqreturn_t histb_vdp2_irq_handler(int irq, void *data)
 	 */
 	vo_write(vdp, VO_MSKINTSTA, all);
 
-	if (sta & ~VO_INT_DHD0_VTTHD1)
+	/* an armed block's own frame-done source is expected while it runs */
+	expected = VO_INT_DHD0_VTTHD1;
+	if (disp) {
+		for (t = 0; t < ARRAY_SIZE(disp->wb_pending); t++) {
+			if (!READ_ONCE(disp->wb_pending[t]))
+				continue;
+			expected |= histb_wb_vte_bit(histb_wb_base_of(t));
+		}
+	}
+
+	if (sta & ~expected)
 		dev_warn_ratelimited(vdp->dev, "vdp irq: unexpected status %08x\n",
 				     sta);
 
 	/* the line stays requested across an aggregate unbind, no CRTC then */
-	if (disp && (sta & VO_INT_DHD0_VTTHD1))
-		drm_crtc_handle_vblank(&disp->crtc);
+	if (disp) {
+		if (sta & VO_INT_DHD0_VTTHD1)
+			drm_crtc_handle_vblank(&disp->crtc);
+		histb_wb_update(disp, sta);
+	}
 
 	return IRQ_HANDLED;
 }
@@ -977,7 +1660,7 @@ static irqreturn_t histb_vdp2_irq_handler(int irq, void *data)
 /* ------------------------------------------------------------------ */
 
 static const struct drm_mode_config_funcs histb_vdp2_mode_config_funcs = {
-	.fb_create		= drm_gem_fb_create,
+	.fb_create		= histb_vdp2_fb_create,
 	.atomic_check		= drm_atomic_helper_check,
 	.atomic_commit		= drm_atomic_helper_commit,
 };
@@ -1066,7 +1749,12 @@ static int histb_vdp2_bind(struct device *dev)
 		goto err_put;
 	}
 
-	ret = drm_universal_plane_init(drm, &disp->primary, 0,
+	/*
+	 * One CRTC, and the plane has to advertise it: a zero mask makes
+	 * generic atomic clients skip the primary plane entirely (the fbdev
+	 * client works anyway because it drives the CRTC's plane directly).
+	 */
+	ret = drm_universal_plane_init(drm, &disp->primary, 1,
 				       &histb_vdp2_plane_funcs,
 				       histb_vdp2_formats,
 				       ARRAY_SIZE(histb_vdp2_formats),
@@ -1076,6 +1764,20 @@ static int histb_vdp2_bind(struct device *dev)
 		goto err_put;
 	}
 	drm_plane_helper_add(&disp->primary, &histb_vdp2_plane_helper_funcs);
+
+	/*
+	 * There is no upstream blend mode that describes what this block does
+	 * with a pixel's alpha byte: the field is 7 bits wide, so bit 7 is
+	 * discarded and coverage wraps (board: alpha 129 scans as transparent,
+	 * 192 as half coverage, 240 as 0.875). The surface is therefore
+	 * scanned out opaque and only "None" is offered.
+	 */
+	ret = drm_plane_create_blend_mode_property(&disp->primary,
+					BIT(DRM_MODE_BLEND_PIXEL_NONE));
+	if (ret) {
+		dev_err_probe(dev, ret, "blend_mode failed\n");
+		goto err_put;
+	}
 
 	ret = drm_crtc_init_with_planes(drm, &disp->crtc, &disp->primary, NULL,
 					&histb_vdp2_crtc_funcs, "histb-vdp2-crtc");
@@ -1109,6 +1811,12 @@ static int histb_vdp2_bind(struct device *dev)
 		goto err_put;
 	}
 	drm_connector_attach_encoder(connector, &disp->encoder);
+
+	ret = histb_wb_init(disp);
+	if (ret) {
+		dev_err_probe(dev, ret, "failed to init the write-back connector\n");
+		goto err_put;
+	}
 
 	/*
 	 * The transmitter has no usable HPD output (it is a level signal that
@@ -1194,6 +1902,13 @@ static int histb_vdp2_add_master(struct device *dev)
  */
 static void histb_vdp2_hw_reset(struct histb_vdp2 *vdp)
 {
+	u32 g0 = vo_read(vdp, G0_CTRL);
+	u32 gp0 = vo_read(vdp, GP0_CTRL);
+	u32 ctrl = vo_read(vdp, DHD0_CTRL);
+	bool live = (g0 & G0_CTRL_SURFACE_EN) || (gp0 & GP0_CTRL_READ_MODE) ||
+		    (ctrl & DHD_CTRL_INTF_EN);
+	unsigned int i;
+
 	/*
 	 * DHD0_CTRL is the readback that says the pulse landed: whoever used
 	 * the display before us normally leaves the HD channel enabled, and a
@@ -1202,10 +1917,48 @@ static void histb_vdp2_hw_reset(struct histb_vdp2 *vdp)
 	 */
 	dev_dbg(vdp->dev, "before reset: DHD0_CTRL %08x\n", vo_read(vdp, DHD0_CTRL));
 
+	/*
+	 * Stop the fetchers and let an in-flight frame retire before the bus
+	 * reset: the channel the bootloader leaves running is still reading a
+	 * framebuffer the driver is about to own (EV200 user guide section 9.2.3.2
+	 * orders the same way for this block family).
+	 */
+	if (g0 & G0_CTRL_SURFACE_EN) {
+		vo_write(vdp, G0_CTRL, g0 & ~G0_CTRL_SURFACE_EN);
+		vo_write(vdp, G0_UPD, G0_UPD_REGUP);
+	}
+	if (gp0 & GP0_CTRL_READ_MODE) {
+		vo_write(vdp, GP0_CTRL, gp0 & ~GP0_CTRL_READ_MODE);
+		vo_write(vdp, GP0_UPD, GP0_UPD_REGUP);
+	}
+	if (ctrl & DHD_CTRL_INTF_EN) {
+		ctrl &= ~DHD_CTRL_INTF_EN;
+		vo_write(vdp, DHD0_CTRL, ctrl);
+	}
+	if (live) {
+		usleep_range(20000, 22000);
+		/* A live channel here means the bootloader left one behind. */
+		dev_info(vdp->dev, "quiesced before reset: DHD0_CTRL %08x\n",
+			 vo_read(vdp, DHD0_CTRL));
+	}
+
 	reset_control_assert(vdp->rst);
 	usleep_range(5000, 5200);
 	reset_control_deassert(vdp->rst);
 	usleep_range(1000, 1200);
+	/*
+	 * Completion judgement for the reset: VDPVERSION1 reads 0 while the
+	 * block is held in reset (measured on the board: 0x00000000 five
+	 * milliseconds into the assert window, 0x76756f76 at the first read
+	 * after deassert), so a non-zero version is the read-back that says
+	 * the reset actually released. It does not release if the clocking the
+	 * VOU reset domain needs is not running -- the case that used to show
+	 * up only as a register file that never answered again.
+	 */
+	for (i = 0; i < 20 && !vo_read(vdp, VO_VDPVERSION1); i++)
+		usleep_range(200, 250);
+	if (!vo_read(vdp, VO_VDPVERSION1))
+		dev_warn(vdp->dev, "vdp still in reset: VDPVERSION1 reads 0\n");
 
 	dev_dbg(vdp->dev, "after reset: DHD0_CTRL %08x\n", vo_read(vdp, DHD0_CTRL));
 }
@@ -1239,8 +1992,39 @@ static int histb_vdp2_runtime_resume(struct device *dev)
 	return 0;
 }
 
+/*
+ * System sleep. The block keeps its clocks for the whole probed lifetime
+ * (see histb_vdp2_probe()), so what sleep has to do is keep the pipeline
+ * from being committed while the SoC is down and put the same mode back on
+ * wake: the reset in histb_vdp2_runtime_resume(), and any power gating the
+ * sleep path itself does, leave the register file at its defaults, so the
+ * saved atomic state has to be re-committed.
+ */
+static int histb_vdp2_suspend(struct device *dev)
+{
+	struct histb_vdp2 *vdp = dev_get_drvdata(dev);
+	struct histb_vdp2_display *disp = READ_ONCE(vdp->disp);
+
+	if (!disp)
+		return 0;
+
+	return drm_mode_config_helper_suspend(disp->drm);
+}
+
+static int histb_vdp2_resume(struct device *dev)
+{
+	struct histb_vdp2 *vdp = dev_get_drvdata(dev);
+	struct histb_vdp2_display *disp = READ_ONCE(vdp->disp);
+
+	if (!disp)
+		return 0;
+
+	return drm_mode_config_helper_resume(disp->drm);
+}
+
 static const struct dev_pm_ops histb_vdp2_pm_ops = {
 	RUNTIME_PM_OPS(histb_vdp2_runtime_suspend, histb_vdp2_runtime_resume, NULL)
+	SYSTEM_SLEEP_PM_OPS(histb_vdp2_suspend, histb_vdp2_resume)
 };
 
 static int histb_vdp2_probe(struct platform_device *pdev)
@@ -1250,13 +2034,13 @@ static int histb_vdp2_probe(struct platform_device *pdev)
 	int ret;
 
 	vdp = devm_kzalloc(dev, sizeof(*vdp), GFP_KERNEL);
+	if (!vdp)
+		return -ENOMEM;
+
 	vdp->chip = of_device_get_match_data(dev);
 	if (!vdp->chip)
 		return -ENODEV;
 	vdp->zme = vdp->chip->zme;
-
-	if (!vdp)
-		return -ENOMEM;
 
 	vdp->dev = dev;
 	platform_set_drvdata(pdev, vdp);
@@ -1325,15 +2109,20 @@ static int histb_vdp2_probe(struct platform_device *pdev)
 	}
 
 	/*
-	 * Clear any latched status and mask every source before requesting the
-	 * line: a pending bit arriving on an unmasked line makes the core
-	 * disable the interrupt ("nobody cared"). drm_crtc_vblank_on() unmasks
-	 * VTTHD1 later.
+	 * Clear any latched status and switch every source off before requesting
+	 * the line: the VOU reset leaves VO_INTMSK all ones (measured: it reads
+	 * 0xffffffff right after probe), so the frame-threshold sources would
+	 * otherwise deliver before anyone asks for them, and a pending bit on an
+	 * enabled line that the handler ignores makes the core disable the
+	 * interrupt ("nobody cared"). Each bit delivers when set (measured: with
+	 * the register written 0 the line stops, and clearing bit 0 alone takes
+	 * 121 interrupts/s down to 60/s), so this is an enable mask, and
+	 * drm_crtc_vblank_on() turns VTTHD1 on later.
 	 */
 	vdp->irq = platform_get_irq_optional(pdev, 0);
 	if (vdp->irq >= 0) {
 		vo_write(vdp, VO_MSKINTSTA, ~0u);
-		vo_write(vdp, VO_INTMSK, ~0u);
+		vo_write(vdp, VO_INTMSK, 0);
 
 		ret = devm_request_irq(dev, vdp->irq, histb_vdp2_irq_handler,
 				       IRQF_SHARED, dev_name(dev), vdp);
