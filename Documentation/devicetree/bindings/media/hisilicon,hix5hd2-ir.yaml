@@ -18,6 +18,7 @@ properties:
       - enum:
           - hisilicon,hix5hd2-ir
           - hisilicon,hi3796cv300-ir
+          - hisilicon,hi3716cv200-ir
 
   reg:
     maxItems: 1
