@@ -320,12 +320,21 @@ static int hix5hd2_ir_probe(struct platform_device *pdev)
 	rdev->rx_resolution = 10;
 	rdev->timeout = IR_CFG_SYMBOL_MAXWIDTH * 10;
 
+	/*
+	 * The handler dereferences priv->rdev, so publish it before the
+	 * request_irq below: on Hi3716CV200 the block raises the RX line within
+	 * milliseconds of the clock gate opening, and on Hi3798MV200H the
+	 * bootloader leaves a decoded edge pending in IR_RAW_STAT, so an
+	 * interrupt that lands while rdev is still NULL oopses in
+	 * ir_raw_event_store() with a NULL argument.
+	 */
+	priv->rdev = rdev;
+	priv->dev = dev;
+	platform_set_drvdata(pdev, priv);
+
 	ret = rc_register_device(rdev);
 	if (ret < 0)
 		goto clkerr;
-
-	priv->rdev = rdev;
-	priv->dev = dev;
 
 	if (devm_request_irq(dev, priv->irq, hix5hd2_ir_rx_interrupt,
 			     0, pdev->name, priv) < 0) {
@@ -334,9 +343,7 @@ static int hix5hd2_ir_probe(struct platform_device *pdev)
 		goto regerr;
 	}
 
-	platform_set_drvdata(pdev, priv);
-
-	return ret;
+	return 0;
 
 regerr:
 	rc_unregister_device(rdev);
