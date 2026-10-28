@@ -34,7 +34,6 @@
 #define VPSS_IMGSIZE_HEIGHT	GENMASK(27, 16)
 
 #define VPSS_CUR_CTRL		0x00c
-#define VPSS_CUR_CTRL_TILE	BIT(4)
 #define VPSS_CUR_CTRL_HOR_OFFSET	GENMASK(17, 5)
 #define VPSS_CUR_CTRL_VER_OFFSET	GENMASK(30, 18)
 
@@ -136,10 +135,23 @@
 #define VPSS_START		0x300
 #define VPSS_INTSTATE		0x304
 #define VPSS_INTSTATE_EOF	BIT(0)		/* raw_eof */
+#define VPSS_INTSTATE_TIMEOUT	BIT(1)		/* raw_timeout: the block's own limit */
+#define VPSS_INTSTATE_BUS_W	BIT(2)		/* write path rejected by the bus */
 #define VPSS_INTSTATE_DONE	BIT(3)		/* raw_eof_end */
+#define VPSS_INTSTATE_VHD_TUNL	BIT(4)		/* output tunnel overrun */
+#define VPSS_INTSTATE_STR_TUNL	BIT(6)		/* stride tunnel overrun */
+#define VPSS_INTSTATE_DCMP	BIT(7)		/* tile decompress error */
+#define VPSS_INTSTATE_BUS_R	BIT(10)		/* read path rejected by the bus */
+/* hi_reg_vpss.h U_VPSS_INTSTATE: everything but the two end-of-frame bits */
+#define VPSS_INTSTATE_ERRORS	(VPSS_INTSTATE_TIMEOUT | VPSS_INTSTATE_BUS_W | \
+				 VPSS_INTSTATE_VHD_TUNL | VPSS_INTSTATE_STR_TUNL | \
+				 VPSS_INTSTATE_DCMP | VPSS_INTSTATE_BUS_R)
 #define VPSS_INTCLR		0x308
 #define VPSS_MISCELLANEOUS	0x314
 #define VPSS_TIMEOUT		0x31c
+#define VPSS_VERSION		0x330		/* constant id word; 0 while the block
+						 * has no clock or does not decode
+						 */
 
 /* Register images are one contiguous block; the deepest field is at 0x5058. */
 #define VPSS_REG_IMAGE_SIZE	0x6000
