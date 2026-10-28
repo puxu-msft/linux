@@ -48,6 +48,7 @@
 struct histb_vpss_fmt {
 	u32	fourcc;
 	bool	nv21;
+	bool	fmt422;
 };
 
 struct histb_vpss {
@@ -77,6 +78,7 @@ struct histb_vpss_ctx {
 	struct v4l2_ctrl	*dei_ctrl;
 	struct v4l2_ctrl	*hflip;
 	struct v4l2_ctrl	*vflip;
+	struct v4l2_ctrl	*sharpness;
 };
 
 struct histb_vpss_job {
@@ -88,23 +90,30 @@ struct histb_vpss_job {
 	unsigned int	out_height;
 	unsigned int	src_stride;
 	unsigned int	dst_stride;
+	bool		in_422;
+	bool		out_422;
 	bool		invert_uv;
+	unsigned int	sharpness;
 	bool		hflip;
 	bool		vflip;
-	unsigned int	crop_x;
-	unsigned int	crop_y;
-	unsigned int	crop_w;
-	unsigned int	crop_h;
+	unsigned int	in_x;
+	unsigned int	in_y;
+	unsigned int	in_w;
+	unsigned int	in_h;
 };
 
 static const struct histb_vpss_fmt histb_vpss_out_fmts[] = {
-	{ V4L2_PIX_FMT_NV12, false },
-	{ V4L2_PIX_FMT_NV21, true },
+	{ V4L2_PIX_FMT_NV12, false, false },
+	{ V4L2_PIX_FMT_NV21, true, false },
+	{ V4L2_PIX_FMT_NV16, false, true },
+	{ V4L2_PIX_FMT_NV61, true, true },
 };
 
 static const struct histb_vpss_fmt histb_vpss_cap_fmts[] = {
-	{ V4L2_PIX_FMT_NV12, false },
-	{ V4L2_PIX_FMT_NV21, true },
+	{ V4L2_PIX_FMT_NV12, false, false },
+	{ V4L2_PIX_FMT_NV21, true, false },
+	{ V4L2_PIX_FMT_NV16, false, true },
+	{ V4L2_PIX_FMT_NV61, true, true },
 };
 
 static void histb_vpss_reset(struct histb_vpss *vpss);
@@ -149,7 +158,11 @@ static void histb_vpss_fill_fmt(const struct histb_vpss_fmt *f,
 
 	stride = histb_vpss_stride(width, pix->bytesperline);
 	pix->bytesperline = stride;
-	pix->sizeimage = stride * height * 3 / 2;
+	/* 4:2:2 keeps a full-height chroma plane beside the luma. */
+	if (f->fmt422)
+		pix->sizeimage = stride * height * 2;
+	else
+		pix->sizeimage = stride * height * 3 / 2;
 }
 
 static int histb_vpss_querycap(struct file *file, void *priv,
@@ -232,9 +245,22 @@ static int histb_vpss_s_fmt(struct file *file, void *priv,
 
 	if (V4L2_TYPE_IS_OUTPUT(f->type)) {
 		ctx->src_fmt = f->fmt.pix;
-	} else {
-		ctx->dst_fmt = f->fmt.pix;
 		histb_vpss_reset_crop(ctx);
+	} else {
+		/* The block converts between chroma orders but not between the
+		 * 4:2:0 and 4:2:2 families: mixing them leaves the job unfinished
+		 *, so a client has to stay in one family.
+		 */
+		const struct histb_vpss_fmt *src = histb_vpss_find(
+			histb_vpss_out_fmts, ARRAY_SIZE(histb_vpss_out_fmts),
+			ctx->src_fmt.pixelformat);
+		const struct histb_vpss_fmt *dst = histb_vpss_find(
+			histb_vpss_cap_fmts, ARRAY_SIZE(histb_vpss_cap_fmts),
+			f->fmt.pix.pixelformat);
+
+		if (!src || !dst || src->fmt422 != dst->fmt422)
+			return -EINVAL;
+		ctx->dst_fmt = f->fmt.pix;
 	}
 	return 0;
 }
@@ -243,8 +269,8 @@ static void histb_vpss_reset_crop(struct histb_vpss_ctx *ctx)
 {
 	ctx->crop.left = 0;
 	ctx->crop.top = 0;
-	ctx->crop.width = ctx->dst_fmt.width;
-	ctx->crop.height = ctx->dst_fmt.height;
+	ctx->crop.width = ctx->src_fmt.width;
+	ctx->crop.height = ctx->src_fmt.height;
 }
 
 static int histb_vpss_g_selection(struct file *file, void *priv,
@@ -252,13 +278,31 @@ static int histb_vpss_g_selection(struct file *file, void *priv,
 {
 	struct histb_vpss_ctx *ctx = histb_vpss_ctx_of(file);
 
-	if (!V4L2_TYPE_IS_CAPTURE(sel->type))
-		return -EINVAL;
 	switch (sel->target) {
+	case V4L2_SEL_TGT_CROP_BOUNDS:
+		if (V4L2_TYPE_IS_CAPTURE(sel->type))
+			return -EINVAL;
+		sel->r.left = 0;
+		sel->r.top = 0;
+		sel->r.width = ctx->src_fmt.width;
+		sel->r.height = ctx->src_fmt.height;
+		return 0;
 	case V4L2_SEL_TGT_CROP:
 	case V4L2_SEL_TGT_CROP_DEFAULT:
-	case V4L2_SEL_TGT_CROP_BOUNDS:
+		if (V4L2_TYPE_IS_CAPTURE(sel->type))
+			return -EINVAL;
 		sel->r = ctx->crop;
+		return 0;
+	case V4L2_SEL_TGT_COMPOSE_BOUNDS:
+	case V4L2_SEL_TGT_COMPOSE:
+	case V4L2_SEL_TGT_COMPOSE_DEFAULT:
+		if (!V4L2_TYPE_IS_CAPTURE(sel->type))
+			return -EINVAL;
+		/* The port only ever writes the whole CAPTURE frame. */
+		sel->r.left = 0;
+		sel->r.top = 0;
+		sel->r.width = ctx->dst_fmt.width;
+		sel->r.height = ctx->dst_fmt.height;
 		return 0;
 	default:
 		return -EINVAL;
@@ -266,11 +310,12 @@ static int histb_vpss_g_selection(struct file *file, void *priv,
 }
 
 /*
- * The block accepts a crop rectangle only when it covers the whole frame: a
- * smaller window leaves the pipeline waiting for a completion that never
- * arrives, and the
- * vendor's own port configuration never asks for one. A client that wants a
- * smaller picture scales into a smaller CAPTURE size instead.
+ * The rectangle is taken on the input side, the way the vendor's split nodes
+ * read a part of a frame: CUR_CTRL offsets the read inside the picture and
+ * IMGSIZE shrinks to the window. A VHDCROP window instead leaves the pipeline
+ * waiting for a completion that never arrives, so the destination stays whole.
+ *
+ * Offsets are on the block's own grid: rows and columns of 16 pixels.
  */
 static int histb_vpss_s_selection(struct file *file, void *priv,
 				  struct v4l2_selection *sel)
@@ -278,11 +323,14 @@ static int histb_vpss_s_selection(struct file *file, void *priv,
 	struct histb_vpss_ctx *ctx = histb_vpss_ctx_of(file);
 	struct v4l2_rect r = sel->r;
 
-	if (!V4L2_TYPE_IS_CAPTURE(sel->type) ||
+	if (V4L2_TYPE_IS_CAPTURE(sel->type) ||
 	    sel->target != V4L2_SEL_TGT_CROP)
 		return -EINVAL;
-	if (r.left || r.top || r.width != ctx->dst_fmt.width ||
-	    r.height != ctx->dst_fmt.height)
+
+	if (r.left % 16 || r.top % 16 || r.width % 16 || r.height % 16 ||
+	    !r.width || !r.height ||
+	    r.left + r.width > ctx->src_fmt.width ||
+	    r.top + r.height > ctx->src_fmt.height)
 		return -EINVAL;
 	ctx->crop = r;
 	sel->r = r;
@@ -388,8 +436,17 @@ static unsigned int histb_vpss_zme_bucket(unsigned int in, unsigned int out)
 	return 6;
 }
 
+/* Four signed 8-bit taps in one word, lowest byte first; FIELD_PREP refuses
+ * negative constants, and the field keeps the low byte either way.
+ */
+static u32 histb_vpss_coef4(int c0, int c1, int c2, int c3)
+{
+	return ((u32)c0 & 0xff) | (((u32)c1 & 0xff) << 8) |
+	       (((u32)c2 & 0xff) << 16) | (((u32)c3 & 0xff) << 24);
+}
+
 static void histb_vpss_load_coef(struct histb_vpss *vpss, unsigned int b,
-				 dma_addr_t addr[4])
+				 bool sharpen, dma_addr_t addr[4])
 {
 	static const u32 *const lh[] = {
 		histb_vpss_zme_lh_r0, histb_vpss_zme_lh_r1, histb_vpss_zme_lh_r2,
@@ -411,13 +468,38 @@ static void histb_vpss_load_coef(struct histb_vpss *vpss, unsigned int b,
 		histb_vpss_zme_cv_r3, histb_vpss_zme_cv_r4, histb_vpss_zme_cv_r5,
 		histb_vpss_zme_cv_r6,
 	};
+	static const u32 *const dti_lh[] = {
+		histb_vpss_dti_lh_r0, histb_vpss_dti_lh_r1, histb_vpss_dti_lh_r2,
+		histb_vpss_dti_lh_r3, histb_vpss_dti_lh_r4, histb_vpss_dti_lh_r5,
+		histb_vpss_dti_lh_r6,
+	};
+	static const u32 *const dti_lv[] = {
+		histb_vpss_dti_lv_r0, histb_vpss_dti_lv_r1, histb_vpss_dti_lv_r2,
+		histb_vpss_dti_lv_r3, histb_vpss_dti_lv_r4, histb_vpss_dti_lv_r5,
+		histb_vpss_dti_lv_r6,
+	};
+	static const u32 *const dti_ch[] = {
+		histb_vpss_dti_ch_r0, histb_vpss_dti_ch_r1, histb_vpss_dti_ch_r2,
+		histb_vpss_dti_ch_r3, histb_vpss_dti_ch_r4, histb_vpss_dti_ch_r5,
+		histb_vpss_dti_ch_r6,
+	};
+	static const u32 *const dti_cv[] = {
+		histb_vpss_dti_cv_r0, histb_vpss_dti_cv_r1, histb_vpss_dti_cv_r2,
+		histb_vpss_dti_cv_r3, histb_vpss_dti_cv_r4, histb_vpss_dti_cv_r5,
+		histb_vpss_dti_cv_r6,
+	};
 	static const unsigned int words[4] = { 51, 51, 34, 34 };
+	static const unsigned int dti_words[4] = { 51, 17, 34, 17 };
+	static const u32 *const *const dti[] = { dti_lh, dti_lv, dti_ch, dti_cv };
 	const u32 *tab[4] = { lh[b], lv[b], ch[b], cv[b] };
 	unsigned int i;
 
 	for (i = 0; i < 4; i++) {
-		memcpy(vpss->coef + i * 256, tab[i], words[i] * 4);
-		addr[i] = vpss->coef_dma + i * 256;
+		memcpy(vpss->coef + i * VPSS_COEF_BLOCK, tab[i], words[i] * 4);
+		if (sharpen)
+			memcpy(vpss->coef + i * VPSS_COEF_BLOCK + 256,
+			       dti[i][b], dti_words[i] * 4);
+		addr[i] = vpss->coef_dma + i * VPSS_COEF_BLOCK;
 	}
 }
 
@@ -430,17 +512,19 @@ struct histb_vpss_pass {
 	dma_addr_t	out;
 	unsigned int	in_w;
 	unsigned int	in_h;
+	unsigned int	off_x;
+	unsigned int	off_y;
+	unsigned int	frame_h;
 	unsigned int	out_w;
 	unsigned int	out_h;
 	unsigned int	in_stride;
 	unsigned int	out_stride;
+	bool		in_422;
+	bool		out_422;
 	bool		invert_uv;
+	unsigned int	sharpness;
 	bool		hflip;
 	bool		vflip;
-	unsigned int	crop_x;
-	unsigned int	crop_y;
-	unsigned int	crop_w;
-	unsigned int	crop_h;
 };
 
 static int histb_vpss_pass_run(struct histb_vpss *vpss,
@@ -464,13 +548,26 @@ static int histb_vpss_pass_run(struct histb_vpss *vpss,
 	s[VPSS_CTRL / 4] = VPSS_CTRL_VHD_EN |
 			  FIELD_PREP(VPSS_CTRL_PROT, 2);
 
-	s[VPSS_CTRL2 / 4] = FIELD_PREP(VPSS_CTRL2_IN_FORMAT, 0) |
-			   FIELD_PREP(VPSS_CTRL2_VHD_FORMAT, 0);
+	/* 0 selects the 4:2:0 semi-planar family, 2 the 4:2:2 one; the port's
+	 * format field counts 4:2:0 as 0 and 4:2:2 as 1.
+	 */
+	s[VPSS_CTRL2 / 4] = FIELD_PREP(VPSS_CTRL2_IN_FORMAT,
+				       p->in_422 ? 2 : 0) |
+			   FIELD_PREP(VPSS_CTRL2_VHD_FORMAT,
+				      p->out_422 ? 1 : 0);
 	s[VPSS_IMGSIZE / 4] = FIELD_PREP(VPSS_IMGSIZE_WIDTH, p->in_w - 1) |
 			     FIELD_PREP(VPSS_IMGSIZE_HEIGHT, p->in_h - 1);
+	/* The window is read by moving the picture's start, the way the vendor's
+	 * split nodes do it: the address and stride stay those of the whole
+	 * frame, IMGSIZE shrinks to the window, and CUR_CTRL says where inside
+	 * the frame the block begins reading.
+	 */
+	s[VPSS_CUR_CTRL / 4] =
+		FIELD_PREP(VPSS_CUR_CTRL_HOR_OFFSET, p->off_x) |
+		FIELD_PREP(VPSS_CUR_CTRL_VER_OFFSET, p->off_y);
 
 	src_c = lower_32_bits(p->in) +
-		p->in_stride * p->in_h;
+		p->in_stride * p->frame_h;
 	s[VPSS_CURYADDR / 4] = lower_32_bits(p->in);
 	s[VPSS_CURCADDR / 4] = src_c;
 	stride = p->in_stride;	/* both layouts take the pitch in bytes */
@@ -489,11 +586,14 @@ static int histb_vpss_pass_run(struct histb_vpss *vpss,
 	s[VPSS_VHDSTRIDE / 4] = FIELD_PREP(VPSS_VHDSTRIDE_Y, p->out_stride) |
 				FIELD_PREP(VPSS_VHDSTRIDE_C, p->out_stride);
 
-	if (p->out_w != p->in_w || p->out_h != p->in_h) {
+	/* The sharpen filters sit in the scaler's datapath, so a unity ratio
+	 * still has to be programmed for them to see the frame.
+	 */
+	if (p->out_w != p->in_w || p->out_h != p->in_h || p->sharpness) {
 		dma_addr_t caddr[4];
 		unsigned int b = histb_vpss_zme_bucket(p->in_w, p->out_w);
 
-		histb_vpss_load_coef(vpss, b, caddr);
+		histb_vpss_load_coef(vpss, b, p->sharpness != 0, caddr);
 		s[VPSS_VHD_ZME_LHADDR / 4] = lower_32_bits(caddr[0]);
 		s[VPSS_VHD_ZME_LVADDR / 4] = lower_32_bits(caddr[1]);
 		s[VPSS_VHD_ZME_CHADDR / 4] = lower_32_bits(caddr[2]);
@@ -519,23 +619,50 @@ static int histb_vpss_pass_run(struct histb_vpss *vpss,
 			FIELD_PREP(VPSS_ZME_OUT_FMT, 1);
 	}
 
-	/* A window smaller than the frame leaves the rest to the letterbox
-	 * fill, so the background has to be programmed and enabled with it.
+	/* Sharpen runs off the same phase table set, its taps 256 bytes in.
+	 * The gain follows the vendor PQ scale: 128 is nominal, and the
+	 * default luma and chroma ratios are 180 and 256.
+	 */
+	if (p->sharpness) {
+		unsigned int lgain = (180 * p->sharpness + 64) / 128;
+		unsigned int cgain = (256 * p->sharpness + 64) / 128;
+
+		s[VPSS_VHD_LTI_CTRL / 4] =
+			VPSS_LTI_CTRL_LTI_EN |
+			FIELD_PREP(VPSS_LTI_CTRL_LHPASS_COEF4, 0xff) |
+			FIELD_PREP(VPSS_LTI_CTRL_LMIXING_RATIO, 127) |
+			FIELD_PREP(VPSS_LTI_CTRL_LGAIN_RATIO, lgain);
+		s[VPSS_VHD_LHPASS_COEF / 4] = histb_vpss_coef4(-19, -8, -2, -1);
+		s[VPSS_VHD_LTI_THD / 4] =
+			FIELD_PREP(VPSS_LTI_THD_LOVER_SWING, 3) |
+			FIELD_PREP(VPSS_LTI_THD_LUNDER_SWING, 3) |
+			FIELD_PREP(VPSS_LTI_THD_LCORING_THD, 2);
+		s[VPSS_VHD_LHFREQ_THD / 4] =
+			FIELD_PREP(GENMASK(15, 0), 50) |
+			FIELD_PREP(GENMASK(31, 16), 51);
+		s[VPSS_VHD_LGAIN_COEF / 4] = histb_vpss_coef4(128, 128, 128, 0);
+		s[VPSS_VHD_CTI_CTRL / 4] =
+			VPSS_CTI_CTRL_CTI_EN |
+			FIELD_PREP(VPSS_CTI_CTRL_CMIXING_RATIO, 127) |
+			FIELD_PREP(VPSS_CTI_CTRL_CGAIN_RATIO, cgain);
+		s[VPSS_VHD_CHPASS_COEF / 4] = histb_vpss_coef4(-21, -21, -11, 0);
+		s[VPSS_VHD_CTI_THD / 4] =
+			FIELD_PREP(VPSS_CTI_THD_COVER_SWING, 4) |
+			FIELD_PREP(VPSS_CTI_THD_CUNDER_SWING, 4) |
+			FIELD_PREP(VPSS_CTI_THD_CCORING_THD, 4);
+	}
+
+	/* The port writes the whole CAPTURE frame: a VHDCROP window smaller than
+	 * the port never reports done, so a client that wants fewer
+	 * pixels crops the source instead.
 	 */
 	s[VPSS_VHDLBA_BK / 4] = FIELD_PREP(GENMASK(15, 8), 0x10) |
 				FIELD_PREP(GENMASK(23, 16), 0x80) |
 				FIELD_PREP(GENMASK(31, 24), 0x80);
-	s[VPSS_VHDLBA_VFPOS / 4] = FIELD_PREP(GENMASK(12, 0), p->crop_x) |
-				   FIELD_PREP(GENMASK(28, 16), p->crop_y);
-	if (p->crop_w != p->out_w || p->crop_h != p->out_h)
-		s[VPSS_CTRL / 4] |= VPSS_CTRL_VHD_LBA_EN;
-	s[VPSS_VHDCROP_POS / 4] =
-		FIELD_PREP(VPSS_VHDCROP_X, p->crop_x) |
-		FIELD_PREP(VPSS_VHDCROP_Y, p->crop_y);
 	s[VPSS_VHDCROP_SIZE / 4] =
 		VPSS_CROP_EN |
-		FIELD_PREP(VPSS_VHDCROP_WIDTH, p->crop_w - 1) |
-		FIELD_PREP(VPSS_VHDCROP_HEIGHT, p->crop_h - 1);
+		FIELD_PREP(VPSS_VHDCROP_WIDTH, p->out_w - 1) |
+		FIELD_PREP(VPSS_VHDCROP_HEIGHT, p->out_h - 1);
 
 	s[VPSS_PNEXT / 4] = 0;
 	s[VPSS_START / 4] = 1;
@@ -568,19 +695,21 @@ static void histb_vpss_pass_fill(struct histb_vpss_pass *p,
 {
 	p->in = job->src;
 	p->out = job->dst;
-	p->in_w = job->width;
-	p->in_h = job->height;
+	p->in_w = job->in_w;
+	p->in_h = job->in_h;
+	p->off_x = job->in_x;
+	p->off_y = job->in_y;
+	p->frame_h = job->height;
 	p->out_w = job->out_width;
 	p->out_h = job->out_height;
 	p->in_stride = job->src_stride;
 	p->out_stride = job->dst_stride;
+	p->in_422 = job->in_422;
+	p->sharpness = job->sharpness;
+	p->out_422 = job->out_422;
 	p->invert_uv = job->invert_uv;
 	p->hflip = job->hflip;
 	p->vflip = job->vflip;
-	p->crop_x = job->crop_x;
-	p->crop_y = job->crop_y;
-	p->crop_w = job->crop_w;
-	p->crop_h = job->crop_h;
 }
 
 static int histb_vpss_run(struct histb_vpss *vpss,
@@ -614,6 +743,13 @@ static void histb_vpss_device_run(void *priv)
 	job.out_height = ctx->dst_fmt.height;
 	job.src_stride = ctx->src_fmt.bytesperline;
 	job.dst_stride = ctx->dst_fmt.bytesperline;
+	job.sharpness = ctx->sharpness ? ctx->sharpness->val : 0;
+	job.in_422 = histb_vpss_find(histb_vpss_out_fmts,
+				     ARRAY_SIZE(histb_vpss_out_fmts),
+				     ctx->src_fmt.pixelformat)->fmt422;
+	job.out_422 = histb_vpss_find(histb_vpss_cap_fmts,
+				      ARRAY_SIZE(histb_vpss_cap_fmts),
+				      ctx->dst_fmt.pixelformat)->fmt422;
 	job.invert_uv = histb_vpss_find(histb_vpss_out_fmts,
 					ARRAY_SIZE(histb_vpss_out_fmts),
 					ctx->src_fmt.pixelformat)->nv21 !=
@@ -621,17 +757,20 @@ static void histb_vpss_device_run(void *priv)
 					ARRAY_SIZE(histb_vpss_cap_fmts),
 					ctx->dst_fmt.pixelformat)->nv21;
 	dei_mode = ctx->dei_ctrl ? ctx->dei_ctrl->val : VPSS_DEI_NONE;
-	job.crop_x = ctx->crop.left;
-	job.crop_y = ctx->crop.top;
-	job.crop_w = ctx->crop.width;
-	job.crop_h = ctx->crop.height;
+	job.in_x = ctx->crop.left;
+	job.in_y = ctx->crop.top;
+	job.in_w = ctx->crop.width;
+	job.in_h = ctx->crop.height;
 	/* Bob doubles one field vertically through the scaler, so it only
 	 * exists when the buffer is a field and the CAPTURE rectangle is twice
 	 * its height; asking for it any other way is a mistake worth a warning
-	 * rather than a silent plain conversion.
+	 * rather than a silent plain conversion. A source window would shrink
+	 * the field it doubles, so a cropped bob is refused too.
 	 */
 	if (dei_mode == VPSS_DEI_BOB &&
 	    (ctx->dst_fmt.height != job.height * 2 ||
+	     job.in_x || job.in_y ||
+	     job.in_w != job.width || job.in_h != job.height ||
 	     (src->field != V4L2_FIELD_TOP &&
 	      src->field != V4L2_FIELD_BOTTOM))) {
 		dev_warn_ratelimited(vpss->dev,
@@ -712,6 +851,8 @@ static int histb_vpss_ctrls_create(struct histb_vpss_ctx *ctx)
 	v4l2_ctrl_handler_init(hdl, 3);
 	ctx->hflip = v4l2_ctrl_new_std(hdl, NULL, V4L2_CID_HFLIP, 0, 1, 1, 0);
 	ctx->vflip = v4l2_ctrl_new_std(hdl, NULL, V4L2_CID_VFLIP, 0, 1, 1, 0);
+	ctx->sharpness = v4l2_ctrl_new_std(hdl, NULL, V4L2_CID_SHARPNESS, 0, 255,
+					   1, 0);
 	ctx->dei_ctrl = v4l2_ctrl_new_std_menu_items(hdl, NULL,
 						     V4L2_CID_DEINTERLACING_MODE,
 						     VPSS_DEI_WEAVE, 0,
@@ -855,8 +996,8 @@ static int histb_vpss_probe(struct platform_device *pdev)
 					  &vpss->shadow_dma, GFP_KERNEL);
 	if (!vpss->shadow)
 		return -ENOMEM;
-	vpss->coef = dma_alloc_coherent(&pdev->dev, 4 * 256, &vpss->coef_dma,
-					GFP_KERNEL);
+	vpss->coef = dma_alloc_coherent(&pdev->dev, VPSS_COEF_BYTES,
+					&vpss->coef_dma, GFP_KERNEL);
 	if (!vpss->coef)
 		return -ENOMEM;
 
@@ -910,7 +1051,8 @@ static void histb_vpss_remove(struct platform_device *pdev)
 	clk_disable_unprepare(vpss->clk);
 	dma_free_coherent(vpss->dev, VPSS_REG_IMAGE_SIZE, vpss->shadow,
 			  vpss->shadow_dma);
-	dma_free_coherent(vpss->dev, 4 * 256, vpss->coef, vpss->coef_dma);
+	dma_free_coherent(vpss->dev, VPSS_COEF_BYTES, vpss->coef,
+			  vpss->coef_dma);
 }
 
 static const struct of_device_id histb_vpss_of_match[] = {

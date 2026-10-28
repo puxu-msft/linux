@@ -35,6 +35,8 @@
 
 #define VPSS_CUR_CTRL		0x00c
 #define VPSS_CUR_CTRL_TILE	BIT(4)
+#define VPSS_CUR_CTRL_HOR_OFFSET	GENMASK(17, 5)
+#define VPSS_CUR_CTRL_VER_OFFSET	GENMASK(30, 18)
 
 #define VPSS_CURYADDR		0x018
 #define VPSS_CURCADDR		0x01c
@@ -85,6 +87,29 @@
 #define VPSS_VHD_ZME_LVADDR	0x214
 #define VPSS_VHD_ZME_CHADDR	0x218
 #define VPSS_VHD_ZME_CVADDR	0x21c
+
+/* The sharpen filters read their phase table 256 bytes into the scaler's. */
+#define VPSS_VHD_LTI_CTRL	0x180
+#define VPSS_LTI_CTRL_LHPASS_COEF4	GENMASK(7, 0)
+#define VPSS_LTI_CTRL_LMIXING_RATIO	GENMASK(15, 8)
+#define VPSS_LTI_CTRL_LGAIN_RATIO	GENMASK(27, 16)
+#define VPSS_LTI_CTRL_LTI_EN		BIT(31)
+#define VPSS_VHD_LHPASS_COEF	0x184
+#define VPSS_VHD_LTI_THD	0x188
+#define VPSS_LTI_THD_LOVER_SWING	GENMASK(9, 0)
+#define VPSS_LTI_THD_LUNDER_SWING	GENMASK(19, 10)
+#define VPSS_LTI_THD_LCORING_THD	GENMASK(31, 20)
+#define VPSS_VHD_LHFREQ_THD	0x18c
+#define VPSS_VHD_LGAIN_COEF	0x190
+#define VPSS_VHD_CTI_CTRL	0x194
+#define VPSS_CTI_CTRL_CMIXING_RATIO	GENMASK(15, 8)
+#define VPSS_CTI_CTRL_CGAIN_RATIO	GENMASK(27, 16)
+#define VPSS_CTI_CTRL_CTI_EN		BIT(31)
+#define VPSS_VHD_CHPASS_COEF	0x198
+#define VPSS_VHD_CTI_THD	0x19c
+#define VPSS_CTI_THD_COVER_SWING	GENMASK(9, 0)
+#define VPSS_CTI_THD_CUNDER_SWING	GENMASK(19, 10)
+#define VPSS_CTI_THD_CCORING_THD	GENMASK(31, 20)
 #define VPSS_MSC_H_MSSC		BIT(31)
 #define VPSS_MSC_H_CSSC		BIT(30)
 #define VPSS_MSC_H_LFIR		BIT(26)
@@ -118,6 +143,12 @@
 
 /* Register images are one contiguous block; the deepest field is at 0x5058. */
 #define VPSS_REG_IMAGE_SIZE	0x6000
+
+/* One phase table set per plane and axis: 256 bytes of scaler taps, then
+ * 256 bytes of sharpen taps.
+ */
+#define VPSS_COEF_BLOCK		512
+#define VPSS_COEF_BYTES		(4 * VPSS_COEF_BLOCK)
 
 /* Pre-scaler modes for turning one field into a frame. */
 #define VPSS_PREZME_DISABLE	0
