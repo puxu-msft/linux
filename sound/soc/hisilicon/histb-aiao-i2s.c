@@ -107,9 +107,18 @@
 #define   TX_SD2_SEL			GENMASK(29, 28)
 #define   TX_SD3_SEL			GENMASK(31, 30)
 #define  TX_DSP_CTRL			0x04
+#define   TX_MUTE_EN			BIT(0)
+#define   TX_MUTE_FADE_EN		BIT(1)
+#define   TX_VOLUME			GENMASK(14, 8)
+#define   TX_FADE_IN_RATE		GENMASK(19, 16)
+#define   TX_FADE_OUT_RATE		GENMASK(23, 20)
 #define   TX_BYPASS_EN			BIT(27)
 #define   TX_ENABLE			BIT(28)
 #define   TX_DISABLE_DONE		BIT(29)
+/* 0x29 is -80 dB and the field steps 1 dB, so unity is 0x79. */
+#define   TX_VOLUME_0DB			0x79
+/* Ramp step of 16 samples: the 80 dB range takes about 27 ms at 48 kHz. */
+#define   TX_FADE_RATE_CODE		4
 #define  TX_BUFF_SADDR			0x80
 #define  TX_BUFF_SIZE			0x84
 #define  TX_BUFF_WPTR			0x88
@@ -147,6 +156,10 @@ struct histb_aiao_port {
 	unsigned int rate;
 	bool running;
 	bool announced;
+	bool muted;
+	spinlock_t dsp_lock;
+	u32 watch_rptr;		/* TX_BUFF_RPTR at the previous tick */
+	unsigned int stalls;	/* consecutive ticks with no pointer movement */
 };
 
 /*
@@ -210,6 +223,34 @@ static struct histb_aiao_port *histb_aiao_substream_port(struct histb_aiao *aiao
 	return &aiao->port[snd_soc_rtd_to_cpu(rtd, 0)->id];
 }
 
+/*
+ * The mute/volume stage only runs while TX_BYPASS_EN is clear, and a clear
+ * bypass with the reset volume code (0x00) would silence the port: every write
+ * of TX_DSP_CTRL therefore carries the unity volume and a fade rate.
+ */
+static u32 histb_aiao_tx_dsp_val(const struct histb_aiao_port *port, bool enable)
+{
+	u32 val = TX_MUTE_FADE_EN |
+		  FIELD_PREP(TX_VOLUME, TX_VOLUME_0DB) |
+		  FIELD_PREP(TX_FADE_IN_RATE, TX_FADE_RATE_CODE) |
+		  FIELD_PREP(TX_FADE_OUT_RATE, TX_FADE_RATE_CODE);
+
+	if (enable)
+		val |= TX_ENABLE;
+	if (port->muted)
+		val |= TX_MUTE_EN;
+	return val;
+}
+
+static void histb_aiao_tx_dsp_write(struct histb_aiao_port *port, bool enable)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&port->dsp_lock, flags);
+	writel(histb_aiao_tx_dsp_val(port, enable), port->regs + TX_DSP_CTRL);
+	spin_unlock_irqrestore(&port->dsp_lock, flags);
+}
+
 static struct histb_aiao_port *histb_aiao_other(struct histb_aiao *aiao,
 					 struct histb_aiao_port *port)
 {
@@ -246,6 +287,11 @@ static void histb_aiao_set_bclk_source(struct histb_aiao *aiao, unsigned int reg
 	writel(val, aiao->base + reg);
 }
 
+static unsigned int histb_aiao_precision(struct snd_pcm_hw_params *params)
+{
+	return params_format(params) == SNDRV_PCM_FORMAT_S32_LE ? 2 : 1;
+}
+
 static int histb_aiao_tx_hw_params(struct snd_pcm_substream *substream,
 				   struct snd_pcm_hw_params *params,
 				   struct histb_aiao *aiao,
@@ -267,7 +313,8 @@ static int histb_aiao_tx_hw_params(struct snd_pcm_substream *substream,
 	 * I2S out through this port's own serializer, 16-bit, two channels,
 	 * the port's own serial-data lanes selected.
 	 */
-	val = FIELD_PREP(TX_MODE, 0) | FIELD_PREP(TX_PRECISION, 1) |
+	val = FIELD_PREP(TX_MODE, 0) |
+	      FIELD_PREP(TX_PRECISION, histb_aiao_precision(params)) |
 	      FIELD_PREP(TX_CH_NUM, 1) | TX_SPD_I2S_SEL |
 	      FIELD_PREP(TX_SD_OFFSET, aiao->variant->tx_sd_offset) |
 	      FIELD_PREP(TX_SD_SOURCE_SEL, port->id);
@@ -275,8 +322,7 @@ static int histb_aiao_tx_hw_params(struct snd_pcm_substream *substream,
 		val |= FIELD_PREP(TX_SD0_SEL, 0) | FIELD_PREP(TX_SD1_SEL, 1) |
 		       FIELD_PREP(TX_SD2_SEL, 2) | FIELD_PREP(TX_SD3_SEL, 3);
 	writel(val, port->regs + TX_IF_ATTRI);
-	/* The port's mute/volume stage stays bypassed; bit0 there would silence. */
-	writel(TX_BYPASS_EN, port->regs + TX_DSP_CTRL);
+	histb_aiao_tx_dsp_write(port, false);
 
 	writel(runtime->dma_addr, port->regs + TX_BUFF_SADDR);
 	writel(params_buffer_bytes(params), port->regs + TX_BUFF_SIZE);
@@ -312,7 +358,8 @@ static int histb_aiao_rx_hw_params(struct snd_pcm_substream *substream,
 	histb_aiao_set_bclk_source(aiao, AIAO_SWITCH_RX_BCLK, port->id,
 				   AIAO_TX_CRG_SRC(port->tap));
 
-	writel(FIELD_PREP(RX_MODE, 0) | FIELD_PREP(RX_PRECISION, 1) |
+	writel(FIELD_PREP(RX_MODE, 0) |
+	       FIELD_PREP(RX_PRECISION, histb_aiao_precision(params)) |
 	       FIELD_PREP(RX_CH_NUM, 1) | FIELD_PREP(RX_SD_OFFSET, 1) |
 	       FIELD_PREP(RX_SD_SOURCE_SEL, port->tap),
 	       port->regs + RX_IF_ATTRI);
@@ -365,14 +412,57 @@ static int histb_aiao_hw_params(struct snd_pcm_substream *substream,
 	return 0;
 }
 
+/*
+ * A receiver is clocked from the generator it samples, so that port's CRG word
+ * doubles as its transmitter's; the clock may only go away when no stream is
+ * left on the word.
+ */
+static bool histb_aiao_crg_claimed(struct histb_aiao *aiao,
+				   const struct histb_aiao_port *port)
+{
+	unsigned int i;
+
+	for (i = 0; i < aiao->variant->num_ports; i++)
+		if (&aiao->port[i] != port && aiao->port[i].crg == port->crg &&
+		    aiao->port[i].substream)
+			return true;
+
+	return false;
+}
+
 static int histb_aiao_hw_free(struct snd_pcm_substream *substream,
 			      struct snd_soc_dai *dai)
 {
 	struct histb_aiao *aiao = snd_soc_dai_get_drvdata(dai);
 	struct histb_aiao_port *port = histb_aiao_substream_port(aiao, substream);
+	bool capture = substream->stream == SNDRV_PCM_STREAM_CAPTURE;
+	unsigned int dsp = capture ? RX_DSP_CTRL : TX_DSP_CTRL;
+	unsigned int saddr = capture ? RX_BUFF_SADDR : TX_BUFF_SADDR;
+	unsigned int size = capture ? RX_BUFF_SIZE : TX_BUFF_SIZE;
+	unsigned int trans = capture ? RX_TRANS_SIZE : TX_TRANS_SIZE;
+	unsigned int wptr = capture ? RX_BUFF_WPTR : TX_BUFF_WPTR;
+	unsigned int rptr = capture ? RX_BUFF_RPTR : TX_BUFF_RPTR;
 
 	port->substream = NULL;
 	port->rate = 0;
+
+	/*
+	 * The ring goes back to the allocator on return from this callback, so
+	 * its address must not stay programmed: a closed port holding a live
+	 * enable bit and a buffer that someone else now owns is exactly the
+	 * state no later error path can distinguish from a running stream.
+	 * The board read TX_ENABLE high, SADDR at the freed ring and CRG_CKEN
+	 * on after a stream had closed.
+	 */
+	writel(0, port->regs + dsp);
+	writel(0, port->regs + saddr);
+	writel(0, port->regs + size);
+	writel(0, port->regs + trans);
+	writel(0, port->regs + wptr);
+	writel(0, port->regs + rptr);
+
+	if (!histb_aiao_crg_claimed(aiao, port))
+		writel(0, port->crg + AIAO_CRG_CTRL);
 
 	return 0;
 }
@@ -416,8 +506,43 @@ static void histb_aiao_tx_commit(struct histb_aiao_port *port,
 	 * next commit picks it up once the port has moved.
 	 */
 	writel((rptr + ahead) % size, port->regs + TX_BUFF_WPTR);
-	writel(TX_ENABLE | TX_BYPASS_EN, port->regs + TX_DSP_CTRL);
+	histb_aiao_tx_dsp_write(port, true);
 	WRITE_ONCE(port->announced, true);
+}
+
+/*
+ * The tick owns the PCM position, so a transmit port that stops draining its
+ * ring would stay silent indefinitely: it keeps TX_ENABLE set -- the check in
+ * the tick below only catches a port that latched itself off -- and the
+ * application keeps receiving period boundaries for audio that never reaches
+ * the wire. Cross-check the port's own read pointer and require movement;
+ * after enough periods without any, call it an underrun. The position is
+ * deliberately not re-derived from that pointer: see the file header on the
+ * stream stalling when a register position is fed to the core while a timer
+ * announces the periods.
+ */
+#define AIAO_TX_STALL_PERIODS 8
+
+static bool histb_aiao_tx_draining(struct histb_aiao_port *port,
+				   struct snd_pcm_runtime *runtime)
+{
+	struct device *dev = port->substream->pcm->card->dev;
+	unsigned int size = frames_to_bytes(runtime, runtime->buffer_size);
+	u32 rptr = readl(port->regs + TX_BUFF_RPTR) & GENMASK(23, 0);
+	u32 delta = (rptr + size - port->watch_rptr) % size;
+
+	if (delta) {
+		port->watch_rptr = rptr;
+		port->stalls = 0;
+		return true;
+	}
+
+	if (++port->stalls < AIAO_TX_STALL_PERIODS)
+		return true;
+
+	dev_warn(dev, "tx enabled but stuck at %u for %u periods\n", rptr,
+		 port->stalls);
+	return false;
 }
 
 /*
@@ -455,6 +580,25 @@ static enum hrtimer_restart histb_aiao_period_tick(struct hrtimer *timer)
 			snd_pcm_stop_xrun(substream);
 			return HRTIMER_NORESTART;
 		}
+		/*
+		 * Only once the ring has been announced: before the first commit
+		 * the port has nothing to read, so a still pointer means nothing.
+		 */
+		if (READ_ONCE(port->announced) &&
+		    !histb_aiao_tx_draining(port, runtime)) {
+			snd_pcm_stop_xrun(substream);
+			return HRTIMER_NORESTART;
+		}
+		/*
+		 * .trigger(STOP) only tries to cancel this timer, so a tick
+		 * already past its entry check can still be running while the
+		 * stop writes the port back to bypass. Re-read the flag right
+		 * before touching the hardware: committing here would put
+		 * TX_ENABLE back on a stream the core has just closed, with the
+		 * ring address already on its way back to the allocator.
+		 */
+		if (!READ_ONCE(port->running))
+			return HRTIMER_NORESTART;
 		histb_aiao_tx_commit(port, runtime);
 	}
 	snd_pcm_period_elapsed(substream);
@@ -496,6 +640,7 @@ static int histb_aiao_trigger(struct snd_pcm_substream *substream, int cmd,
 			writel(enable | bypass, dsp);
 		WRITE_ONCE(port->announced, false);
 		WRITE_ONCE(port->running, true);
+		port->stalls = 0;
 		hrtimer_start(&port->tick, port->period, HRTIMER_MODE_REL_SOFT);
 		break;
 	case SNDRV_PCM_TRIGGER_STOP:
@@ -503,7 +648,10 @@ static int histb_aiao_trigger(struct snd_pcm_substream *substream, int cmd,
 	case SNDRV_PCM_TRIGGER_PAUSE_PUSH:
 		WRITE_ONCE(port->running, false);
 		hrtimer_try_to_cancel(&port->tick);
-		writel(bypass, dsp);
+		if (capture)
+			writel(bypass, dsp);
+		else
+			histb_aiao_tx_dsp_write(port, false);
 		/*
 		 * The port reports when its pipeline has really drained. Wait
 		 * for it without scheduling: .trigger runs with the stream lock
@@ -534,6 +682,28 @@ static snd_pcm_uframes_t histb_aiao_pointer(struct snd_soc_component *component,
 /*
  * The port makes its own master clock from the AIAO PLL, so accept and ignore.
  */
+static int histb_aiao_set_fmt(struct snd_soc_dai *dai, unsigned int fmt)
+{
+	/*
+	 * The port only ever implements one wiring: I2S word format, both edges
+	 * nominal, and bit and frame clock generated by the dividers this driver
+	 * programs. The provider test is written from this end's point of view
+	 * because snd_soc_runtime_set_dai_fmt() flips that field before calling
+	 * a CPU DAI (sound/soc/soc-core.c:1339-1345): a link that declares the
+	 * codec consumer arrives here as CBP_CFP. Asking for the clock from
+	 * outside would be programmed as if it had been granted, so refuse it.
+	 */
+	if ((fmt & SND_SOC_DAIFMT_FORMAT_MASK) != SND_SOC_DAIFMT_I2S)
+		return -EINVAL;
+	if ((fmt & SND_SOC_DAIFMT_CLOCK_PROVIDER_MASK) !=
+	    SND_SOC_DAIFMT_CBP_CFP)
+		return -EINVAL;
+	if ((fmt & SND_SOC_DAIFMT_INV_MASK) != SND_SOC_DAIFMT_NB_NF)
+		return -EINVAL;
+
+	return 0;
+}
+
 static int histb_aiao_set_sysclk(struct snd_soc_dai *dai, int clk_id,
 				 unsigned int freq, int dir)
 {
@@ -545,6 +715,7 @@ static const struct snd_soc_dai_ops histb_aiao_dai_ops = {
 	.hw_free = histb_aiao_hw_free,
 	.trigger = histb_aiao_trigger,
 	.set_sysclk = histb_aiao_set_sysclk,
+	.set_fmt = histb_aiao_set_fmt,
 };
 
 /*
@@ -554,8 +725,9 @@ static const struct snd_soc_dai_ops histb_aiao_dai_ops = {
 static const struct snd_pcm_hardware histb_aiao_pcm_hardware = {
 	.info = SNDRV_PCM_INFO_INTERLEAVED | SNDRV_PCM_INFO_MMAP |
 		SNDRV_PCM_INFO_MMAP_VALID | SNDRV_PCM_INFO_BLOCK_TRANSFER |
-		SNDRV_PCM_INFO_PAUSE | SNDRV_PCM_INFO_RESUME,
-	.formats = SNDRV_PCM_FMTBIT_S16_LE,
+		SNDRV_PCM_INFO_PAUSE | SNDRV_PCM_INFO_RESUME |
+		SNDRV_PCM_INFO_NO_REWINDS,
+	.formats = SNDRV_PCM_FMTBIT_S16_LE | SNDRV_PCM_FMTBIT_S32_LE,
 	.rate_min = 8000,
 	.rate_max = 192000,
 	.channels_min = 2,
@@ -571,8 +743,37 @@ static const struct snd_pcm_hardware histb_aiao_pcm_hardware = {
 static int histb_aiao_pcm_open(struct snd_soc_component *component,
 			       struct snd_pcm_substream *substream)
 {
-	substream->runtime->hw = histb_aiao_pcm_hardware;
-	return 0;
+	struct snd_pcm_runtime *runtime = substream->runtime;
+	int ret;
+
+	runtime->hw = histb_aiao_pcm_hardware;
+
+	/*
+	 * The block walks the ring in 128-byte bursts -- the SDK aligns both the
+	 * buffer address and the period size to it
+	 * (msp/drv/aiao/aiao_v1_1/common/include/hal_aiao_common.h:144-145) --
+	 * so a period off that step would leave the play pointer between
+	 * bursts. The SDK truncates the request in silence; a constraint lets
+	 * the core negotiate a size that is legal instead.
+	 */
+	ret = snd_pcm_hw_constraint_step(runtime, 0,
+					 SNDRV_PCM_HW_PARAM_PERIOD_BYTES,
+					 AIAO_BUFFER_ALIGN);
+	if (ret)
+		return ret;
+	ret = snd_pcm_hw_constraint_step(runtime, 0,
+					 SNDRV_PCM_HW_PARAM_BUFFER_BYTES,
+					 AIAO_BUFFER_ALIGN);
+	if (ret)
+		return ret;
+
+	/*
+	 * S32_LE on this port is a 32-bit container for a 24-bit sample, pad in
+	 * the low byte, which is what the precision field selects; advertise
+	 * that instead of letting a client put data into bits the DAC never
+	 * sees.
+	 */
+	return snd_pcm_hw_constraint_msbits(runtime, 0, 32, 24);
 }
 
 static int histb_aiao_pcm_tx_ack(struct histb_aiao *aiao,
@@ -643,7 +844,56 @@ static int histb_aiao_pcm_new(struct snd_soc_component *component,
 	return 0;
 }
 
+static int histb_aiao_mute_get(struct snd_kcontrol *kcontrol,
+			       struct snd_ctl_elem_value *ucontrol)
+{
+	struct snd_soc_component *component = snd_kcontrol_chip(kcontrol);
+	struct histb_aiao *aiao = snd_soc_component_get_drvdata(component);
+
+	ucontrol->value.integer.value[0] = !aiao->port[HISTB_AIAO_HDMI_TX].muted;
+	return 0;
+}
+
+static int histb_aiao_mute_put(struct snd_kcontrol *kcontrol,
+			       struct snd_ctl_elem_value *ucontrol)
+{
+	struct snd_soc_component *component = snd_kcontrol_chip(kcontrol);
+	struct histb_aiao *aiao = snd_soc_component_get_drvdata(component);
+	bool muted = !ucontrol->value.integer.value[0];
+	unsigned int i;
+	int changed = 0;
+
+	for (i = 0; i < aiao->variant->num_ports; i++) {
+		struct histb_aiao_port *port = &aiao->port[i];
+		unsigned long flags;
+		u32 val;
+
+		if (port->rx || port->muted == muted)
+			continue;
+		spin_lock_irqsave(&port->dsp_lock, flags);
+		port->muted = muted;
+		val = readl(port->regs + TX_DSP_CTRL);
+		writel(histb_aiao_tx_dsp_val(port, val & TX_ENABLE),
+		       port->regs + TX_DSP_CTRL);
+		spin_unlock_irqrestore(&port->dsp_lock, flags);
+		changed = 1;
+	}
+	return changed;
+}
+
+static const struct snd_kcontrol_new histb_aiao_controls[] = {
+	SOC_SINGLE_EXT("Playback Switch", 0, 0, 1, 1,
+		       histb_aiao_mute_get, histb_aiao_mute_put),
+};
+
+static int histb_aiao_component_probe(struct snd_soc_component *component)
+{
+	return snd_soc_add_component_controls(component, histb_aiao_controls,
+					      ARRAY_SIZE(histb_aiao_controls));
+}
+
 static const struct snd_soc_component_driver histb_aiao_component = {
+	.probe = histb_aiao_component_probe,
 	.open = histb_aiao_pcm_open,
 	.prepare = histb_aiao_pcm_prepare,
 	.ack = histb_aiao_pcm_ack,
@@ -706,7 +956,7 @@ static struct snd_soc_dai_driver histb_aiao_dais[] = {
 			.channels_min = 2,
 			.channels_max = 2,
 			.rates = SNDRV_PCM_RATE_8000_192000,
-			.formats = SNDRV_PCM_FMTBIT_S16_LE,
+			.formats = SNDRV_PCM_FMTBIT_S16_LE | SNDRV_PCM_FMTBIT_S32_LE,
 		},
 		.ops = &histb_aiao_dai_ops,
 	},
@@ -718,7 +968,7 @@ static struct snd_soc_dai_driver histb_aiao_dais[] = {
 			.channels_min = 2,
 			.channels_max = 2,
 			.rates = SNDRV_PCM_RATE_8000_192000,
-			.formats = SNDRV_PCM_FMTBIT_S16_LE,
+			.formats = SNDRV_PCM_FMTBIT_S16_LE | SNDRV_PCM_FMTBIT_S32_LE,
 		},
 		.ops = &histb_aiao_dai_ops,
 	},
@@ -730,7 +980,7 @@ static struct snd_soc_dai_driver histb_aiao_dais[] = {
 			.channels_min = 2,
 			.channels_max = 2,
 			.rates = SNDRV_PCM_RATE_8000_192000,
-			.formats = SNDRV_PCM_FMTBIT_S16_LE,
+			.formats = SNDRV_PCM_FMTBIT_S16_LE | SNDRV_PCM_FMTBIT_S32_LE,
 		},
 		.ops = &histb_aiao_dai_ops,
 	},
@@ -742,7 +992,7 @@ static struct snd_soc_dai_driver histb_aiao_dais[] = {
 			.channels_min = 2,
 			.channels_max = 2,
 			.rates = SNDRV_PCM_RATE_8000_192000,
-			.formats = SNDRV_PCM_FMTBIT_S16_LE,
+			.formats = SNDRV_PCM_FMTBIT_S16_LE | SNDRV_PCM_FMTBIT_S32_LE,
 		},
 		.ops = &histb_aiao_dai_ops,
 	},
@@ -784,6 +1034,7 @@ static int histb_aiao_probe(struct platform_device *pdev)
 						     AIAO_TX(port->id));
 		port->crg = base + AIAO_TX_CRG(specs[i].rx ? port->tap :
 						 port->id);
+		spin_lock_init(&port->dsp_lock);
 		hrtimer_setup(&port->tick, histb_aiao_period_tick, CLOCK_MONOTONIC,
 			      HRTIMER_MODE_REL_SOFT);
 	}
