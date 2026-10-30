@@ -161,6 +161,8 @@
 #define   GP0_CSC_DC16		(16 * 4)	/* +16 codes: DC fields are 10-bit */
 #define   GP0_CSC_PAIR(lo, hi)	(FIELD_PREP(GENMASK(14, 0), (lo)) | \
 				 FIELD_PREP(GENMASK(30, 16), (hi)))
+/* 15-bit signed coefficient, two's complement (vendor assigns HI_S32 to the field) */
+#define   GP0_CSC_COEF(v)	((u32)(v) & 0x7fff)
 /* out0 = in1, out1 = in2, out2 = in0: the inverse of the fetch's rotation */
 #define GP0_CSC_CYC_P0		GP0_CSC_PAIR(0, GP0_CSC_LIM)
 #define GP0_CSC_CYC_P2		GP0_CSC_PAIR(0, GP0_CSC_LIM)

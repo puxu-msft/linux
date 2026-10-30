@@ -1010,9 +1010,17 @@ err_put:
 
 /*
  * One-time display pipeline setup: route GP0 into the DHD0 mixer, set the AXI
- * outstanding limits and enable the block's clock gate.
+ * outstanding limits and enable the block's clock gate.  @yuv444 carries the
+ * link format the connector negotiated (RGB vs YCbCr 4:4:4): in the YCbCr
+ * case the GP0 CSC stage carries the RGB -> limited-range YCbCr matrix the
+ * vendor's own displaying pipeline leaves in that block (read at the fastboot
+ * prompt: BT.709 row scaled by 219/255 in this stage's Q10, DC offsets +16
+ * luma / +128 chroma), and the channel data type below follows the same
+ * decision.
  */
-static void histb_vdp2_pipeline_init(struct histb_vdp2 *vdp)
+static void histb_vdp2_pipeline_init(struct histb_vdp2 *vdp,
+				     const struct drm_display_mode *mode,
+				     bool yuv444)
 {
 	unsigned int i;
 	u32 ctrl;
@@ -1126,6 +1134,43 @@ static void histb_vdp2_pipeline_init(struct histb_vdp2 *vdp)
 		vo_write(vdp, GP0_CSC_P3, GP0_CSC_CYC_P3);
 		vo_write(vdp, GP0_CSC_P4, 0);
 		vo_write(vdp, GP0_CSC_IDC, GP0_CSC_EN);
+	} else if (yuv444) {
+		/*
+		 * RGB -> limited-range YCbCr 4:4:4 with the component lanes
+		 * left honest (no rotation, unlike the cycle matrix above).
+		 * The coefficients are not recomputed: they are the vendor's
+		 * own live matrix, read out of the displaying boot-logo
+		 * pipeline at the fastboot prompt (GP0_CSC P0..P4, BT.709 row
+		 * scaled by 881 = 219/255 in this stage's Q10, with the DC
+		 * offsets carrying +16 on the luma line and +128 on both
+		 * chroma lines -- value * 4, Y on the dc2 slot). BT.601 is
+		 * the same table scaled the same way for SD modes, matching
+		 * the transmitter's infoframe split.
+		 */
+		static const s16 coef709[9] = {
+			188, 629, 63, -103, -347, 450, 450, -409, -41
+		};
+		static const s16 coef601[9] = {
+			263, 517, 100, -151, -298, 450, 450, -377, -73
+		};
+		const s16 *c = (mode->hdisplay > 720 || mode->vdisplay > 576) ?
+			       coef709 : coef601;
+
+		vo_write(vdp, GP0_CSC_ODC,
+			 FIELD_PREP(GENMASK(10, 0), 128 * 4) |
+			 FIELD_PREP(GENMASK(21, 11), 128 * 4));
+		vo_write(vdp, GP0_CSC_IODC, FIELD_PREP(GENMASK(21, 11), 16 * 4));
+		vo_write(vdp, GP0_CSC_P0,
+			 GP0_CSC_PAIR(GP0_CSC_COEF(c[0]), GP0_CSC_COEF(c[1])));
+		vo_write(vdp, GP0_CSC_P1,
+			 GP0_CSC_PAIR(GP0_CSC_COEF(c[2]), GP0_CSC_COEF(c[3])));
+		vo_write(vdp, GP0_CSC_P2,
+			 GP0_CSC_PAIR(GP0_CSC_COEF(c[4]), GP0_CSC_COEF(c[5])));
+		vo_write(vdp, GP0_CSC_P3,
+			 GP0_CSC_PAIR(GP0_CSC_COEF(c[6]), GP0_CSC_COEF(c[7])));
+		vo_write(vdp, GP0_CSC_P4,
+			 GP0_CSC_PAIR(GP0_CSC_COEF(c[8]), 0));
+		vo_write(vdp, GP0_CSC_IDC, GP0_CSC_EN);
 	} else {
 		vo_write(vdp, GP0_CSC_IDC, 0);
 	}
@@ -1134,7 +1179,8 @@ static void histb_vdp2_pipeline_init(struct histb_vdp2 *vdp)
 }
 
 static void histb_vdp2_crtc_setup_timing(struct histb_vdp2 *vdp,
-				       const struct drm_display_mode *mode)
+					 const struct drm_display_mode *mode,
+					 bool yuv444)
 {
 	/*
 	 * The DHD totals are ACT + BB + FB -- the sync pulse lives inside the
@@ -1177,15 +1223,23 @@ static void histb_vdp2_crtc_setup_timing(struct histb_vdp2 *vdp,
 	 * carry the interface data type, 1 meaning RGB on the HDMI pins and 0
 	 * YCbCr.
 	 *
-	 * RGB is used for every format here. Passing YCbCr straight through
-	 * also needs the output-stage lane mux (video1_sel / video2_sel /
-	 * video3_sel / src_ctrl) reprogrammed to match; with the mux left at
-	 * its reset values the two chroma lanes arrive exchanged and Cb carries
-	 * nothing, so only the luma path is right. Nothing on the RGB path
-	 * needs those selects.
+	 * RGB is used for every format the negotiation hands over as RGB; when
+	 * the connector picked YCbCr 4:4:4 the pins carry the GP0 CSC stage's
+	 * YCbCr and both bits stay clear -- the shape of the vendor's own
+	 * displaying channel (read at the fastboot prompt: DHD0_CTRL
+	 * 0x80008010, DATA_SEL 0x6, and the channel CSC block at 0xc040 all
+	 * zero, so the conversion happens in GP0, not here). Both bits are
+	 * decided absolutely, set or cleared: the format can flip at runtime
+	 * and the previous mode's bit would otherwise survive this
+	 * read-modify-write. The HDATE port is not touched for either data
+	 * type: on this part the transmitter hangs straight off the DHD
+	 * channel and the vendor leaves the whole HDATE block at zero while
+	 * displaying.
 	 */
-	if (vdp->chip->dhd_hdmi_mode)
+	if (vdp->chip->dhd_hdmi_mode && !yuv444)
 		ctrl |= DHD_CTRL_HDMI_MODE;
+	else
+		ctrl &= ~DHD_CTRL_HDMI_MODE;
 	/*
 	 * bit15 is reserved in the mv100 layout, but a channel that drives a
 	 * panel has it set on both parts: the Hi3716CV200 channel that was
@@ -1238,10 +1292,14 @@ static void histb_vdp2_crtc_setup_timing(struct histb_vdp2 *vdp,
 	 * Set our bit of the interface data type and leave the rest as the
 	 * reset state has it: bit 3 is hdmi_data_sel, bit 1 is vga_data_sel and
 	 * bit 2 is reserved on mv100, so this has to be a read-modify-write.
-	 * hdmi_mode above carries the same decision.
+	 * hdmi_mode above carries the same decision; in the YCbCr case the bit
+	 * has to be actively cleared, since the boot can leave it set.
 	 */
 	ctrl = vo_read(vdp, DHD0_DATA_SEL);
-	ctrl |= DHD_DATA_SEL_HDMI;
+	if (yuv444)
+		ctrl &= ~DHD_DATA_SEL_HDMI;
+	else
+		ctrl |= DHD_DATA_SEL_HDMI;
 	vo_write(vdp, DHD0_DATA_SEL, ctrl);
 
 	/* latch the timing registers */
@@ -1410,17 +1468,34 @@ static void histb_vdp2_crtc_atomic_enable(struct drm_crtc *crtc,
 	struct histb_vdp2 *vdp = crtc_to_vdp(crtc);
 	struct drm_crtc_state *new_state = drm_atomic_get_new_crtc_state(state, crtc);
 	const struct drm_display_mode *mode = &new_state->adjusted_mode;
+	struct drm_connector *conn;
+	struct drm_connector_state *conn_state;
 	struct drm_plane_state *pstate;
 	struct drm_gem_dma_object *gem;
 	struct drm_framebuffer *fb;
+	bool yuv444;
 	u32 ctrl;
+
+	/*
+	 * The link format is the connector's negotiation: the HDMI bridge
+	 * chain exposes the "color format" property and the core picks
+	 * output_format from it against the sink's EDID (and marks the commit
+	 * a modeset when it changes).  The channel data type and the GP0 CSC
+	 * stage both follow that decision.
+	 */
+	conn = drm_atomic_get_new_connector_for_encoder(state,
+							&vdp->disp->encoder);
+	conn_state = conn ? drm_atomic_get_new_connector_state(state, conn) :
+			    NULL;
+	yuv444 = conn_state && conn_state->hdmi.output_format ==
+				 DRM_OUTPUT_COLOR_FORMAT_YCBCR444;
 
 	/* the channel clock is what the HDMI transmitter receives, too */
 	histb_vdp2_set_pixclk(vdp, mode->clock);
 
-	histb_vdp2_pipeline_init(vdp);
+	histb_vdp2_pipeline_init(vdp, mode, yuv444);
 
-	histb_vdp2_crtc_setup_timing(vdp, mode);
+	histb_vdp2_crtc_setup_timing(vdp, mode, yuv444);
 
 	/*
 	 * VO_MUX bit3 names the channel the HDMI interface reads, it does not
