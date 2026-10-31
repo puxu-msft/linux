@@ -330,7 +330,7 @@ static void histb_vdp2_g0_set(struct histb_vdp2 *vdp, struct drm_framebuffer *fb
 			    struct drm_gem_dma_object *gem,
 			    const struct drm_plane_state *pstate, bool enable)
 {
-	u32 ctrl, ifmt, palpha;
+	u32 ctrl, ifmt;
 	u32 src_x, src_y, src_w, src_h, dst_x, dst_y, dst_w, dst_h;
 
 	if (!enable) {
@@ -361,7 +361,6 @@ static void histb_vdp2_g0_set(struct histb_vdp2 *vdp, struct drm_framebuffer *fb
 	switch (fb->format->format) {
 	case DRM_FORMAT_RGB565:
 		ifmt = G0_IFMT_RGB565;
-		palpha = 0;
 		break;
 	case DRM_FORMAT_ARGB8888:
 		/*
@@ -371,11 +370,9 @@ static void histb_vdp2_g0_set(struct histb_vdp2 *vdp, struct drm_framebuffer *fb
 		 * and the plane declares blend mode "None".
 		 */
 		ifmt = G0_IFMT_KRGB888;
-		palpha = 0;
 		break;
 	default:
 		ifmt = G0_IFMT_KRGB888;
-		palpha = 0;
 		break;
 	}
 
@@ -392,11 +389,14 @@ static void histb_vdp2_g0_set(struct histb_vdp2 *vdp, struct drm_framebuffer *fb
 		G0_CTRL_READ_MODE | G0_CTRL_UPD_MODE;
 	vo_write(vdp, G0_CTRL, ctrl);
 
-	/* global alpha is opaque; only ARGB8888 turns per-pixel alpha on */
+	/*
+	 * The plane's "alpha" is 16-bit (0xffff opaque), this field is 8-bit, so
+	 * the top byte is what reaches the mixer; latched by G0_UPD below.
+	 */
 	ctrl = vo_read(vdp, G0_CBMPARA);
 	ctrl &= ~(G0_CBMPARA_GALPHA | G0_CBMPARA_PALPHA_EN |
 		  G0_CBMPARA_KEY_EN | G0_CBMPARA_KEY_MODE);
-	ctrl |= FIELD_PREP(G0_CBMPARA_GALPHA, 0xff) | palpha;
+	ctrl |= FIELD_PREP(G0_CBMPARA_GALPHA, pstate->alpha >> 8);
 	vo_write(vdp, G0_CBMPARA, ctrl);
 
 	/*
@@ -1851,6 +1851,17 @@ static int histb_vdp2_bind(struct device *dev)
 					BIT(DRM_MODE_BLEND_PIXEL_NONE));
 	if (ret) {
 		dev_err_probe(dev, ret, "blend_mode failed\n");
+		goto err_put;
+	}
+
+	/*
+	 * The layer's global alpha is a full 8-bit field, unlike the 7-bit
+	 * per-pixel one that made the blend mode above refuse to promise anything,
+	 * so the plane can offer opacity.
+	 */
+	ret = drm_plane_create_alpha_property(&disp->primary);
+	if (ret) {
+		dev_err_probe(dev, ret, "alpha failed\n");
 		goto err_put;
 	}
 
