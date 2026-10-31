@@ -685,6 +685,7 @@ static void histb_vdp2_g0_set(struct histb_vdp2 *vdp, struct drm_framebuffer *fb
 			    const struct drm_plane_state *pstate, bool enable)
 {
 	u32 ctrl, ifmt;
+	bool palpha;
 	u32 src_x, src_y, src_w, src_h, dst_x, dst_y, dst_w, dst_h;
 	u32 win_w, win_h;
 
@@ -719,17 +720,18 @@ static void histb_vdp2_g0_set(struct histb_vdp2 *vdp, struct drm_framebuffer *fb
 		break;
 	case DRM_FORMAT_ARGB8888:
 		/*
-		 * Scanned out through the opaque 32bpp coding: the alpha byte
-		 * would reach the mixer as a 7-bit field, which is neither the
-		 * coverage nor the premultiplied formula, so the byte is ignored
-		 * and the plane declares blend mode "None".
+		 * The alpha byte only reaches the mixer once the pixel-alpha path is
+		 * switched on, so "None" keeps the opaque coding and the other two
+		 * blend modes hand the byte over.
 		 */
-		ifmt = G0_IFMT_KRGB888;
+		ifmt = pstate->pixel_blend_mode == DRM_MODE_BLEND_PIXEL_NONE ?
+		       G0_IFMT_KRGB888 : G0_IFMT_ARGB8888;
 		break;
 	default:
 		ifmt = G0_IFMT_KRGB888;
 		break;
 	}
+	palpha = ifmt == G0_IFMT_ARGB8888;
 
 	/*
 	 * bitext, read_mode and upd_mode all have to be set for a layer that
@@ -747,11 +749,24 @@ static void histb_vdp2_g0_set(struct histb_vdp2 *vdp, struct drm_framebuffer *fb
 	/*
 	 * The plane's "alpha" is 16-bit (0xffff opaque), this field is 8-bit, so
 	 * the top byte is what reaches the mixer; latched by G0_UPD below.
+	 *
+	 * palpha_range picks the divisor for the pixel's alpha byte: with it set the
+	 * blend is out = a*c + (1-a)*bg over the full byte (measured against a
+	 * non-black mixer background: 0x00/0x40/0x80/0xc0/0xff came back within one
+	 * luma step of that line), cleared it only uses the top seven bits and
+	 * saturates at 0x80. premult_en is the other half of the DRM choice: the
+	 * buffer's colour is then added as it stands and only the background is
+	 * scaled by (1-a), which is what a premultiplied surface expects.
 	 */
 	ctrl = vo_read(vdp, G0_CBMPARA);
-	ctrl &= ~(G0_CBMPARA_GALPHA | G0_CBMPARA_PALPHA_EN |
-		  G0_CBMPARA_KEY_EN | G0_CBMPARA_KEY_MODE);
+	ctrl &= ~(G0_CBMPARA_GALPHA | G0_CBMPARA_PALPHA_EN | G0_CBMPARA_PALPHA_RANGE |
+		  G0_CBMPARA_PREMULT_EN | G0_CBMPARA_KEY_EN | G0_CBMPARA_KEY_MODE);
 	ctrl |= FIELD_PREP(G0_CBMPARA_GALPHA, pstate->alpha >> 8);
+	if (palpha) {
+		ctrl |= G0_CBMPARA_PALPHA_EN | G0_CBMPARA_PALPHA_RANGE;
+		if (pstate->pixel_blend_mode == DRM_MODE_BLEND_PREMULTI)
+			ctrl |= G0_CBMPARA_PREMULT_EN;
+	}
 	vo_write(vdp, G0_CBMPARA, ctrl);
 
 	/*
@@ -2229,14 +2244,18 @@ static int histb_vdp2_bind(struct device *dev)
 	drm_plane_helper_add(&disp->primary, &histb_vdp2_plane_helper_funcs);
 
 	/*
-	 * There is no upstream blend mode that describes what this block does
-	 * with a pixel's alpha byte: the field is 7 bits wide, so bit 7 is
-	 * discarded and coverage wraps (board: alpha 129 scans as transparent,
-	 * 192 as half coverage, 240 as 0.875). The surface is therefore
-	 * scanned out opaque and only "None" is offered.
+	 * The mixer can take the alpha byte as a coverage weight, and it can treat
+	 * the surface as premultiplied, so both upstream modes are offered next to
+	 * "None". Measured over a non-black background with the pixel-alpha path and
+	 * its range bit set, alpha 0x00/0x40/0x80/0xc0/0xff came back at the panel
+	 * within one luma step of a*c + (1-a)*bg; with the range bit clear only part
+	 * of the byte is used, so that bit is always set here. See
+	 * histb_vdp2_g0_set().
 	 */
 	ret = drm_plane_create_blend_mode_property(&disp->primary,
-					BIT(DRM_MODE_BLEND_PIXEL_NONE));
+					BIT(DRM_MODE_BLEND_PIXEL_NONE) |
+					BIT(DRM_MODE_BLEND_PREMULTI) |
+					BIT(DRM_MODE_BLEND_COVERAGE));
 	if (ret) {
 		dev_err_probe(dev, ret, "blend_mode failed\n");
 		goto err_put;
