@@ -1421,13 +1421,6 @@ static void histb_vdp2_pipeline_init(struct histb_vdp2 *vdp,
 	vo_write(vdp, CBM_ATTR, CBM_ATTR_SUR2 | CBM_ATTR_SUR3);
 
 	/*
-	 * Mixer background (Cr[9:0] Cb[19:10] Y[29:20]). Left at its reset 0
-	 * the uncovered area is YCbCr(0,0,0), which panels render as solid
-	 * green; Y=64 with both chroma at mid-scale is black.
-	 */
-	vo_write(vdp, CBM_BKG1, CBM_BKG_BLACK);
-
-	/*
 	 * Firmware can leave its own logo layers enabled, and they sit at a
 	 * higher mixer priority than ours, so turn off every graphics layer
 	 * except the one the plane drives.
@@ -1672,6 +1665,16 @@ static void histb_vdp2_crtc_setup_timing(struct histb_vdp2 *vdp,
 	else
 		ctrl |= DHD_DATA_SEL_HDMI;
 	vo_write(vdp, DHD0_DATA_SEL, ctrl);
+
+	/*
+	 * The mixer inserts its background (Cr[9:0] Cb[19:10] Y[29:20]) downstream
+	 * of GP0's colour handling, so the three numbers reach the pins as they are
+	 * written and the domain is the one just selected above. Black is
+	 * YCbCr(16,128,128) on a YCbCr link and (0,0,0) on an RGB one: with the
+	 * YCbCr triple on the RGB link the area the layer does not cover came back
+	 * on the panel as a flat grey-teal, and with all three at zero it is black.
+	 */
+	vo_write(vdp, CBM_BKG1, yuv444 ? CBM_BKG_BLACK : 0);
 
 	/* latch the timing registers */
 	ctrl = vo_read(vdp, DHD0_CTRL);
