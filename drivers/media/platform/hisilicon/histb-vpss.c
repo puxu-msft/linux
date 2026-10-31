@@ -53,11 +53,26 @@
  * Deinterlacing modes offered through V4L2_CID_DEINTERLACING_MODE.
  * Bob turns one field into a frame by doubling it vertically; Weave states
  * that no filtering happens, so its job is the plain conversion of a frame
- * that already holds both fields.
+ * that already holds both fields. Motion-adaptive interpolation reads the
+ * field, the one before it and the two after it from a driver-owned ring, and
+ * a motion history the block keeps across jobs.
  */
 #define VPSS_DEI_NONE		0
 #define VPSS_DEI_BOB		1
 #define VPSS_DEI_WEAVE		2
+#define VPSS_DEI_MAD		3
+
+/* The ring holds whole pictures: each one carries the two fields of its
+ * moment in the half they occupy, so the block can weave a field with its
+ * partner and compare whole pictures across time.
+ */
+#define VPSS_DEI_RING		4
+/* Motion history planes are fixed to the block's maximum picture (960 x 544
+ * bytes per plane on a 1920-wide frame), as the vendor's allocator does.
+ */
+#define VPSS_DEI_HIST_STRIDE	960
+#define VPSS_DEI_HIST_PLANE	(VPSS_DEI_HIST_STRIDE * 544)
+#define VPSS_DEI_HIST_PLANES	3
 
 struct histb_vpss_fmt {
 	u32	fourcc;
@@ -98,6 +113,22 @@ struct histb_vpss_ctx {
 	struct v4l2_ctrl	*vflip;
 	struct v4l2_ctrl	*sharpness;
 	struct v4l2_ctrl	*rotate;
+
+	/* Motion-adaptive deinterlacing keeps the fields the block reads
+	 * beside the current one, and the motion history it accumulates
+	 * between jobs. All of it is the driver's own memory: a client hands
+	 * the block one field per buffer and gets a frame back.
+	 */
+	void		*dei_fields;
+	dma_addr_t	dei_fields_dma;
+	size_t		dei_frame_bytes;
+	unsigned int	dei_count;
+	unsigned int	dei_hist_wr;
+	u64		dei_ts[VPSS_DEI_RING][2];
+	bool		dei_first_bottom;
+	bool		dei_last_bottom;
+	void		*dei_hist;
+	dma_addr_t	dei_hist_dma;
 };
 
 struct histb_vpss_job {
@@ -143,6 +174,7 @@ static const struct histb_vpss_fmt histb_vpss_cap_fmts[] = {
 static int histb_vpss_reset(struct histb_vpss *vpss);
 static int histb_vpss_kick(struct histb_vpss *vpss, dma_addr_t first);
 static void histb_vpss_reset_crop(struct histb_vpss_ctx *ctx);
+static void histb_vpss_dei_free(struct histb_vpss_ctx *ctx);
 
 static struct histb_vpss_ctx *histb_vpss_ctx_of(struct file *file)
 {
@@ -464,6 +496,8 @@ static void histb_vpss_stop_streaming(struct vb2_queue *vq)
 	if (V4L2_TYPE_IS_OUTPUT(vq->type)) {
 		while ((buf = v4l2_m2m_src_buf_remove(ctx->fh.m2m_ctx)))
 			v4l2_m2m_buf_done(buf, VB2_BUF_STATE_ERROR);
+		/* A new stream starts with no fields and no motion history. */
+		histb_vpss_dei_free(ctx);
 	} else {
 		while ((buf = v4l2_m2m_dst_buf_remove(ctx->fh.m2m_ctx)))
 			v4l2_m2m_buf_done(buf, VB2_BUF_STATE_ERROR);
@@ -909,6 +943,314 @@ static int histb_vpss_run(struct histb_vpss *vpss,
 	return histb_vpss_pass_run(vpss, &p);
 }
 
+/*
+ * The block's interpolation parameters are one register image of their own,
+ * taken from the vendor's PQ defaults for this chip (SDK
+ * msp/drv/pq/pq_v3_0/hal/hi3798mv100/pq_hal_table_default.h): the motion
+ * adaptation window first, then the film-mode detector's thresholds. Each
+ * word is written whole, so the comment names the fields it carries.
+ */
+static const struct {
+	unsigned int	off;
+	u32		val;
+} histb_vpss_dei_defaults[] = {
+	{ 0x1004, 0x00000092 },	/* rec-mode, IIR, motion smooth, mf-max */
+	{ 0x1008, 0xfec00200 },	/* ver_min_inten, dir_inten_ver */
+	{ 0x100c, 0x00000002 },	/* range_scale */
+	{ 0x1010, 0x0008021e },	/* check1 gain, range gain, max range */
+	{ 0x1014, 0x0008021e },	/* check2 gain, range gain, max range */
+	{ 0x1018, 0x1b201828 },	/* direction multipliers 0..3 */
+	{ 0x101c, 0x0b0c0f12 },	/* direction multipliers 4..7 */
+	{ 0x1020, 0x06070809 },	/* direction multipliers 8..11 */
+	{ 0x1024, 0x00030505 },	/* direction multipliers 12..14 */
+	{ 0x1034, 0x87766556 },	/* interpolation scale ratios 1..8 */
+	{ 0x1038, 0x08888888 },	/* interpolation scale ratios 9..15 */
+	{ 0x103c, 0x13880420 },	/* strength/dir thresholds, bc gain */
+	{ 0x1040, 0x00000000 },	/* jitter and field-motion coring */
+	{ 0x1044, 0x083eff00 },	/* field motion gain, slope, thresholds */
+	{ 0x1048, 0xffd09010 },	/* motion-difference thresholds 0..3 */
+	{ 0x104c, 0x4020ffff },	/* IIR range and thresholds 4..5 */
+	{ 0x1050, 0x20000081 },	/* motion IIR curve slopes and ratio 0 */
+	{ 0x1054, 0x40404030 },	/* motion IIR curve ratios 1..4 */
+	{ 0x1058, 0x000d0011 },	/* history mode, rec-mode steps */
+	{ 0x105c, 0x01000000 },	/* median filter */
+	{ 0x1060, 0xa00a0fff },	/* comb-check limits */
+	{ 0x1064, 0x00001e40 },	/* comb-check thresholds */
+	{ 0x1068, 0xffff4808 },	/* frame-motion smooth thresholds 0..3 */
+	{ 0x106c, 0x4000ffff },	/* frame-motion smooth range 4..5 */
+	{ 0x1070, 0x00000008 },	/* frame-motion smooth slopes, ratio 0 */
+	{ 0x1074, 0x40404040 },	/* frame-motion smooth ratios 1..4 */
+	{ 0x1078, 0xffff4808 },	/* frame/field blend thresholds 0..3 */
+	{ 0x107c, 0x4000ffff },	/* frame/field blend range 4..5 */
+	{ 0x1080, 0x00000008 },	/* frame/field blend slopes, ratio 0 */
+	{ 0x1084, 0x40404040 },	/* frame/field blend ratios 1..4 */
+	{ 0x1088, 0x00800080 },	/* motion-adjust gains */
+	{ 0x108c, 0x00100010 },	/* global-motion thresholds 0..1 */
+	{ 0x1090, 0x00100010 },	/* global-motion thresholds 2..3 */
+	{ 0x1094, 0x40402004 },	/* chroma combing removal */
+	{ 0x1098, 0x040118c0 },	/* chroma combing thresholds */
+	{ 0x1144, 0x00201008 },	/* film-mode histogram thresholds 0..2 */
+	{ 0x1148, 0x00143214 },	/* motion coring: block, pixel, window */
+	{ 0x1150, 0x02000006 },	/* edge smoothing, motion-to-rec shift */
+	{ 0x1154, 0x00001e00 },	/* moving-block and still-block thresholds */
+	{ 0x1158, 0x00000000 },	/* monitoring start and threshold */
+	{ 0x115c, 0x00402008 },	/* static-detection thresholds */
+	{ 0x1160, 0x0010105a },	/* per-pixel coring: block, pixel, window */
+	{ 0x1164, 0x00000010 },	/* per-pixel horizontal threshold */
+	{ 0x1168, 0x80402010 },	/* per-pixel vertical thresholds 0..3 */
+	{ 0x116c, 0x20100804 },	/* pixel-difference thresholds 0..3 */
+	{ 0x1170, 0x00200f14 },	/* edge/texture thresholds */
+	{ 0x1174, 0x00000020 },	/* texture alpha, texture coring */
+	{ 0x1178, 0x00000000 },	/* texture thresholds 0..3 */
+	{ 0x117c, 0x00000000 },	/* detection region start and end */
+};
+
+static void histb_vpss_dei_free(struct histb_vpss_ctx *ctx)
+{
+	if (ctx->dei_fields)
+		dma_free_coherent(ctx->vpss->dev,
+				  ctx->dei_frame_bytes * VPSS_DEI_RING,
+				  ctx->dei_fields, ctx->dei_fields_dma);
+	if (ctx->dei_hist)
+		dma_free_coherent(ctx->vpss->dev,
+				  VPSS_DEI_HIST_PLANE * VPSS_DEI_HIST_PLANES,
+				  ctx->dei_hist, ctx->dei_hist_dma);
+	ctx->dei_fields = NULL;
+	ctx->dei_hist = NULL;
+	ctx->dei_frame_bytes = 0;
+	ctx->dei_count = 0;
+	ctx->dei_hist_wr = 0;
+}
+
+static int histb_vpss_dei_alloc(struct histb_vpss_ctx *ctx, size_t frame_bytes)
+{
+	struct histb_vpss *vpss = ctx->vpss;
+	u32 *hist;
+	unsigned int i;
+
+	if (ctx->dei_frame_bytes == frame_bytes && ctx->dei_hist)
+		return 0;
+	histb_vpss_dei_free(ctx);
+
+	ctx->dei_fields = dma_alloc_coherent(vpss->dev,
+					     frame_bytes * VPSS_DEI_RING,
+					     &ctx->dei_fields_dma, GFP_KERNEL);
+	if (!ctx->dei_fields)
+		return -ENOMEM;
+	ctx->dei_hist = dma_alloc_coherent(vpss->dev,
+					   VPSS_DEI_HIST_PLANE *
+					   VPSS_DEI_HIST_PLANES,
+					   &ctx->dei_hist_dma, GFP_KERNEL);
+	if (!ctx->dei_hist) {
+		histb_vpss_dei_free(ctx);
+		return -ENOMEM;
+	}
+	/* The vendor hands the block a history of "no motion" words. */
+	hist = ctx->dei_hist;
+	for (i = 0; i < VPSS_DEI_HIST_PLANE * VPSS_DEI_HIST_PLANES / 4; i++)
+		hist[i] = 0x007f007f;
+	ctx->dei_frame_bytes = frame_bytes;
+	ctx->dei_count = 0;
+	ctx->dei_hist_wr = 0;
+	return 0;
+}
+
+/*
+ * A ring slot is one picture of its moment: the field that just arrived goes
+ * into the half it occupies, and the other half holds the field that came
+ * with it. That is the layout the block is given - it is handed the picture
+ * (one line past its start for the bottom field) and reads every other line.
+ */
+static void histb_vpss_dei_store(struct histb_vpss_ctx *ctx, const void *src,
+				 unsigned int stride, unsigned int h,
+				 unsigned int field, bool bottom, u64 ts)
+{
+	unsigned int half = bottom;
+	unsigned int slot = (field / 2) % VPSS_DEI_RING;
+	u8 *pic = ctx->dei_fields + (size_t)slot * ctx->dei_frame_bytes;
+	u8 *y = pic + (size_t)half * stride;
+	u8 *c = pic + (size_t)stride * 2 * h + (size_t)half * stride;
+	const u8 *row = src;
+	unsigned int i;
+
+	for (i = 0; i < h; i++)
+		memcpy(y + (size_t)2 * i * stride, row + (size_t)i * stride,
+		       stride);
+	row += (size_t)stride * h;
+	for (i = 0; i < h / 2; i++)
+		memcpy(c + (size_t)2 * i * stride, row + (size_t)i * stride,
+		       stride);
+	ctx->dei_ts[slot][half] = ts;
+}
+
+static dma_addr_t histb_vpss_dei_field(struct histb_vpss_ctx *ctx,
+				       unsigned int field, bool bottom,
+				       unsigned int stride)
+{
+	unsigned int slot = (field / 2) % VPSS_DEI_RING;
+
+	return ctx->dei_fields_dma + (size_t)slot * ctx->dei_frame_bytes +
+	       (bottom ? stride : 0);
+}
+
+/*
+ * One motion-adaptive job. A job reads the field it produces, the one before
+ * it and the two after it out of the ring, so its picture is three fields
+ * behind the buffer that triggered it, and its timestamp says so; the delay
+ * is what makes sure every picture a job reads is complete. Until the output
+ * field has a neighbour on both sides the block has nothing to interpolate
+ * against, so that frame leaves as the doubled copy bob already produces.
+ */
+static int histb_vpss_dei_run(struct histb_vpss *vpss,
+			      struct histb_vpss_ctx *ctx,
+			      const struct histb_vpss_job *job,
+			      const void *src, u64 ts, bool bottom,
+			      u64 *out_ts)
+{
+	unsigned int h = job->height;
+	size_t frame = (size_t)job->src_stride * 3 * h;
+	dma_addr_t f[VPSS_DEI_RING];
+	dma_addr_t hist_w, hist_r;
+	unsigned int n, k, i;
+	bool cur_bottom;
+	u32 *s = vpss->shadow;
+	int ret;
+
+	ret = histb_vpss_dei_alloc(ctx, frame);
+	if (ret)
+		return ret;
+
+	n = ctx->dei_count;
+	/*
+	 * The block pairs a field with the one before it, so a stream whose
+	 * fields do not alternate has no pairing to give it; start the ring
+	 * over instead of pairing the current field with a stale picture.
+	 */
+	if (n && bottom == ctx->dei_last_bottom) {
+		dev_warn_ratelimited(vpss->dev,
+				     "fields do not alternate, starting over\n");
+		ctx->dei_count = 0;
+		n = 0;
+	}
+	ctx->dei_last_bottom = bottom;
+	if (!n)
+		ctx->dei_first_bottom = bottom;
+	histb_vpss_dei_store(ctx, src, job->src_stride, h, n, bottom, ts);
+	ctx->dei_count++;
+
+	if (ctx->dei_count <= 4) {
+		*out_ts = ts;
+		return histb_vpss_run(vpss, job);
+	}
+
+	k = n - 3;
+	cur_bottom = ctx->dei_first_bottom ^ (k & 1);
+	for (i = 0; i < VPSS_DEI_RING; i++) {
+		unsigned int field = k - 1 + i;
+
+		f[i] = histb_vpss_dei_field(ctx, field,
+					    ctx->dei_first_bottom ^
+					    (field & 1),
+					    job->src_stride);
+	}
+	*out_ts = ctx->dei_ts[(k / 2) % VPSS_DEI_RING][cur_bottom];
+
+	if (!s)
+		return -ENODEV;
+	if (upper_32_bits(f[0]) || upper_32_bits(f[3]))
+		return -ERANGE;
+
+	memset(s, 0, VPSS_REG_IMAGE_SIZE);
+	s[VPSS_MISCELLANEOUS / 4] = 0x03003244;
+	s[VPSS_INTMASK / 4] = 0xff;
+	s[VPSS_TIMEOUT / 4] = 0xffffffff;
+
+	/* Field input: the block reads one half of each frame-sized picture,
+	 * which half the field it produces is, and which half the stream
+	 * starts with.
+	 */
+	s[VPSS_CTRL / 4] = VPSS_CTRL_VHD_EN |
+			  FIELD_PREP(VPSS_CTRL_PROT, 2) |
+			  VPSS_CTRL_DEI_EN | VPSS_CTRL_BFIELD |
+			  (ctx->dei_first_bottom ? VPSS_CTRL_BFIELD_FIRST : 0) |
+			  (cur_bottom ? VPSS_CTRL_BFIELD_MODE : 0);
+	s[VPSS_CTRL2 / 4] = FIELD_PREP(VPSS_CTRL2_IN_FORMAT, 0) |
+			   FIELD_PREP(VPSS_CTRL2_VHD_FORMAT, 0);
+	s[VPSS_IMGSIZE / 4] = FIELD_PREP(VPSS_IMGSIZE_WIDTH, job->in_w - 1) |
+			     FIELD_PREP(VPSS_IMGSIZE_HEIGHT, 2 * h - 1);
+
+	s[VPSS_CURYADDR / 4] = lower_32_bits(f[1]);
+	s[VPSS_CURCADDR / 4] = lower_32_bits(f[1] +
+					     (size_t)job->src_stride * 2 * h);
+	s[VPSS_CURSTRIDE / 4] =
+		FIELD_PREP(VPSS_CURSTRIDE_Y, job->src_stride) |
+		FIELD_PREP(VPSS_CURSTRIDE_C, job->src_stride);
+	s[VPSS_REFYADDR / 4] = lower_32_bits(f[0]);
+	s[VPSS_REFCADDR / 4] = lower_32_bits(f[0] +
+					     (size_t)job->src_stride * 2 * h);
+	s[VPSS_REFSTRIDE / 4] =
+		FIELD_PREP(VPSS_FIELDSTRIDE_Y, job->src_stride) |
+		FIELD_PREP(VPSS_FIELDSTRIDE_C, job->src_stride);
+	s[VPSS_NXT1YADDR / 4] = lower_32_bits(f[2]);
+	s[VPSS_NXT1CADDR / 4] = lower_32_bits(f[2] +
+					      (size_t)job->src_stride * 2 * h);
+	s[VPSS_NXT1STRIDE / 4] =
+		FIELD_PREP(VPSS_FIELDSTRIDE_Y, job->src_stride) |
+		FIELD_PREP(VPSS_FIELDSTRIDE_C, job->src_stride);
+	s[VPSS_NXT2YADDR / 4] = lower_32_bits(f[3]);
+	s[VPSS_NXT2CADDR / 4] = lower_32_bits(f[3] +
+					      (size_t)job->src_stride * 2 * h);
+	s[VPSS_NXT2STRIDE / 4] =
+		FIELD_PREP(VPSS_FIELDSTRIDE_Y, job->src_stride) |
+		FIELD_PREP(VPSS_FIELDSTRIDE_C, job->src_stride);
+
+	hist_w = ctx->dei_hist_dma + ctx->dei_hist_wr * VPSS_DEI_HIST_PLANE;
+	hist_r = ctx->dei_hist_dma +
+		 ((ctx->dei_hist_wr + 2) % VPSS_DEI_HIST_PLANES) *
+		 VPSS_DEI_HIST_PLANE;
+	s[VPSS_STWADDR / 4] = lower_32_bits(hist_w);
+	s[VPSS_STRADDR / 4] = lower_32_bits(hist_r);
+	s[VPSS_STSTRIDE / 4] =
+		FIELD_PREP(VPSS_STSTRIDE_VAL, VPSS_DEI_HIST_STRIDE);
+	/* The parameter block starts at the control word itself
+	 * (VPSS_REG_SIZE_CALC(VPSS_CTRL, VPSS_DIECTRL) - 4 in the vendor
+	 * header), which is inside this register image.
+	 */
+	s[VPSS_DEI_ADDR / 4] = lower_32_bits(vpss->shadow_dma + VPSS_DIECTRL);
+	s[VPSS_DIECTRL / 4] = FIELD_PREP(VPSS_DIECTRL_LMODE, 1) |
+			     FIELD_PREP(VPSS_DIECTRL_CMODE, 1);
+	for (i = 0; i < ARRAY_SIZE(histb_vpss_dei_defaults); i++)
+		s[histb_vpss_dei_defaults[i].off / 4] =
+			histb_vpss_dei_defaults[i].val;
+
+	s[VPSS_VHDCTRL / 4] = job->invert_uv ? VPSS_VHDCTRL_UV_INVERT : 0;
+	s[VPSS_VHDSIZE / 4] = FIELD_PREP(VPSS_VHDSIZE_WIDTH, job->out_width - 1) |
+			     FIELD_PREP(VPSS_VHDSIZE_HEIGHT, 2 * h - 1);
+	s[VPSS_VHDYADDR / 4] = lower_32_bits(job->dst);
+	s[VPSS_VHDCADDR / 4] = lower_32_bits(job->dst +
+					     (size_t)job->dst_stride * 2 * h);
+	s[VPSS_VHDSTRIDE / 4] = FIELD_PREP(VPSS_VHDSTRIDE_Y, job->dst_stride) |
+			       FIELD_PREP(VPSS_VHDSTRIDE_C, job->dst_stride);
+
+	s[VPSS_VHDLBA_BK / 4] = FIELD_PREP(GENMASK(15, 8), 0x10) |
+				FIELD_PREP(GENMASK(23, 16), 0x80) |
+				FIELD_PREP(GENMASK(31, 24), 0x80);
+	s[VPSS_VHDCROP_SIZE / 4] =
+		VPSS_CROP_EN |
+		FIELD_PREP(VPSS_VHDCROP_WIDTH, job->out_width - 1) |
+		FIELD_PREP(VPSS_VHDCROP_HEIGHT, 2 * h - 1);
+
+	s[VPSS_PNEXT / 4] = 0;
+	s[VPSS_START / 4] = 1;
+	/* The image has to be in memory before the block is handed its head. */
+	wmb();
+
+	ret = histb_vpss_kick(vpss, vpss->shadow_dma);
+	if (!ret)
+		ctx->dei_hist_wr = (ctx->dei_hist_wr + 2) % VPSS_DEI_HIST_PLANES;
+	return ret;
+}
+
 static void histb_vpss_device_run(void *priv)
 {
 	struct histb_vpss_ctx *ctx = priv;
@@ -918,11 +1260,13 @@ static void histb_vpss_device_run(void *priv)
 	unsigned int dei_mode = VPSS_DEI_NONE;
 	int ret = -EINVAL;
 	bool powered = false;
+	u64 out_ts = 0;
 
 	src = v4l2_m2m_next_src_buf(ctx->fh.m2m_ctx);
 	dst = v4l2_m2m_next_dst_buf(ctx->fh.m2m_ctx);
 	if (!src || !dst)
 		goto finish;
+	out_ts = src->vb2_buf.timestamp;
 
 	if (vpss->faulted) {
 		ret = -EIO;
@@ -997,6 +1341,7 @@ static void histb_vpss_device_run(void *priv)
 	if (job.in_packed && (job.in_x || job.in_y)) {
 		dev_warn_ratelimited(vpss->dev,
 				     "packed input cannot be windowed\n");
+		ret = -EINVAL;
 		goto finish;
 	}
 	/* Bob doubles one field vertically through the scaler, so it only
@@ -1013,13 +1358,41 @@ static void histb_vpss_device_run(void *priv)
 	      src->field != V4L2_FIELD_BOTTOM))) {
 		dev_warn_ratelimited(vpss->dev,
 				     "bob needs a field and twice its height\n");
+		ret = -EINVAL;
 		goto finish;
 	}
 	job.hflip = ctx->hflip && ctx->hflip->val;
 	job.vflip = ctx->vflip && ctx->vflip->val;
 	job.angle = ctx->rotate ? ctx->rotate->val : 0;
 
-	if (job.angle == 180) {
+	if (dei_mode == VPSS_DEI_MAD) {
+		const void *vaddr = vb2_plane_vaddr(&src->vb2_buf, 0);
+
+		/*
+		 * The interpolation path reads 4:2:0 fields only, from memory
+		 * the driver can copy, and it owns the whole conversion: no
+		 * window, scaler, sharpen, flip or turn rides on top of it.
+		 */
+		if (job.in_422 || job.out_422 || job.in_packed ||
+		    job.in_x || job.in_y ||
+		    job.in_w != job.width || job.in_h != job.height ||
+		    job.out_width != job.width ||
+		    job.out_height != job.height * 2 ||
+		    job.sharpness || job.hflip || job.vflip || job.angle ||
+		    !vaddr ||
+		    (src->field != V4L2_FIELD_TOP &&
+		     src->field != V4L2_FIELD_BOTTOM)) {
+			dev_warn_ratelimited(vpss->dev,
+					     "motion-adaptive wants one 4:2:0 field and nothing "
+					     "else\n");
+			ret = -EINVAL;
+			goto finish;
+		}
+		ret = histb_vpss_dei_run(vpss, ctx, &job, vaddr,
+					 src->vb2_buf.timestamp,
+					 src->field == V4L2_FIELD_BOTTOM,
+					 &out_ts);
+	} else if (job.angle == 180) {
 		/* Half a turn is the port's mirror plus flip. Both are order
 		 * reversals on independent axes, so they commute and a client's
 		 * flip cancels the matching one here rather than being dropped.
@@ -1072,7 +1445,7 @@ finish:
 			vb2_set_plane_payload(&dst->vb2_buf, 0,
 					      ctx->dst_fmt.sizeimage);
 			if (src)
-				dst->vb2_buf.timestamp = src->vb2_buf.timestamp;
+				dst->vb2_buf.timestamp = out_ts;
 		}
 		v4l2_m2m_buf_done(dst, ret ? VB2_BUF_STATE_ERROR :
 						 VB2_BUF_STATE_DONE);
@@ -1117,14 +1490,14 @@ static int histb_vpss_queue_init(void *priv, struct vb2_queue *src_vq,
 }
 
 static const char *const histb_vpss_dei_menu[] = {
-	"Off", "Bob", "Weave", NULL,
+	"Off", "Bob", "Weave", "Motion adaptive", NULL,
 };
 
 static int histb_vpss_ctrls_create(struct histb_vpss_ctx *ctx)
 {
 	struct v4l2_ctrl_handler *hdl = &ctx->ctrl_handler;
 
-	v4l2_ctrl_handler_init(hdl, 3);
+	v4l2_ctrl_handler_init(hdl, 5);
 	ctx->hflip = v4l2_ctrl_new_std(hdl, NULL, V4L2_CID_HFLIP, 0, 1, 1, 0);
 	ctx->vflip = v4l2_ctrl_new_std(hdl, NULL, V4L2_CID_VFLIP, 0, 1, 1, 0);
 	ctx->sharpness = v4l2_ctrl_new_std(hdl, NULL, V4L2_CID_SHARPNESS, 0, 255,
@@ -1132,7 +1505,7 @@ static int histb_vpss_ctrls_create(struct histb_vpss_ctx *ctx)
 	ctx->rotate = v4l2_ctrl_new_std(hdl, NULL, V4L2_CID_ROTATE, 0, 270, 90, 0);
 	ctx->dei_ctrl = v4l2_ctrl_new_std_menu_items(hdl, NULL,
 						     V4L2_CID_DEINTERLACING_MODE,
-						     VPSS_DEI_WEAVE, 0,
+						     VPSS_DEI_MAD, 0,
 						     VPSS_DEI_NONE,
 						     histb_vpss_dei_menu);
 	if (hdl->error)
@@ -1195,6 +1568,7 @@ static int histb_vpss_release(struct file *file)
 	v4l2_ctrl_handler_free(&ctx->ctrl_handler);
 	v4l2_fh_del(&ctx->fh, file);
 	v4l2_fh_exit(&ctx->fh);
+	histb_vpss_dei_free(ctx);
 	mutex_unlock(&ctx->vpss->lock);
 	kfree(ctx);
 	return 0;

@@ -45,6 +45,32 @@
 #define VPSS_CURSTRIDE_Y	GENMASK(15, 0)
 #define VPSS_CURSTRIDE_C	GENMASK(31, 16)
 
+/* The three field nodes DEI reads beside the current one. */
+#define VPSS_REF_CTRL		0x028
+#define VPSS_REFYADDR		0x034
+#define VPSS_REFCADDR		0x038
+#define VPSS_REFCRADDR		0x03c
+#define VPSS_REFSTRIDE		0x040
+#define VPSS_NXT1_CTRL		0x044
+#define VPSS_NXT1YADDR		0x050
+#define VPSS_NXT1CADDR		0x054
+#define VPSS_NXT1CRADDR		0x058
+#define VPSS_NXT1STRIDE		0x05c
+#define VPSS_NXT2_CTRL		0x060
+#define VPSS_NXT2YADDR		0x06c
+#define VPSS_NXT2CADDR		0x070
+#define VPSS_NXT2CRADDR		0x074
+#define VPSS_NXT2STRIDE		0x078
+#define VPSS_FIELDSTRIDE_Y	GENMASK(15, 0)
+#define VPSS_FIELDSTRIDE_C	GENMASK(31, 16)
+
+/* Motion history: the block reads one plane and writes the next. */
+#define VPSS_STRADDR		0x098
+#define VPSS_STWADDR		0x09c
+#define VPSS_STSTRIDE		0x0a0
+#define VPSS_STSTRIDE_VAL	GENMASK(19, 0)
+#define VPSS_DEI_ADDR		0x240
+
 #define VPSS_VHDCTRL		0x0a4
 #define VPSS_VHDCTRL_MIRROR	BIT(4)
 #define VPSS_VHDCTRL_FLIP	BIT(5)
