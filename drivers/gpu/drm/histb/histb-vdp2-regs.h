@@ -102,6 +102,14 @@
 #define G0_IFMT_RGB444		0x40	/* 16bpp, R in bits 11:8, no alpha */
 #define G0_IFMT_RGB555		0x41	/* 16bpp, R in bits 14:10, no alpha */
 #define G0_IFMT_RGB565		0x42	/* 16bpp, no alpha */
+#define G0_IFMT_ARGB4444	0x48	/* 16bpp, A:R:G:B nibbles */
+/*
+ * 0x49 is the 16bpp code with a single alpha bit. It is not used: with
+ * palpha_en set the layer disappeared for both bit states, under every
+ * combination of palpha_range and premult_en that was tried, while the same
+ * pixels with the bit cleared came back at full level (board, luma 0 for
+ * 0x10ff/0x11ff/0x30ff/0x31ff and 255 for 0x00ff).
+ */
 #define G0_IFMT_RGB888		0x50	/* 24bpp, one byte per channel, no alpha */
 #define G0_IFMT_KRGB888		0x60	/* 32bpp, alpha ignored */
 #define G0_IFMT_ARGB8888	0x68	/* 32bpp, alpha taken from the pixel */

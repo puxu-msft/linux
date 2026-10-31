@@ -350,6 +350,7 @@ static const u32 histb_vdp2_formats[] = {
 	DRM_FORMAT_RGBA8888,
 	DRM_FORMAT_RGB565,
 	DRM_FORMAT_XRGB4444,
+	DRM_FORMAT_ARGB4444,
 	DRM_FORMAT_XRGB1555,
 	/* one byte per channel; the fetch stride is in 16-byte units, so the
 	 * width has to be a multiple of 16 pixels for the pitch to divide.
@@ -761,6 +762,15 @@ static void histb_vdp2_g0_set(struct histb_vdp2 *vdp, struct drm_framebuffer *fb
 		break;
 	case DRM_FORMAT_XRGB1555:
 		ifmt = G0_IFMT_RGB555;
+		break;
+	case DRM_FORMAT_ARGB4444:
+		/*
+		 * The alpha nibble is replicated into a byte before the blend
+		 * (board: a white surface with the nibble 0/1/4/8/15 came back as
+		 * 0/17/67/135/255, which is the nibble times 0x11 over 255), so the
+		 * range bit stays set here as it does for the byte-alpha codes.
+		 */
+		ifmt = blend ? G0_IFMT_ARGB4444 : G0_IFMT_RGB444;
 		break;
 	case DRM_FORMAT_RGB565:
 		ifmt = G0_IFMT_RGB565;
