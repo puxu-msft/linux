@@ -735,14 +735,22 @@ static void histb_vdp2_g0_set(struct histb_vdp2 *vdp, struct drm_framebuffer *fb
 		return;
 	}
 
-	src_x = (pstate->src_x >> 16) & GENMASK(11, 0);
-	src_y = (pstate->src_y >> 16) & GENMASK(11, 0);
-	src_w = min_t(u32, pstate->src_w >> 16, fb->width - src_x);
-	src_h = min_t(u32, pstate->src_h >> 16, fb->height - src_y);
-	dst_x = pstate->crtc_x & GENMASK(11, 0);
-	dst_y = pstate->crtc_y & GENMASK(11, 0);
-	dst_w = min_t(u32, pstate->crtc_w, 4096 - dst_x);
-	dst_h = min_t(u32, pstate->crtc_h, 4096 - dst_y);
+	/*
+	 * The core has already clipped the destination to the screen and moved the
+	 * source corner along with it, into these two rectangles. The crtc_x and
+	 * src_x fields keep what the caller asked for, so a plane that starts off
+	 * the left edge would be placed by their negative value: masking one into
+	 * the 12-bit position field put its first corner at 4032 while its last
+	 * stayed at 575, and the layer vanished instead of losing its left column.
+	 */
+	src_x = pstate->src.x1 >> 16;
+	src_y = pstate->src.y1 >> 16;
+	src_w = (pstate->src.x2 - pstate->src.x1) >> 16;
+	src_h = (pstate->src.y2 - pstate->src.y1) >> 16;
+	dst_x = pstate->dst.x1;
+	dst_y = pstate->dst.y1;
+	dst_w = drm_rect_width(&pstate->dst);
+	dst_h = drm_rect_height(&pstate->dst);
 	if (!src_w || !src_h || !dst_w || !dst_h)
 		return;
 
@@ -846,36 +854,37 @@ static void histb_vdp2_g0_set(struct histb_vdp2 *vdp, struct drm_framebuffer *fb
 		 FIELD_PREP(G0_IRESO_IH, src_h - 1));
 
 	/*
-	 * V* is where the fetched region lands on the panel (the SDK's "video
-	 * position", VDP_GFX_SetVideoPos) and D* is the display window around it
-	 * (VDP_GFX_SetDispPos). Writing the source corner into V* instead, as an
-	 * earlier revision did, moved the surface on screen rather than cropping it:
-	 * the top-left text row came back at (320,180) under a 320,180 "source" commit.
+	 * Two rectangles describe the layer: D* is the window its fetched picture
+	 * is laid into, V* is the picture itself counted from the layer's origin.
+	 * The panel position the block ends up using is the display start scaled by
+	 * the zoom ratio plus the GP0 video start, so the display start belongs at
+	 * 0 and the position is carried by the GP0 corner below; left at the
+	 * destination, every layer landed a second destination-width to the right
+	 * (128 instead of 64 at x=64, 192 instead of 64 at 2x magnify).
 	 *
-	 * The footprint has to be the wider of the two rectangles, not the
+	 * The picture has to be the wider of the two rectangles, not the
 	 * destination: GP0 re-shapes the window G0 laid down, so a destination
 	 * smaller than the source would clip the region the zoom stage is told to
 	 * read, and the minified commit came back as a flat field on the panel.
 	 */
 	win_w = max(src_w, dst_w);
 	win_h = max(src_h, dst_h);
-	vo_write(vdp, G0_VFPOS,
-		 FIELD_PREP(G0_DFPOS_X, dst_x) |
-		 FIELD_PREP(G0_DFPOS_Y, dst_y));
+	vo_write(vdp, G0_VFPOS, 0);
 	vo_write(vdp, G0_VLPOS,
-		 FIELD_PREP(G0_DLPOS_X, dst_x + win_w - 1) |
-		 FIELD_PREP(G0_DLPOS_Y, dst_y + win_h - 1));
-	vo_write(vdp, G0_DFPOS,
-		 FIELD_PREP(G0_DFPOS_X, dst_x) |
-		 FIELD_PREP(G0_DFPOS_Y, dst_y));
+		 FIELD_PREP(G0_DLPOS_X, win_w - 1) |
+		 FIELD_PREP(G0_DLPOS_Y, win_h - 1));
+	vo_write(vdp, G0_DFPOS, 0);
 	vo_write(vdp, G0_DLPOS,
 		 FIELD_PREP(G0_DLPOS_X, dst_x + win_w - 1) |
 		 FIELD_PREP(G0_DLPOS_Y, dst_y + win_h - 1));
 
 	/*
-	 * GP0 post-processes the window G0 produced, not the whole surface:
-	 * its input resolution and output window both follow the destination
-	 * rectangle.
+	 * GP0 post-processes the window G0 produced, not the whole surface, and its
+	 * video pair is the rectangle the picture occupies on the panel: it has to
+	 * span exactly the output size. Written wider, the block covers the rest of
+	 * the screen with out-of-range pixels and the write-back tap stops
+	 * completing frames; written 0-based, every layer is clipped at a panel
+	 * column equal to its own width.
 	 */
 	vo_write(vdp, GP0_IRESO,
 		 FIELD_PREP(G0_IRESO_IW, src_w - 1) |
@@ -889,10 +898,12 @@ static void histb_vdp2_g0_set(struct histb_vdp2 *vdp, struct drm_framebuffer *fb
 	vo_write(vdp, GP0_DLPOS,
 		 FIELD_PREP(G0_DLPOS_X, dst_x + dst_w - 1) |
 		 FIELD_PREP(G0_DLPOS_Y, dst_y + dst_h - 1));
-	vo_write(vdp, GP0_VFPOS, 0);
+	vo_write(vdp, GP0_VFPOS,
+		 FIELD_PREP(G0_DFPOS_X, dst_x) |
+		 FIELD_PREP(G0_DFPOS_Y, dst_y));
 	vo_write(vdp, GP0_VLPOS,
-		 FIELD_PREP(G0_DLPOS_X, dst_w - 1) |
-		 FIELD_PREP(G0_DLPOS_Y, dst_h - 1));
+		 FIELD_PREP(G0_DLPOS_X, dst_x + dst_w - 1) |
+		 FIELD_PREP(G0_DLPOS_Y, dst_y + dst_h - 1));
 
 	/*
 	 * The zoom engine walks the source with its own step registers, so
@@ -951,6 +962,7 @@ static int histb_vdp2_plane_atomic_check(struct drm_plane *plane,
 	struct drm_gem_dma_object *gem;
 	unsigned int min_scale, max_scale;
 	dma_addr_t addr;
+	int ret;
 	u32 sfpos;
 
 	if (!new_state->fb)
@@ -959,18 +971,6 @@ static int histb_vdp2_plane_atomic_check(struct drm_plane *plane,
 	/* G0_STRIDE is programmed in units of 16 bytes */
 	if (new_state->fb->pitches[0] % 16)
 		return -EINVAL;
-
-	/*
-	 * and the source corner has to be one the fetch can name: the address
-	 * field carries 16-byte units, src_xfpos the pixels inside one of them.
-	 */
-	gem = drm_fb_dma_get_gem_obj(new_state->fb, 0);
-	if (!gem)
-		return -EINVAL;
-	if (histb_vdp2_fetch_pos(new_state->fb, gem->dma_addr,
-				 new_state->src_x >> 16,
-				 new_state->src_y >> 16, &addr, &sfpos))
-		return -ERANGE;
 
 	/* the G0_IRESO / GP0_ORESO width fields are 12 bits wide */
 	if (new_state->fb->width > 4095)
@@ -983,9 +983,6 @@ static int histb_vdp2_plane_atomic_check(struct drm_plane *plane,
 	/* The new-state getter is a slot read, so it yields NULL. */
 	if (!crtc_state)
 		return PTR_ERR(crtc_state);
-
-	if (new_state->crtc_w > 4095 || new_state->crtc_h > 4095)
-		return -EINVAL;
 
 	/*
 	 * This is what fills in new_state->visible, and atomic_update acts on
@@ -1011,9 +1008,30 @@ static int histb_vdp2_plane_atomic_check(struct drm_plane *plane,
 		max_scale = DRM_PLANE_NO_SCALING;
 	}
 
-	return drm_atomic_helper_check_plane_state(new_state, crtc_state,
-						   min_scale, max_scale,
-						   true, true);
+	ret = drm_atomic_helper_check_plane_state(new_state, crtc_state,
+						  min_scale, max_scale,
+						  true, true);
+	if (ret)
+		return ret;
+
+	/*
+	 * With the rectangles clipped to the panel, the source corner the fetch will
+	 * be pointed at is known: the address field carries 16-byte units and
+	 * src_xfpos the pixels inside one of them, and a corner neither can name is
+	 * refused here rather than rounded down in the update path.
+	 */
+	if (!new_state->visible)
+		return 0;
+
+	gem = drm_fb_dma_get_gem_obj(new_state->fb, 0);
+	if (!gem)
+		return -EINVAL;
+	if (histb_vdp2_fetch_pos(new_state->fb, gem->dma_addr,
+				 new_state->src.x1 >> 16,
+				 new_state->src.y1 >> 16, &addr, &sfpos))
+		return -ERANGE;
+
+	return 0;
 }
 
 static const struct drm_plane_helper_funcs histb_vdp2_plane_helper_funcs = {
@@ -1092,10 +1110,8 @@ static const struct histb_wb_fmt *histb_wb_fmt_find(u32 format)
 	return NULL;
 }
 
-/* the capture is one frame of what the channel mixes, read
- * progressively as the vendor's snapshot path does
- * (drv_disp_hal.c:2583), at 1:1
- */
+
+/* the capture is one frame of what the channel mixes, at 1:1 */
 static void histb_wb_setup(struct histb_vdp2 *vdp, const struct histb_wb_fmt *fmt,
 			   struct drm_framebuffer *fb)
 {
@@ -1109,7 +1125,7 @@ static void histb_wb_setup(struct histb_vdp2 *vdp, const struct histb_wb_fmt *fm
 	ctrl = vo_read(vdp, base + WBC_OFS_CTRL);
 	ctrl &= ~(WBC_CTRL_FORMAT | WBC_CTRL_MODE | WBC_CTRL_3D_MODE);
 	ctrl |= FIELD_PREP(WBC_CTRL_FORMAT, fmt->wbc_format) |
-		FIELD_PREP(WBC_CTRL_MODE, WBC_MODE_PROGRESSIVE);
+		FIELD_PREP(WBC_CTRL_MODE, 1);	/* progressive */
 	if (fmt->planes == 2) {
 		ctrl &= ~WBC_CTRL_UV_ORDER;
 		if (fmt->uv_order)
@@ -1117,6 +1133,7 @@ static void histb_wb_setup(struct histb_vdp2 *vdp, const struct histb_wb_fmt *fm
 	}
 	/* the caller enables, once the target is fully described */
 	vo_write(vdp, base + WBC_OFS_CTRL, ctrl);
+
 
 	if (base == WBC_BASE_GP0) {
 		/* 10-bit surfaces dither down to the 8-bit target the block writes */
@@ -1552,7 +1569,8 @@ static void histb_vdp2_pipeline_init(struct histb_vdp2 *vdp,
 	 * rotated, and nothing upstream can be changed to fix it: every 32bpp ifmt
 	 * code this chip names only rotates the byte index of the pixel, and no
 	 * 32-bit DRM format composes with that map into the honest assignment (both
-	 * measured on the AR513W). This stage is the one place in the path that reorders the
+	 * measured on the AR513W). This stage is the one place in the path that
+	 * reorders the
 	 * component lines, so it carries the inverse cycle, and it still performs no
 	 * colour-space conversion -- the interface carries RGB (see
 	 * histb_vdp2_crtc_setup_timing()) and the transmitter converts on its own.
