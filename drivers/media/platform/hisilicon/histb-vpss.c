@@ -63,6 +63,7 @@ struct histb_vpss_fmt {
 	u32	fourcc;
 	bool	nv21;
 	bool	fmt422;
+	bool	packed;
 };
 
 struct histb_vpss {
@@ -110,6 +111,8 @@ struct histb_vpss_job {
 	unsigned int	dst_stride;
 	bool		in_422;
 	bool		out_422;
+	bool		in_packed;
+	unsigned int	in_fmt;
 	bool		invert_uv;
 	unsigned int	sharpness;
 	bool		hflip;
@@ -122,17 +125,19 @@ struct histb_vpss_job {
 };
 
 static const struct histb_vpss_fmt histb_vpss_out_fmts[] = {
-	{ V4L2_PIX_FMT_NV12, false, false },
-	{ V4L2_PIX_FMT_NV21, true, false },
-	{ V4L2_PIX_FMT_NV16, false, true },
-	{ V4L2_PIX_FMT_NV61, true, true },
+	{ V4L2_PIX_FMT_NV12, false, false, false },
+	{ V4L2_PIX_FMT_NV21, true, false, false },
+	{ V4L2_PIX_FMT_NV16, false, true, false },
+	{ V4L2_PIX_FMT_NV61, true, true, false },
+	{ V4L2_PIX_FMT_YUYV, false, true, true },
+	{ V4L2_PIX_FMT_UYVY, false, true, true },
 };
 
 static const struct histb_vpss_fmt histb_vpss_cap_fmts[] = {
-	{ V4L2_PIX_FMT_NV12, false, false },
-	{ V4L2_PIX_FMT_NV21, true, false },
-	{ V4L2_PIX_FMT_NV16, false, true },
-	{ V4L2_PIX_FMT_NV61, true, true },
+	{ V4L2_PIX_FMT_NV12, false, false, false },
+	{ V4L2_PIX_FMT_NV21, true, false, false },
+	{ V4L2_PIX_FMT_NV16, false, true, false },
+	{ V4L2_PIX_FMT_NV61, true, true, false },
 };
 
 static int histb_vpss_reset(struct histb_vpss *vpss);
@@ -162,6 +167,20 @@ static unsigned int histb_vpss_stride(unsigned int width, unsigned int bpl)
 }
 
 /*
+ * The input sampler's code for the source layout (vpss_reg_3798m.c:580-640):
+ * 0 is semi-planar 4:2:0, 2 semi-planar 4:2:2, and the packed pairs carry their
+ * own codes because the byte order inside a pair is part of the layout.
+ */
+static unsigned int histb_vpss_in_format(const struct histb_vpss_fmt *f)
+{
+	if (f->fourcc == V4L2_PIX_FMT_YUYV)
+		return 0xb;
+	if (f->fourcc == V4L2_PIX_FMT_UYVY)
+		return 0xd;
+	return f->fmt422 ? 2 : 0;
+}
+
+/*
  * A client's bytesperline reaches the stride registers unchanged, and both of
  * them are 16 bits wide (VPSS_CURSTRIDE_Y, VPSS_VHDSTRIDE_Y), so a request
  * above that would be masked into a different geometry: the buffer gets sized
@@ -187,10 +206,19 @@ static int histb_vpss_fill_fmt(const struct histb_vpss_fmt *f,
 	pix->field = V4L2_FIELD_NONE;
 	pix->colorspace = V4L2_COLORSPACE_SMPTE170M;
 
+	/* A packed pair is two bytes per pixel and one plane, so the row is at
+	 * least 2 * width long and a client asking for less is asking for a
+	 * different geometry.
+	 */
+	if (f->packed && pix->bytesperline < 2 * width)
+		pix->bytesperline = 2 * width;
+
 	stride = histb_vpss_stride(width, pix->bytesperline);
 	pix->bytesperline = stride;
 	/* 4:2:2 keeps a full-height chroma plane beside the luma. */
-	if (f->fmt422)
+	if (f->packed)
+		pix->sizeimage = stride * height;
+	else if (f->fmt422)
 		pix->sizeimage = stride * height * 2;
 	else
 		pix->sizeimage = stride * height * 3 / 2;
@@ -564,6 +592,8 @@ struct histb_vpss_pass {
 	unsigned int	out_stride;
 	bool		in_422;
 	bool		out_422;
+	bool		in_packed;
+	unsigned int	in_fmt;
 	bool		invert_uv;
 	unsigned int	sharpness;
 	bool		hflip;
@@ -589,11 +619,11 @@ static int histb_vpss_pass_run(struct histb_vpss *vpss,
 	s[VPSS_CTRL / 4] = VPSS_CTRL_VHD_EN |
 			  FIELD_PREP(VPSS_CTRL_PROT, 2);
 
-	/* 0 selects the 4:2:0 semi-planar family, 2 the 4:2:2 one; the port's
-	 * format field counts 4:2:0 as 0 and 4:2:2 as 1.
+	/* 0 selects the 4:2:0 semi-planar family, 2 the 4:2:2 one and the packed
+	 * pairs their own codes; the port's format field counts 4:2:0 as 0 and
+	 * 4:2:2 as 1.
 	 */
-	s[VPSS_CTRL2 / 4] = FIELD_PREP(VPSS_CTRL2_IN_FORMAT,
-				       p->in_422 ? 2 : 0) |
+	s[VPSS_CTRL2 / 4] = FIELD_PREP(VPSS_CTRL2_IN_FORMAT, p->in_fmt) |
 			   FIELD_PREP(VPSS_CTRL2_VHD_FORMAT,
 				      p->out_422 ? 1 : 0);
 	s[VPSS_IMGSIZE / 4] = FIELD_PREP(VPSS_IMGSIZE_WIDTH, p->in_w - 1) |
@@ -607,12 +637,18 @@ static int histb_vpss_pass_run(struct histb_vpss *vpss,
 		FIELD_PREP(VPSS_CUR_CTRL_HOR_OFFSET, p->off_x) |
 		FIELD_PREP(VPSS_CUR_CTRL_VER_OFFSET, p->off_y);
 
-	src_c = lower_32_bits(p->in) + p->in_stride * p->frame_h;
+	/* A packed pair has no chroma plane of its own: the sampler takes the
+	 * bytes out of the luma rows, so both the chroma origin and its pitch
+	 * are left at zero.
+	 */
+	src_c = p->in_packed ? 0 :
+		lower_32_bits(p->in) + p->in_stride * p->frame_h;
 	s[VPSS_CURYADDR / 4] = lower_32_bits(p->in);
 	s[VPSS_CURCADDR / 4] = src_c;
 	stride = p->in_stride;	/* both layouts take the pitch in bytes */
 	s[VPSS_CURSTRIDE / 4] = FIELD_PREP(VPSS_CURSTRIDE_Y, stride) |
-				FIELD_PREP(VPSS_CURSTRIDE_C, stride);
+				FIELD_PREP(VPSS_CURSTRIDE_C,
+					   p->in_packed ? 0 : stride);
 
 	s[VPSS_VHDCTRL / 4] = (p->invert_uv ? VPSS_VHDCTRL_UV_INVERT : 0) |
 			      (p->hflip ? VPSS_VHDCTRL_MIRROR : 0) |
@@ -632,6 +668,8 @@ static int histb_vpss_pass_run(struct histb_vpss *vpss,
 	if (p->out_w != p->in_w || p->out_h != p->in_h || p->sharpness) {
 		dma_addr_t caddr[4];
 		unsigned int b = histb_vpss_zme_bucket(p->in_w, p->out_w);
+		unsigned int zme_in = p->in_422 ? 0 : 1;
+		unsigned int zme_out = p->out_422 ? 0 : 1;
 
 		histb_vpss_load_coef(vpss, b, p->sharpness != 0, caddr);
 		s[VPSS_VHD_ZME_LHADDR / 4] = lower_32_bits(caddr[0]);
@@ -655,8 +693,8 @@ static int histb_vpss_pass_run(struct histb_vpss *vpss,
 		s[VPSS_VHD_VSP / 4] =
 			VPSS_MSC_V_MSSC | VPSS_MSC_V_CSSC |
 			VPSS_MSC_V_LFIR | VPSS_MSC_V_CFIR |
-			FIELD_PREP(VPSS_ZME_IN_FMT, 1) |
-			FIELD_PREP(VPSS_ZME_OUT_FMT, 1);
+			FIELD_PREP(VPSS_ZME_IN_FMT, zme_in) |
+			FIELD_PREP(VPSS_ZME_OUT_FMT, zme_out);
 	}
 
 	/* Sharpen runs off the same phase table set, its taps 256 bytes in.
@@ -853,6 +891,8 @@ static void histb_vpss_pass_fill(struct histb_vpss_pass *p,
 	p->in_stride = job->src_stride;
 	p->out_stride = job->dst_stride;
 	p->in_422 = job->in_422;
+	p->in_packed = job->in_packed;
+	p->in_fmt = job->in_fmt;
 	p->sharpness = job->sharpness;
 	p->out_422 = job->out_422;
 	p->invert_uv = job->invert_uv;
@@ -921,23 +961,44 @@ static void histb_vpss_device_run(void *priv)
 	job.src_stride = ctx->src_fmt.bytesperline;
 	job.dst_stride = ctx->dst_fmt.bytesperline;
 	job.sharpness = ctx->sharpness ? ctx->sharpness->val : 0;
-	job.in_422 = histb_vpss_find(histb_vpss_out_fmts,
-				     ARRAY_SIZE(histb_vpss_out_fmts),
-				     ctx->src_fmt.pixelformat)->fmt422;
-	job.out_422 = histb_vpss_find(histb_vpss_cap_fmts,
-				      ARRAY_SIZE(histb_vpss_cap_fmts),
-				      ctx->dst_fmt.pixelformat)->fmt422;
-	job.invert_uv = histb_vpss_find(histb_vpss_out_fmts,
+	{
+		const struct histb_vpss_fmt *src_fmt =
+			histb_vpss_find(histb_vpss_out_fmts,
 					ARRAY_SIZE(histb_vpss_out_fmts),
-					ctx->src_fmt.pixelformat)->nv21 !=
+					ctx->src_fmt.pixelformat);
+		const struct histb_vpss_fmt *dst_fmt =
 			histb_vpss_find(histb_vpss_cap_fmts,
 					ARRAY_SIZE(histb_vpss_cap_fmts),
-					ctx->dst_fmt.pixelformat)->nv21;
+					ctx->dst_fmt.pixelformat);
+
+		job.in_422 = src_fmt->fmt422;
+		job.in_packed = src_fmt->packed;
+		job.in_fmt = histb_vpss_in_format(src_fmt);
+		job.out_422 = dst_fmt->fmt422;
+		job.invert_uv = src_fmt->nv21 != dst_fmt->nv21;
+		/*
+		 * A packed pair reaches the sampler in the opposite order to the
+		 * semi-planar one: with exact luma a YUYV/UYVY frame comes out
+		 * with U and V exchanged, and the output inversion is the pair
+		 * swap the rest of the path already uses.
+		 */
+		if (src_fmt->packed)
+			job.invert_uv = !job.invert_uv;
+	}
 	dei_mode = ctx->dei_ctrl ? ctx->dei_ctrl->val : VPSS_DEI_NONE;
 	job.in_x = ctx->crop.left;
 	job.in_y = ctx->crop.top;
 	job.in_w = ctx->crop.width;
 	job.in_h = ctx->crop.height;
+	/* The offset semantics are known for the planar layouts; in a packed
+	 * row a start offset moves the pair boundary as well, so a windowed
+	 * packed frame is refused.
+	 */
+	if (job.in_packed && (job.in_x || job.in_y)) {
+		dev_warn_ratelimited(vpss->dev,
+				     "packed input cannot be windowed\n");
+		goto finish;
+	}
 	/* Bob doubles one field vertically through the scaler, so it only
 	 * exists when the buffer is a field and the CAPTURE rectangle is twice
 	 * its height; asking for it any other way is a mistake worth a warning
