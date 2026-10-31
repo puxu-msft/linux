@@ -74,6 +74,8 @@
 #define G0_IRESO		0x6020
 #define   G0_IRESO_IW GENMASK(11, 0)
 #define   G0_IRESO_IH GENMASK(23, 12)
+#define G0_SFPOS		0x6024
+#define   G0_SFPOS_X GENMASK(6, 0)	/* pixels inside the unit G0_ADDR names */
 #define G0_CBMPARA		0x6030
 #define   G0_CBMPARA_GALPHA GENMASK(7, 0)
 #define   G0_CBMPARA_PALPHA_RANGE BIT(8)	/* 1: alpha over 255, else 7 bits only */

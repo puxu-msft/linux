@@ -688,6 +688,34 @@ static void histb_vdp2_zme_setup(struct histb_vdp2 *vdp, u32 src_w, u32 src_h,
 		vo_write(vdp, GP0_PARAUP, GP0_PARAUP_HCOEF | GP0_PARAUP_VCOEF);
 }
 
+/*
+ * G0_ADDR carries 16-byte units: the block drops the low nibble of whatever
+ * address it is handed and adds (src_xfpos * bytes per pixel) modulo 16 back
+ * on, which is how the source corner of a crop gets expressed at all (board:
+ * every src_xfpos from 0 to 15 was read back as that many pixels of offset,
+ * wrapping inside the unit). A corner the two fields cannot name is refused
+ * instead of rounded: rounding started the fetch up to 15 bytes early.
+ */
+static int histb_vdp2_fetch_pos(struct drm_framebuffer *fb, dma_addr_t base,
+				unsigned int src_x, unsigned int src_y,
+				dma_addr_t *addr, u32 *sfpos)
+{
+	unsigned int bpp = drm_format_info_min_pitch(fb->format, 0, 1);
+	dma_addr_t want = base + fb->offsets[0] +
+		(dma_addr_t)src_y * fb->pitches[0] + (dma_addr_t)src_x * bpp;
+	u32 sf;
+
+	for (sf = 0; sf < 16; sf++)
+		if (((sf * bpp) & 15) == ((u32)want & 15))
+			break;
+	if (sf == 16)
+		return -ERANGE;
+
+	*addr = want;
+	*sfpos = sf;
+	return 0;
+}
+
 static void histb_vdp2_g0_set(struct histb_vdp2 *vdp, struct drm_framebuffer *fb,
 			    struct drm_gem_dma_object *gem,
 			    const struct drm_plane_state *pstate, bool enable)
@@ -695,7 +723,8 @@ static void histb_vdp2_g0_set(struct histb_vdp2 *vdp, struct drm_framebuffer *fb
 	u32 ctrl, ifmt;
 	bool palpha, blend;
 	u32 src_x, src_y, src_w, src_h, dst_x, dst_y, dst_w, dst_h;
-	u32 win_w, win_h;
+	u32 win_w, win_h, sfpos;
+	dma_addr_t addr;
 
 	if (!enable) {
 		ctrl = vo_read(vdp, G0_CTRL);
@@ -791,17 +820,14 @@ static void histb_vdp2_g0_set(struct histb_vdp2 *vdp, struct drm_framebuffer *fb
 	vo_write(vdp, G0_CBMPARA, ctrl);
 
 	/*
-	 * The layer has no source-rectangle register worth the name: G0_SFPOS's
-	 * src_xfpos is 7 bits and there is no src_y (hi_reg_vdp.h U_G0_SFPOS), so
-	 * the source corner is taken by advancing the base address and the extent
-	 * by G0_IRESO. The stride keeps describing the surface, so a cropped region
-	 * still reads whole rows of it.
+	 * There is no src_y register, so the source corner is taken by advancing
+	 * the base address and the extent by G0_IRESO. The stride keeps describing
+	 * the surface, so a cropped region still reads whole rows of it.
 	 */
-	vo_write(vdp, G0_ADDR,
-		 (u32)(gem->dma_addr + fb->offsets[0] +
-		       (dma_addr_t)src_y * fb->pitches[0] +
-		       (dma_addr_t)src_x *
-			       drm_format_info_min_pitch(fb->format, 0, 1)));
+	if (histb_vdp2_fetch_pos(fb, gem->dma_addr, src_x, src_y, &addr, &sfpos))
+		return;
+	vo_write(vdp, G0_SFPOS, sfpos);
+	vo_write(vdp, G0_ADDR, (u32)addr);
 	/* G0_STRIDE is programmed in units of 16 bytes */
 	vo_write(vdp, G0_STRIDE,
 		 FIELD_PREP(G0_STRIDE_MASK, fb->pitches[0] / 16));
@@ -912,7 +938,10 @@ static int histb_vdp2_plane_atomic_check(struct drm_plane *plane,
 		drm_atomic_get_new_plane_state(state, plane);
 	struct histb_vdp2 *vdp = plane_to_vdp(plane);
 	struct drm_crtc_state *crtc_state;
+	struct drm_gem_dma_object *gem;
 	unsigned int min_scale, max_scale;
+	dma_addr_t addr;
+	u32 sfpos;
 
 	if (!new_state->fb)
 		return 0;
@@ -920,6 +949,18 @@ static int histb_vdp2_plane_atomic_check(struct drm_plane *plane,
 	/* G0_STRIDE is programmed in units of 16 bytes */
 	if (new_state->fb->pitches[0] % 16)
 		return -EINVAL;
+
+	/*
+	 * and the source corner has to be one the fetch can name: the address
+	 * field carries 16-byte units, src_xfpos the pixels inside one of them.
+	 */
+	gem = drm_fb_dma_get_gem_obj(new_state->fb, 0);
+	if (!gem)
+		return -EINVAL;
+	if (histb_vdp2_fetch_pos(new_state->fb, gem->dma_addr,
+				 new_state->src_x >> 16,
+				 new_state->src_y >> 16, &addr, &sfpos))
+		return -ERANGE;
 
 	/* the G0_IRESO / GP0_ORESO width fields are 12 bits wide */
 	if (new_state->fb->width > 4095)
