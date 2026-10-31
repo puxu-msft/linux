@@ -84,6 +84,8 @@ struct histb_vdp2_zme {
 	u32	voffset;	/* vertical phase */
 	u32	hratio;		/* field mask inside hsp */
 	u32	vratio;		/* field mask inside vsr */
+	u32	hratio_max;	/* widest value the two fields hold */
+	u32	vratio_max;
 	bool	hoffset_pair;
 	unsigned long	hprec;	/* the ratio that means 1:1 */
 	unsigned long	vprec;
@@ -96,6 +98,8 @@ static const struct histb_vdp2_zme histb_vdp2_zme_mv100 = {
 	.voffset = GP0_ZME_VOFFSET,
 	.hratio = GP0_ZME_HSP_RATIO,
 	.vratio = GP0_ZME_VSR_RATIO,
+	.hratio_max = 0xffffff,
+	.vratio_max = 0xffff,
 	.hoffset_pair = true,
 	.hprec = GP0_ZME_HPREC,
 	.vprec = GP0_ZME_VPREC,
@@ -113,6 +117,8 @@ static const struct histb_vdp2_zme histb_vdp2_zme_cv200 = {
 	.voffset = CV200_GP0_ZME_VOFFSET,
 	.hratio = CV200_GP0_ZME_HSP_RATIO,
 	.vratio = CV200_GP0_ZME_VSR_RATIO,
+	.hratio_max = 0xffff,
+	.vratio_max = 0xffff,
 	.hoffset_pair = false,
 	.hprec = CV200_GP0_ZME_HPREC,
 	.vprec = CV200_GP0_ZME_VPREC,
@@ -135,6 +141,17 @@ struct histb_vdp2_chip {
 	bool				mux_hdmi_dhd0;
 	bool				hdate_hdmi_out;
 	/*
+	 * What the zoom engine wants in its step registers alongside a non-1:1
+	 * ratio: the filter, median and order bits. Zero for a part whose recipe
+	 * has not been established on hardware, which is also what refuses scaling
+	 * there. The vertical ones live in a separate register on this part, but
+	 * the same address is cv200's vertical step register, so which block to
+	 * touch is per part as well.
+	 */
+	u32				zme_hfir_en;
+	u32				zme_vfir_reg;
+	u32				zme_vfir_en;
+	/*
 	 * Expose the write-back taps: WBC_HD0 (the composited HD channel, block
 	 * at 0xac00) and WBC_GP0 (graphics layer, 0xa800). Hi3798MV100 has both
 	 * board-verified. Hi3716CV200's own register file has the same two blocks
@@ -156,6 +173,16 @@ struct histb_vdp2_chip {
 static const struct histb_vdp2_chip histb_vdp2_mv100 = {
 	.zme = &histb_vdp2_zme_mv100,
 	.gp0_order = GP0_ORDER_ZME_CSC,
+	/*
+	 * Board readings: the part's own live gfx path carried these while
+	 * magnifying (0x9140 = 0xf7055555, 0x914c = 0xf1800000), and the same
+	 * words put a clean scaled picture on the panel here. Both are the value
+	 * of their field, not pre-shifted: the register step is applied against
+	 * the mask.
+	 */
+	.zme_hfir_en = 0xf7,
+	.zme_vfir_reg = GP0_ZME_VSP,
+	.zme_vfir_en = 0xf1800000,
 	.dhd_intf_b = true,
 	.dhd_hdmi_mode = true,
 	.mux_hdmi_dhd0 = false,
@@ -188,6 +215,8 @@ struct histb_vdp2 {
 	struct reset_control	*rst;
 	const struct histb_vdp2_zme	*zme;
 	const struct histb_vdp2_chip	*chip;
+	void				*zme_coef;	/* filter tables in memory */
+	dma_addr_t			zme_coef_dma;
 
 	int			irq;
 
@@ -326,12 +355,338 @@ static u32 histb_vdp2_m1(u32 v)
 	return max(v, 1u) - 1;
 }
 
+/*
+ * The zoom engine reads its filter coefficients from memory, so a step that is
+ * not 1:1 needs the band table as well. These are the polyphase tables for the
+ * eight-tap horizontal and four-tap vertical stages, one set per supported step
+ * (magnifying, 1.11, 0.75, 0.5, 0.33, 0.25 and beyond that), each set holding
+ * luma then chroma then the two-tap stage. At 1:1 the engine copies and needs no
+ * table, which is why this block could run without one until now.
+ */
+static const u32 histb_vdp2_zme_coef[] = {
+	0xffea0004, 0x01d40028, 0xffea0028, 0x00000004, 0xfff90001,
+	0x01c9fff7, 0xffda0064, 0x00000008, 0x00040000, 0x01a9ffd6,
+	0xffca00a8, 0x0000000b, 0x000b0000, 0x0176ffc2, 0xffbf00f0,
+	0x0000000e, 0x000e0000, 0x0136ffbc, 0xffbc0136, 0x0000000e,
+	0x000e0000, 0x00f0ffbf, 0xffc20176, 0x0000000b, 0x000b0000,
+	0x00a8ffca, 0xffd601a9, 0x00000004, 0x00080000, 0x0064ffda,
+	0xfff701c9, 0x0001fff9, 0xffea0004, 0x01d40028, 0xffea0028,
+	0x00000004, 0xfff90001, 0x01c9fff7, 0xffda0064, 0x00000008,
+	0x00040000, 0x01a9ffd6, 0xffca00a8, 0x0000000b, 0x000b0000,
+	0x0176ffc2, 0xffbf00f0, 0x0000000e, 0x000e0000, 0x0136ffbc,
+	0xffbc0136, 0x0000000e, 0x000e0000, 0x00f0ffbf, 0xffc20176,
+	0x0000000b, 0x000b0000, 0x00a8ffca, 0xffd601a9, 0x00000004,
+	0x00080000, 0x0064ffda, 0xfff701c9, 0x0001fff9, 0x96e001ff,
+	0x10edc524, 0xe9862bd5, 0x0032d351, 0x91a2f144, 0x04010039,
+	0x10bc4010, 0x00544af5, 0x4cb6187a, 0x67143b4d, 0x0000468e,
+	0x00000000, 0x00000000, 0x01ff0000, 0x00000000, 0x00000000,
+	0x000bfffd, 0x01f0ffd7, 0xfff0003d, 0x00000004, 0x0011fffc,
+	0x01c3ffc1, 0xffdd008a, 0xffff0009, 0x0012fffc, 0x0182ffba,
+	0xffcc00de, 0xfffe000e, 0x0011fffd, 0x0133ffbf, 0xffbf0133,
+	0xfffd0011, 0x000efffe, 0x00deffcc, 0xffba0182, 0xfffc0012,
+	0x0009ffff, 0x008affdd, 0xffc101c3, 0xfffc0011, 0x00040000,
+	0x003dfff0, 0xffd701f0, 0xfffd000b, 0x00000000, 0x01ff0000,
+	0x00000000, 0x00000000, 0x000bfffd, 0x01f0ffd7, 0xfff0003d,
+	0x00000004, 0x0011fffc, 0x01c3ffc1, 0xffdd008a, 0xffff0009,
+	0x0012fffc, 0x0182ffba, 0xffcc00de, 0xfffe000e, 0x0011fffd,
+	0x0133ffbf, 0xffbf0133, 0xfffd0011, 0x000efffe, 0x00deffcc,
+	0xffba0182, 0xfffc0012, 0x0009ffff, 0x008affdd, 0xffc101c3,
+	0xfffc0011, 0x00040000, 0x003dfff0, 0xffd701f0, 0xfffd000b,
+	0x96e001ff, 0x10edc524, 0xe9862bd5, 0x0032d351, 0x91a2f144,
+	0x04010039, 0x10bc4010, 0x00544af5, 0x4cb6187a, 0x67143b4d,
+	0x0000468e, 0x00000000, 0xffea0004, 0x01d40028, 0xffea0028,
+	0x00000004, 0xfff90001, 0x01c9fff7, 0xffda0064, 0x00000008,
+	0x00040000, 0x01a9ffd6, 0xffca00a8, 0x0000000b, 0x000b0000,
+	0x0176ffc2, 0xffbf00f0, 0x0000000e, 0x000e0000, 0x0136ffbc,
+	0xffbc0136, 0x0000000e, 0x000e0000, 0x00f0ffbf, 0xffc20176,
+	0x0000000b, 0x000b0000, 0x00a8ffca, 0xffd601a9, 0x00000004,
+	0x00080000, 0x0064ffda, 0xfff701c9, 0x0001fff9, 0xffea0004,
+	0x01d40028, 0xffea0028, 0x00000004, 0xfff90001, 0x01c9fff7,
+	0xffda0064, 0x00000008, 0x00040000, 0x01a9ffd6, 0xffca00a8,
+	0x0000000b, 0x000b0000, 0x0176ffc2, 0xffbf00f0, 0x0000000e,
+	0x000e0000, 0x0136ffbc, 0xffbc0136, 0x0000000e, 0x000e0000,
+	0x00f0ffbf, 0xffc20176, 0x0000000b, 0x000b0000, 0x00a8ffca,
+	0xffd601a9, 0x00000004, 0x00080000, 0x0064ffda, 0xfff701c9,
+	0x0001fff9, 0x96e001ff, 0x10edc524, 0xe9862bd5, 0x0032d351,
+	0x91a2f144, 0x04010039, 0x10bc4010, 0x00544af5, 0x4cb6187a,
+	0x67143b4d, 0x0000468e, 0x00000000, 0x0000fff0, 0x00fe0091,
+	0x00000091, 0x0000fff0, 0xfff7fff3, 0x00fc007b, 0x000b00a7,
+	0x0000ffed, 0xfff1fff6, 0x00f50065, 0x001900bc, 0xffffffeb,
+	0xffedfff9, 0x00ec0050, 0x002900ce, 0xfffdffea, 0xffebfffb,
+	0x00de003c, 0x003c00de, 0xfffbffeb, 0xffeafffd, 0x00ce0029,
+	0x005000ec, 0xfff9ffed, 0xffebffff, 0x00bc0019, 0x006500f5,
+	0xfff6fff1, 0xffed0000, 0x00a7000b, 0x007b00fc, 0xfff3fff7,
+	0x0000fff0, 0x00fe0091, 0x00000091, 0x0000fff0, 0xfff7fff3,
+	0x00fc007b, 0x000b00a7, 0x0000ffed, 0xfff1fff6, 0x00f50065,
+	0x001900bc, 0xffffffeb, 0xffedfff9, 0x00ec0050, 0x002900ce,
+	0xfffdffea, 0xffebfffb, 0x00de003c, 0x003c00de, 0xfffbffeb,
+	0xffeafffd, 0x00ce0029, 0x005000ec, 0xfff9ffed, 0xffebffff,
+	0x00bc0019, 0x006500f5, 0xfff6fff1, 0xffed0000, 0x00a7000b,
+	0x007b00fc, 0xfff3fff7, 0x96e001ff, 0x10edc524, 0xe9862bd5,
+	0x0032d351, 0x91a2f144, 0x04010039, 0x10bc4010, 0x00544af5,
+	0x4cb6187a, 0x67143b4d, 0x0000468e, 0x00000000, 0x0013ffee,
+	0x00e20090, 0x00130090, 0xfffcffee, 0x0009ffef, 0x00e1007e,
+	0x001e00a1, 0xfffbffef, 0x0000fff1, 0x00de006d, 0x002b00b1,
+	0xfff9ffef, 0xfffafff2, 0x00d6005b, 0x003a00c0, 0xfff7fff2,
+	0xfff5fff4, 0x00cd004a, 0x004a00cd, 0xfff4fff5, 0xfff2fff7,
+	0x00c0003a, 0x005b00d6, 0xfff2fffa, 0xffeffff9, 0x00b1002b,
+	0x006d00de, 0xfff10000, 0xffeffffb, 0x00a1001e, 0x007e00e1,
+	0xffef0009, 0x0013ffee, 0x00e20090, 0x00130090, 0xfffcffee,
+	0x0009ffef, 0x00e1007e, 0x001e00a1, 0xfffbffef, 0x0000fff1,
+	0x00de006d, 0x002b00b1, 0xfff9ffef, 0xfffafff2, 0x00d6005b,
+	0x003a00c0, 0xfff7fff2, 0xfff5fff4, 0x00cd004a, 0x004a00cd,
+	0xfff4fff5, 0xfff2fff7, 0x00c0003a, 0x005b00d6, 0xfff2fffa,
+	0xffeffff9, 0x00b1002b, 0x006d00de, 0xfff10000, 0xffeffffb,
+	0x00a1001e, 0x007e00e1, 0xffef0009, 0x96e001ff, 0x10edc524,
+	0xe9862bd5, 0x0032d351, 0x91a2f144, 0x04010039, 0x10bc4010,
+	0x00544af5, 0x4cb6187a, 0x67143b4d, 0x0000468e, 0x00000000,
+	0x0013ffee, 0x00e20090, 0x00130090, 0xfffcffee, 0x0009ffef,
+	0x00e1007e, 0x001e00a1, 0xfffbffef, 0x0000fff1, 0x00de006d,
+	0x002b00b1, 0xfff9ffef, 0xfffafff2, 0x00d6005b, 0x003a00c0,
+	0xfff7fff2, 0xfff5fff4, 0x00cd004a, 0x004a00cd, 0xfff4fff5,
+	0xfff2fff7, 0x00c0003a, 0x005b00d6, 0xfff2fffa, 0xffeffff9,
+	0x00b1002b, 0x006d00de, 0xfff10000, 0xffeffffb, 0x00a1001e,
+	0x007e00e1, 0xffef0009, 0x0013ffee, 0x00e20090, 0x00130090,
+	0xfffcffee, 0x0009ffef, 0x00e1007e, 0x001e00a1, 0xfffbffef,
+	0x0000fff1, 0x00de006d, 0x002b00b1, 0xfff9ffef, 0xfffafff2,
+	0x00d6005b, 0x003a00c0, 0xfff7fff2, 0xfff5fff4, 0x00cd004a,
+	0x004a00cd, 0xfff4fff5, 0xfff2fff7, 0x00c0003a, 0x005b00d6,
+	0xfff2fffa, 0xffeffff9, 0x00b1002b, 0x006d00de, 0xfff10000,
+	0xffeffffb, 0x00a1001e, 0x007e00e1, 0xffef0009, 0x96e001ff,
+	0x10edc524, 0xe9862bd5, 0x0032d351, 0x91a2f144, 0x04010039,
+	0x10bc4010, 0x00544af5, 0x4cb6187a, 0x67143b4d, 0x0000468e,
+	0x00000000, 0x0013ffee, 0x00e20090, 0x00130090, 0xfffcffee,
+	0x0009ffef, 0x00e1007e, 0x001e00a1, 0xfffbffef, 0x0000fff1,
+	0x00de006d, 0x002b00b1, 0xfff9ffef, 0xfffafff2, 0x00d6005b,
+	0x003a00c0, 0xfff7fff2, 0xfff5fff4, 0x00cd004a, 0x004a00cd,
+	0xfff4fff5, 0xfff2fff7, 0x00c0003a, 0x005b00d6, 0xfff2fffa,
+	0xffeffff9, 0x00b1002b, 0x006d00de, 0xfff10000, 0xffeffffb,
+	0x00a1001e, 0x007e00e1, 0xffef0009, 0x0013ffee, 0x00e20090,
+	0x00130090, 0xfffcffee, 0x0009ffef, 0x00e1007e, 0x001e00a1,
+	0xfffbffef, 0x0000fff1, 0x00de006d, 0x002b00b1, 0xfff9ffef,
+	0xfffafff2, 0x00d6005b, 0x003a00c0, 0xfff7fff2, 0xfff5fff4,
+	0x00cd004a, 0x004a00cd, 0xfff4fff5, 0xfff2fff7, 0x00c0003a,
+	0x005b00d6, 0xfff2fffa, 0xffeffff9, 0x00b1002b, 0x006d00de,
+	0xfff10000, 0xffeffffb, 0x00a1001e, 0x007e00e1, 0xffef0009,
+	0x96e001ff, 0x10edc524, 0xe9862bd5, 0x0032d351, 0x91a2f144,
+	0x04010039, 0x10bc4010, 0x00544af5, 0x4cb6187a, 0x67143b4d,
+	0x0000468e, 0x00000000, 0x0188004e, 0xffdc004e, 0x0188004e,
+	0xffdc004e, 0x01890038, 0xffd90066, 0x01890038, 0xffd90066,
+	0x01870024, 0xffd50080, 0x01870024, 0xffd50080, 0x01800012,
+	0xffd3009b, 0x01800012, 0xffd3009b, 0x01750002, 0xffd100b8,
+	0x01750002, 0xffd100b8, 0x0166fff4, 0xffd100d5, 0x0166fff4,
+	0xffd100d5, 0x0154ffe9, 0xffd200f1, 0x0154ffe9, 0xffd200f1,
+	0x013fffe0, 0xffd4010d, 0x013fffe0, 0xffd4010d, 0x0127ffd9,
+	0xffd90127, 0x0127ffd9, 0xffd90127, 0x010dffd4, 0xffe0013f,
+	0x010dffd4, 0xffe0013f, 0x00f1ffd2, 0xffe90154, 0x00f1ffd2,
+	0xffe90154, 0x00d5ffd1, 0xfff40166, 0x00d5ffd1, 0xfff40166,
+	0x00b8ffd1, 0x00020175, 0x00b8ffd1, 0x00020175, 0x009bffd3,
+	0x00120180, 0x009bffd3, 0x00120180, 0x0080ffd5, 0x00240187,
+	0x0080ffd5, 0x00240187, 0x0066ffd9, 0x00380189, 0x0066ffd9,
+	0x00380189, 0x96e001ff, 0xf075e324, 0xedc52855, 0x002bd510,
+	0x543169a6, 0x51e9862f, 0x6d6532d3, 0x00361282, 0x91a2f144,
+	0xd3792239, 0x01003cd0, 0x00401004, 0xca1488de, 0xf510bc57,
+	0x949b544a, 0x0050cbd5, 0x4cb6187a, 0x86985a4d, 0x143b4a0d,
+	0x00468e67, 0x4f378c1d, 0x00000043, 0x00000000, 0x00000000,
+	0x01ff0000, 0x00000000, 0x01ff0000, 0x00000000, 0x01fdffdb,
+	0xfffe002a, 0x01fdffdb, 0xfffe002a, 0x01f3ffc0, 0xfff70056,
+	0x01f3ffc0, 0xfff70056, 0x01e4ffae, 0xffed0081, 0x01e4ffae,
+	0xffed0081, 0x01cfffa2, 0xffe100ae, 0x01cfffa2, 0xffe100ae,
+	0x01b6ff9e, 0xffd300d9, 0x01b6ff9e, 0xffd300d9, 0x0199ff9e,
+	0xffc50104, 0x0199ff9e, 0xffc50104, 0x0178ffa4, 0xffb8012c,
+	0x0178ffa4, 0xffb8012c, 0x0153ffad, 0xffad0153, 0x0153ffad,
+	0xffad0153, 0x012cffb8, 0xffa40178, 0x012cffb8, 0xffa40178,
+	0x0104ffc5, 0xff9e0199, 0x0104ffc5, 0xff9e0199, 0x00d9ffd3,
+	0xff9e01b6, 0x00d9ffd3, 0xff9e01b6, 0x00aeffe1, 0xffa201cf,
+	0x00aeffe1, 0xffa201cf, 0x0081ffed, 0xffae01e4, 0x0081ffed,
+	0xffae01e4, 0x0056fff7, 0xffc001f3, 0x0056fff7, 0xffc001f3,
+	0x002afffe, 0xffdb01fd, 0x002afffe, 0xffdb01fd, 0x96e0c9ce,
+	0xf12db524, 0x959b2855, 0x002bd511, 0x5431f982, 0x5261682f,
+	0xc94e32d3, 0x00361282, 0x91a33134, 0xd3991a39, 0x01003cd0,
+	0x00401004, 0xca1468e6, 0xf4d0cc57, 0x38b2544a, 0x0050cbd5,
+	0x4cb5a098, 0x86087e4d, 0x6c654a0d, 0x00468e66, 0x4f36d44b,
+	0x00000043, 0x00000000, 0x00000000, 0x017f004f, 0xffe3004f,
+	0x017f004f, 0xffe3004f, 0x0180003a, 0xffe00066, 0x0180003a,
+	0xffe00066, 0x017c0028, 0xffdd007f, 0x017c0028, 0xffdd007f,
+	0x01760017, 0xffda0099, 0x01760017, 0xffda0099, 0x016b0008,
+	0xffd900b4, 0x016b0008, 0xffd900b4, 0x015dfffa, 0xffd900d0,
+	0x015dfffa, 0xffd900d0, 0x014bfff0, 0xffda00eb, 0x014bfff0,
+	0xffda00eb, 0x0137ffe7, 0xffdc0106, 0x0137ffe7, 0xffdc0106,
+	0x011fffe1, 0xffe1011f, 0x011fffe1, 0xffe1011f, 0x0106ffdc,
+	0xffe70137, 0x0106ffdc, 0xffe70137, 0x00ebffda, 0xfff0014b,
+	0x00ebffda, 0xfff0014b, 0x00d0ffd9, 0xfffa015d, 0x00d0ffd9,
+	0xfffa015d, 0x00b4ffd9, 0x0008016b, 0x00b4ffd9, 0x0008016b,
+	0x0099ffda, 0x00170176, 0x0099ffda, 0x00170176, 0x007fffdd,
+	0x0028017c, 0x007fffdd, 0x0028017c, 0x0066ffe0, 0x003a0180,
+	0x0066ffe0, 0x003a0180, 0x96e0c9ce, 0xf12db524, 0x959b2855,
+	0x002bd511, 0x5431f982, 0x5261682f, 0xc94e32d3, 0x00361282,
+	0x91a33134, 0xd3991a39, 0x01003cd0, 0x00401004, 0xca1468e6,
+	0xf4d0cc57, 0x38b2544a, 0x0050cbd5, 0x4cb5a098, 0x86087e4d,
+	0x6c654a0d, 0x00468e66, 0x4f36d44b, 0x00000043, 0x00000000,
+	0x00000000, 0x01480067, 0xffea0067, 0x01480067, 0xffea0067,
+	0x01480055, 0xffea0079, 0x01480055, 0xffea0079, 0x01440045,
+	0xffea008d, 0x01440045, 0xffea008d, 0x013f0035, 0xffeb00a1,
+	0x013f0035, 0xffeb00a1, 0x01370028, 0xffec00b5, 0x01370028,
+	0xffec00b5, 0x012d001b, 0xffef00c9, 0x012d001b, 0xffef00c9,
+	0x01200010, 0xfff300dd, 0x01200010, 0xfff300dd, 0x01110007,
+	0xfff800f0, 0x01110007, 0xfff800f0, 0x0102fffe, 0xfffe0102,
+	0x0102fffe, 0xfffe0102, 0x00f0fff8, 0x00070111, 0x00f0fff8,
+	0x00070111, 0x00ddfff3, 0x00100120, 0x00ddfff3, 0x00100120,
+	0x00c9ffef, 0x001b012d, 0x00c9ffef, 0x001b012d, 0x00b5ffec,
+	0x00280137, 0x00b5ffec, 0x00280137, 0x00a1ffeb, 0x0035013f,
+	0x00a1ffeb, 0x0035013f, 0x008dffea, 0x00450144, 0x008dffea,
+	0x00450144, 0x0079ffea, 0x00550148, 0x0079ffea, 0x00550148,
+	0x96e0c9ce, 0xf12db524, 0x959b2855, 0x002bd511, 0x5431f982,
+	0x5261682f, 0xc94e32d3, 0x00361282, 0x91a33134, 0xd3991a39,
+	0x01003cd0, 0x00401004, 0xca1468e6, 0xf4d0cc57, 0x38b2544a,
+	0x0050cbd5, 0x4cb5a098, 0x86087e4d, 0x6c654a0d, 0x00468e66,
+	0x4f36d44b, 0x00000043, 0x00000000, 0x00000000, 0x012d0071,
+	0xfff10071, 0x012d0071, 0xfff10071, 0x012c0061, 0xfff20081,
+	0x012c0061, 0xfff20081, 0x01290052, 0xfff40091, 0x01290052,
+	0xfff40091, 0x01240044, 0xfff600a2, 0x01240044, 0xfff600a2,
+	0x011d0037, 0xfff900b3, 0x011d0037, 0xfff900b3, 0x0115002b,
+	0xfffc00c4, 0x0115002b, 0xfffc00c4, 0x010b0020, 0x000100d4,
+	0x010b0020, 0x000100d4, 0x00ff0017, 0x000700e3, 0x00ff0017,
+	0x000700e3, 0x00f2000e, 0x000e00f2, 0x00f2000e, 0x000e00f2,
+	0x00e30007, 0x001700ff, 0x00e30007, 0x001700ff, 0x00d40001,
+	0x0020010b, 0x00d40001, 0x0020010b, 0x00c4fffc, 0x002b0115,
+	0x00c4fffc, 0x002b0115, 0x00b3fff9, 0x0037011d, 0x00b3fff9,
+	0x0037011d, 0x00a2fff6, 0x00440124, 0x00a2fff6, 0x00440124,
+	0x0091fff4, 0x00520129, 0x0091fff4, 0x00520129, 0x0081fff2,
+	0x0061012c, 0x0081fff2, 0x0061012c, 0x96e0c9ce, 0xf12db524,
+	0x959b2855, 0x002bd511, 0x5431f982, 0x5261682f, 0xc94e32d3,
+	0x00361282, 0x91a33134, 0xd3991a39, 0x01003cd0, 0x00401004,
+	0xca1468e6, 0xf4d0cc57, 0x38b2544a, 0x0050cbd5, 0x4cb5a098,
+	0x86087e4d, 0x6c654a0d, 0x00468e66, 0x4f36d44b, 0x00000043,
+	0x00000000, 0x00000000, 0x01140079, 0xfffa0079, 0x01140079,
+	0xfffa0079, 0x0113006b, 0xfffc0086, 0x0113006b, 0xfffc0086,
+	0x0110005d, 0xffff0094, 0x0110005d, 0xffff0094, 0x010b0051,
+	0x000200a2, 0x010b0051, 0x000200a2, 0x01060044, 0x000600b0,
+	0x01060044, 0x000600b0, 0x00ff003a, 0x000a00bd, 0x00ff003a,
+	0x000a00bd, 0x00f60030, 0x001000ca, 0x00f60030, 0x001000ca,
+	0x00ed0026, 0x001700d6, 0x00ed0026, 0x001700d6, 0x00e2001e,
+	0x001e00e2, 0x00e2001e, 0x001e00e2, 0x00d60017, 0x002600ed,
+	0x00d60017, 0x002600ed, 0x00ca0010, 0x003000f6, 0x00ca0010,
+	0x003000f6, 0x00bd000a, 0x003a00ff, 0x00bd000a, 0x003a00ff,
+	0x00b00006, 0x00440106, 0x00b00006, 0x00440106, 0x00a20002,
+	0x0051010b, 0x00a20002, 0x0051010b, 0x0094ffff, 0x005d0110,
+	0x0094ffff, 0x005d0110, 0x0086fffc, 0x006b0113, 0x0086fffc,
+	0x006b0113, 0x96e0c9ce, 0xf12db524, 0x959b2855, 0x002bd511,
+	0x5431f982, 0x5261682f, 0xc94e32d3, 0x00361282, 0x91a33134,
+	0xd3991a39, 0x01003cd0, 0x00401004, 0xca1468e6, 0xf4d0cc57,
+	0x38b2544a, 0x0050cbd5, 0x4cb5a098, 0x86087e4d, 0x6c654a0d,
+	0x00468e66, 0x4f36d44b, 0x00000043, 0x00000000, 0x00000000,
+	0x00e30087, 0x000f0087, 0x00e30087, 0x000f0087, 0x00e2007c,
+	0x0013008f, 0x00e2007c, 0x0013008f, 0x00de0073, 0x00180097,
+	0x00de0073, 0x00180097, 0x00db0069, 0x001d009f, 0x00db0069,
+	0x001d009f, 0x00d7005f, 0x002300a7, 0x00d7005f, 0x002300a7,
+	0x00d30056, 0x002900ae, 0x00d30056, 0x002900ae, 0x00ce004e,
+	0x002f00b5, 0x00ce004e, 0x002f00b5, 0x00c90045, 0x003600bc,
+	0x00c90045, 0x003600bc, 0x00c2003e, 0x003e00c2, 0x00c2003e,
+	0x003e00c2, 0x00bc0036, 0x004500c9, 0x00bc0036, 0x004500c9,
+	0x00b5002f, 0x004e00ce, 0x00b5002f, 0x004e00ce, 0x00ae0029,
+	0x005600d3, 0x00ae0029, 0x005600d3, 0x00a70023, 0x005f00d7,
+	0x00a70023, 0x005f00d7, 0x009f001d, 0x006900db, 0x009f001d,
+	0x006900db, 0x00970018, 0x007300de, 0x00970018, 0x007300de,
+	0x008f0013, 0x007c00e2, 0x008f0013, 0x007c00e2, 0x96e0c9ce,
+	0xf12db524, 0x959b2855, 0x002bd511, 0x5431f982, 0x5261682f,
+	0xc94e32d3, 0x00361282, 0x91a33134, 0xd3991a39, 0x01003cd0,
+	0x00401004, 0xca1468e6, 0xf4d0cc57, 0x38b2544a, 0x0050cbd5,
+	0x4cb5a098, 0x86087e4d, 0x6c654a0d, 0x00468e66, 0x4f36d44b,
+	0x00000043, 0x00000000, 0x00000000,
+};
+
+/*
+ * Strides inside that image: the horizontal bands are 304 bytes each, the
+ * vertical ones 352 and start after the seven horizontal bands.
+ */
+#define ZME_H_BAND_BYTES	304
+#define ZME_V_BANDS_OFFSET	0x850
+#define ZME_V_BAND_BYTES	352
+
+/*
+ * Which band's table a step uses. The vendor generator indexes its seven
+ * coefficient blocks by 4096*4096 divided by the step expressed in 4.12, and its
+ * second threshold differs per axis (3686 horizontal, 3264 vertical), so the
+ * caller hands over the step in that form and the boundary for its axis.
+ */
+static unsigned int histb_vdp2_zme_band(u32 ratio, u32 e1)
+{
+	u32 tmp = 4096u * 4096u / ratio;
+
+	if (tmp > 4096)
+		return 0;
+	if (tmp >= e1)
+		return 1;
+	if (tmp >= 3072)
+		return 2;
+	if (tmp >= 2048)
+		return 3;
+	if (tmp >= 1365)
+		return 4;
+	if (tmp >= 1024)
+		return 5;
+	return 6;
+}
+
+/*
+ * Program the step, its band's table and the filter enables together, then latch
+ * them: the steps are shadowed per axis through GP0_PARAUP and the rest of the
+ * block through GP0_UPD. The filter stays off at 1:1, as it has always been.
+ */
+static void histb_vdp2_zme_setup(struct histb_vdp2 *vdp, u32 src_w, u32 src_h,
+				 u32 dst_w, u32 dst_h)
+{
+	unsigned long hprec = vdp->zme->hprec;
+	unsigned long vprec = vdp->zme->vprec;
+	u32 hratio = DIV_ROUND_CLOSEST_ULL((u64)src_w * hprec, dst_w);
+	u32 vratio = DIV_ROUND_CLOSEST_ULL((u64)src_h * vprec, dst_h);
+	unsigned int hband, vband;
+	bool scale;
+
+	scale = vdp->chip->zme_hfir_en && (hratio != hprec || vratio != vprec);
+	if (!scale) {
+		hratio = hprec;
+		vratio = vprec;
+	}
+	hratio = min_t(u32, hratio, vdp->zme->hratio_max);
+	vratio = min_t(u32, vratio, vdp->zme->vratio_max);
+	/* The generator's table index wants both steps in 4.12. */
+	hband = histb_vdp2_zme_band(hratio >> (__fls(hprec) - 12), 3686);
+	vband = histb_vdp2_zme_band(vratio, 3264);
+
+	if (scale) {
+		vo_write(vdp, GP0_HCOEFAD,
+			 vdp->zme_coef_dma + hband * ZME_H_BAND_BYTES);
+		vo_write(vdp, GP0_VCOEFAD, vdp->zme_coef_dma + ZME_V_BANDS_OFFSET +
+			 vband * ZME_V_BAND_BYTES);
+	} else {
+		vo_write(vdp, GP0_HCOEFAD, 0);
+		vo_write(vdp, GP0_VCOEFAD, 0);
+	}
+
+	vo_rmw_field(vdp, vdp->zme->hsp, vdp->zme->hratio, hratio);
+	vo_rmw_field(vdp, vdp->zme->vsr, vdp->zme->vratio, vratio);
+	vo_rmw_field(vdp, vdp->zme->hsp, GP0_ZME_HFIR_ENABLES,
+		     scale ? vdp->chip->zme_hfir_en : 0);
+	if (vdp->chip->zme_vfir_reg)
+		vo_write(vdp, vdp->chip->zme_vfir_reg,
+			 scale ? vdp->chip->zme_vfir_en : 0);
+	vo_write(vdp, vdp->zme->hoffset, 0);
+	if (vdp->zme->hoffset_pair)
+		vo_write(vdp, vdp->zme->hoffset + 4, 0);
+	vo_write(vdp, vdp->zme->voffset, 0);
+	if (scale)
+		vo_write(vdp, GP0_PARAUP, GP0_PARAUP_HCOEF | GP0_PARAUP_VCOEF);
+}
+
 static void histb_vdp2_g0_set(struct histb_vdp2 *vdp, struct drm_framebuffer *fb,
 			    struct drm_gem_dma_object *gem,
 			    const struct drm_plane_state *pstate, bool enable)
 {
 	u32 ctrl, ifmt;
 	u32 src_x, src_y, src_w, src_h, dst_x, dst_y, dst_w, dst_h;
+	u32 win_w, win_h;
 
 	if (!enable) {
 		ctrl = vo_read(vdp, G0_CTRL);
@@ -421,23 +776,29 @@ static void histb_vdp2_g0_set(struct histb_vdp2 *vdp, struct drm_framebuffer *fb
 	/*
 	 * V* is where the fetched region lands on the panel (the SDK's "video
 	 * position", VDP_GFX_SetVideoPos) and D* is the display window around it
-	 * (VDP_GFX_SetDispPos); with no scaling allowed both are the destination
-	 * rectangle. Writing the source corner into V* instead, as an earlier
-	 * revision did, moved the surface on screen rather than cropping it: the
-	 * top-left text row came back at (320,180) under a 320,180 "source" commit.
+	 * (VDP_GFX_SetDispPos). Writing the source corner into V* instead, as an
+	 * earlier revision did, moved the surface on screen rather than cropping it:
+	 * the top-left text row came back at (320,180) under a 320,180 "source" commit.
+	 *
+	 * The footprint has to be the wider of the two rectangles, not the
+	 * destination: GP0 re-shapes the window G0 laid down, so a destination
+	 * smaller than the source would clip the region the zoom stage is told to
+	 * read, and the minified commit came back as a flat field on the panel.
 	 */
+	win_w = max(src_w, dst_w);
+	win_h = max(src_h, dst_h);
 	vo_write(vdp, G0_VFPOS,
 		 FIELD_PREP(G0_DFPOS_X, dst_x) |
 		 FIELD_PREP(G0_DFPOS_Y, dst_y));
 	vo_write(vdp, G0_VLPOS,
-		 FIELD_PREP(G0_DLPOS_X, dst_x + dst_w - 1) |
-		 FIELD_PREP(G0_DLPOS_Y, dst_y + dst_h - 1));
+		 FIELD_PREP(G0_DLPOS_X, dst_x + win_w - 1) |
+		 FIELD_PREP(G0_DLPOS_Y, dst_y + win_h - 1));
 	vo_write(vdp, G0_DFPOS,
 		 FIELD_PREP(G0_DFPOS_X, dst_x) |
 		 FIELD_PREP(G0_DFPOS_Y, dst_y));
 	vo_write(vdp, G0_DLPOS,
-		 FIELD_PREP(G0_DLPOS_X, dst_x + dst_w - 1) |
-		 FIELD_PREP(G0_DLPOS_Y, dst_y + dst_h - 1));
+		 FIELD_PREP(G0_DLPOS_X, dst_x + win_w - 1) |
+		 FIELD_PREP(G0_DLPOS_Y, dst_y + win_h - 1));
 
 	/*
 	 * GP0 post-processes the window G0 produced, not the whole surface:
@@ -445,8 +806,8 @@ static void histb_vdp2_g0_set(struct histb_vdp2 *vdp, struct drm_framebuffer *fb
 	 * rectangle.
 	 */
 	vo_write(vdp, GP0_IRESO,
-		 FIELD_PREP(G0_IRESO_IW, dst_w - 1) |
-		 FIELD_PREP(G0_IRESO_IH, dst_h - 1));
+		 FIELD_PREP(G0_IRESO_IW, src_w - 1) |
+		 FIELD_PREP(G0_IRESO_IH, src_h - 1));
 	vo_write(vdp, GP0_ORESO,
 		 FIELD_PREP(GP0_ORESO_OW, dst_w - 1) |
 		 FIELD_PREP(GP0_ORESO_OH, dst_h - 1));
@@ -470,14 +831,7 @@ static void histb_vdp2_g0_set(struct histb_vdp2 *vdp, struct drm_framebuffer *fb
 	 * ratios live in is what differs between the two SoCs of this family --
 	 * hence the chip data rather than the macros.
 	 */
-	ctrl = vo_rmw_field(vdp, vdp->zme->hsp, vdp->zme->hratio, vdp->zme->hprec);
-	ctrl = vo_rmw_field(vdp, vdp->zme->vsr, vdp->zme->vratio, vdp->zme->vprec);
-
-	/* scaler phase starts at the first source pixel */
-	vo_write(vdp, vdp->zme->hoffset, 0);
-	if (vdp->zme->hoffset_pair)
-		vo_write(vdp, vdp->zme->hoffset + 4, 0);
-	vo_write(vdp, vdp->zme->voffset, 0);
+	histb_vdp2_zme_setup(vdp, src_w, src_h, dst_w, dst_h);
 	vo_write(vdp, GP0_UPD, GP0_UPD_REGUP);
 
 	/* layer enable + shadow-register update */
@@ -520,7 +874,9 @@ static int histb_vdp2_plane_atomic_check(struct drm_plane *plane,
 {
 	struct drm_plane_state *new_state =
 		drm_atomic_get_new_plane_state(state, plane);
+	struct histb_vdp2 *vdp = plane_to_vdp(plane);
 	struct drm_crtc_state *crtc_state;
+	unsigned int min_scale, max_scale;
 
 	if (!new_state->fb)
 		return 0;
@@ -552,9 +908,24 @@ static int histb_vdp2_plane_atomic_check(struct drm_plane *plane,
 	 * the CRTC size made the helper reject every cropped source rectangle
 	 * ("Plane must cover entire CRTC") even though the hardware can show it.
 	 */
+	/*
+	 * The bounds are the factors the panel confirmed: 2x, 4x and 8x
+	 * magnification and 2x and 4x minification each returned the stripe period
+	 * at the predicted factor. Past them the reading left the prediction behind
+	 * (a 16x step came back as roughly 14x, an 8x minification lost the window
+	 * entirely), so the checker does not promise those. A part whose filter
+	 * recipe is unverified stays pinned to 1:1.
+	 */
+	if (vdp->chip->zme_hfir_en) {
+		min_scale = (1 << 16) / 8;
+		max_scale = 4 << 16;
+	} else {
+		min_scale = DRM_PLANE_NO_SCALING;
+		max_scale = DRM_PLANE_NO_SCALING;
+	}
+
 	return drm_atomic_helper_check_plane_state(new_state, crtc_state,
-						   DRM_PLANE_NO_SCALING,
-						   DRM_PLANE_NO_SCALING,
+						   min_scale, max_scale,
 						   true, true);
 }
 
@@ -1798,6 +2169,20 @@ static int histb_vdp2_bind(struct device *dev)
 		ret = -ENOMEM;
 		goto err_put;
 	}
+	if (!vdp->zme_coef) {
+		size_t bytes = sizeof(histb_vdp2_zme_coef);
+		void *coef;
+
+		coef = dmam_alloc_coherent(dev, bytes, &vdp->zme_coef_dma,
+					   GFP_KERNEL);
+		if (!coef) {
+			ret = -ENOMEM;
+			goto err_put;
+		}
+		memcpy(coef, histb_vdp2_zme_coef, bytes);
+		vdp->zme_coef = coef;
+	}
+
 	disp->vdp = vdp;
 	disp->drm = drm;
 	drm->dev_private = disp;

@@ -35,13 +35,6 @@
 #define   VO_MUX_VGA_SEL	BIT(2)
 #define   VO_MUX_HDMI_SEL	BIT(3)
 #define   VO_MUX_DIGITAL	GENMASK(5, 4)
-#define VO_MUX_TESTSYNC		0x0108	/* vo_test_en[31] + test sync polarity bits */
-#define VO_MUX_TESTDATA		0x010c	/* test_data[29:0] */
-/*
- * Reserved on mv100 and mv200: never written, reads back 0. Listed only so the
- * register dump lines up with the rest of the block.
- */
-#define VO_DAC_MUX		0x0140
 #define VO_INTSTA		0x0004
 #define VO_MSKINTSTA		0x0008	/* write 1 to clear int status */
 #define VO_INTMSK		0x000c	/* 1 = that source delivers */
@@ -59,22 +52,6 @@
 #define   VO_AXI_M0_RD0_OSTD GENMASK(3, 0)	/* read outstanding, bus 0 */
 #define   VO_AXI_M0_RD1_OSTD GENMASK(7, 4)	/* read outstanding, bus 1 */
 #define   VO_AXI_M0_WR_OSTD GENMASK(11, 8)	/* write outstanding */
-
-/*
- * Second display channel ("SD"), addressed as the DHD0 registers plus
- * CHN_OFFSET. Nothing in this range is named by the SoC's register layout, so
- * the names below mirror the DHD0 layout.
- */
-#define SD_CTRL			0xc400
-#define SD_VSYNC		0xc404
-#define SD_HSYNC1		0xc408
-#define SD_HSYNC2		0xc40c
-#define SD_VPLUS		0xc410
-#define SD_PWR			0xc414
-#define SD_VTTHD3		0xc418
-#define SD_VTTHD		0xc41c
-#define SD_SYNC_INV		0xc420
-#define SD_DATA_SEL		0xc42c
 
 /* ------------------------------------------------------------------ */
 /* G0 graphics (RGB fetch) layer                                       */
@@ -144,10 +121,10 @@
 #define GP0_HCOEFAD		0x9010	/* ZME horizontal coefficient window */
 #define GP0_VCOEFAD		0x9014	/* ZME vertical coefficient window */
 #define GP0_PARAUP		0x9018	/* shadow-register update latch */
+#define   GP0_PARAUP_HCOEF	BIT(0)	/* latch the horizontal step and table */
+#define   GP0_PARAUP_VCOEF	BIT(1)	/* latch the vertical step and table */
 #define GP0_DFPOS		0x9100
 #define GP0_DLPOS		0x9104
-#define GP0_BK			0x9110
-#define GP0_ALPHA		0x9114
 #define   GP0_UPD_REGUP BIT(0)
 #define GP0_ORESO		0x9008
 #define   GP0_ORESO_OW GENMASK(11, 0)
@@ -168,8 +145,7 @@
  * cv200 needs a matrix here even though the interface runs in RGB: the G0 fetch
  * hands its three components to the mixer one position rotated, and neither an
  * ifmt code nor any 32-bit DRM pixel format reaches the honest assignment
- * (board-measured on the AR513W). GP0_CSC_CYC below is that compensation;
- * the same stage also
+ * (board-measured on the AR513W). GP0_CSC_CYC below is that compensation; the same stage also
  * carries the 219/255 gain and the +16 code offset that make the luma the
  * limited range the AVI InfoFrame declares (see the comment on the writes in
  * histb-vdp2.c).
@@ -223,6 +199,7 @@
 #define   GP0_ZME_HSP_HAMID_EN	BIT(30)
 #define   GP0_ZME_HSP_HSC_EN	BIT(31)
 #define   GP0_ZME_HPREC		BIT(20)
+#define   GP0_ZME_HFIR_ENABLES	GENMASK(31, 24)	/* filter, median and order bits */
 #define GP0_ZME_HLOFFSET	0x9144
 #define GP0_ZME_HCOFFSET	0x9148
 #define GP0_ZME_VSP		0x914c	/* filter/tap enables only; ratio is in VSR */
@@ -292,8 +269,6 @@
 					 */
 #define   CBM_BKG_BLACK		0x04080200	/* Y=64, Cb=Cr=512 */
 #define CBM_MIX1		0xb408		/* DHD0 mixer priority */
-#define CBM_BKG2		0xb420		/* DHD1 mixer background */
-#define CBM_MIX2		0xb428		/* DHD1 mixer priority */
 #define CBM_ATTR		0xb440
 #define   CBM_ATTR_SUR0 BIT(0)
 #define   CBM_ATTR_SUR1 BIT(1)
@@ -438,9 +413,6 @@
 #define   DHD_SYNC_HDMI_F_INV BIT(11)
 #define   DHD_SYNC_DATE_HS_INV BIT(13)
 #define DHD0_DATA_SEL		0xc02c
-#define DHD0_STATE		0xc0f0	/* live: vblank[1] vcnt[15:3] */
-#define DHD0_DEBUG		0xc0f8	/* live: pix_h[15:0] pix_v[27:16] pix_src[30:28] */
-#define DHD0_DEBUG_STATE	0xc0fc	/* live: pixel_value[29:0] at the sample point */
 #define HDATE_VERSION		0xf000	/* IP version word; anchor of the register layout */
 #define HDATE_STATE		0xf010	/* hd digital port: line_len[12:0] frame_len[26:16] */
 #define HDATE_EN		0xf004	/* hd_en[0]: hd digital output port enable */
@@ -473,6 +445,5 @@
  * register has to be read, patched and written back.
  */
 #define   DHD_DATA_SEL_HDMI BIT(3)
-#define DHD0_ABUFTHD		0xc034
 
 #endif /* _HISTB_VDP2_REGS_H_ */
