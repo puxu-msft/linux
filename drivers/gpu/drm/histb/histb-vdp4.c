@@ -43,6 +43,7 @@
 
 #include <drm/drm_atomic.h>
 #include <drm/drm_atomic_helper.h>
+#include <drm/drm_blend.h>
 #include <drm/drm_bridge.h>
 #include <drm/drm_bridge_connector.h>
 #include <drm/drm_crtc.h>
@@ -249,7 +250,7 @@ static u32 histb_vdp4_m1(u32 v)
  * update mode and enable.
  */
 static void histb_vdp4_g0_set(struct histb_vdp4 *vdp, const struct drm_framebuffer *fb,
-			      struct drm_gem_dma_object *gem, bool enable)
+			      struct drm_gem_dma_object *gem, bool enable, u8 alpha)
 {
 	u32 fmt, ctrl, last;
 
@@ -293,7 +294,12 @@ static void histb_vdp4_g0_set(struct histb_vdp4 *vdp, const struct drm_framebuff
 	/* Surface stride in 16-byte units; the compression stride stays 0. */
 	vo_write(vdp, GFX0_STRIDE, FIELD_PREP(GFX0_LSTRIDE, fb->pitches[0] / 16));
 
-	/* Layer stage: 1:1 placement at the display origin, fully opaque. */
+	/*
+	 * Layer stage: 1:1 placement at the display origin.  G0_ALPHA is the
+	 * layer's background alpha; the layer's own opacity is the galpha field
+	 * of G0_CTRL (the vendor's VDP_GFX_SetLayerGalpha writes exactly that
+	 * byte), so 0xff would make every commit fully opaque.
+	 */
 	last = FIELD_PREP(L0_POS_X, fb->width - 1) |
 	       FIELD_PREP(L0_POS_Y, fb->height - 1);
 	vo_write(vdp, L0_DISP_START, 0);
@@ -301,7 +307,8 @@ static void histb_vdp4_g0_set(struct histb_vdp4 *vdp, const struct drm_framebuff
 	vo_write(vdp, L0_VIR_START, 0);
 	vo_write(vdp, L0_VIR_END, last);
 	vo_write(vdp, MV310_L0_ALPHA, 0xff);
-	vo_write(vdp, L0_CTRL, 0xff | L0_UPD_MODE | L0_NO_SEC | L0_EN);
+	vo_write(vdp, L0_CTRL,
+		 FIELD_PREP(L0_GALPHA, alpha) | L0_UPD_MODE | L0_NO_SEC | L0_EN);
 
 	/* Latch G0 and GP0, then the graphics parameter-update bit. */
 	vo_write(vdp, L0_REGUP, 1);
@@ -330,7 +337,8 @@ static void histb_vdp4_plane_atomic_update(struct drm_plane *plane,
 	if (!gem)
 		return;
 
-	histb_vdp4_g0_set(vdp, fb, gem, new_state->visible);
+	histb_vdp4_g0_set(vdp, fb, gem, new_state->visible,
+			  new_state->alpha >> 8);
 }
 
 static void histb_vdp4_plane_atomic_disable(struct drm_plane *plane,
@@ -338,7 +346,7 @@ static void histb_vdp4_plane_atomic_disable(struct drm_plane *plane,
 {
 	struct histb_vdp4 *vdp = plane_to_vdp(plane);
 
-	histb_vdp4_g0_set(vdp, NULL, NULL, false);
+	histb_vdp4_g0_set(vdp, NULL, NULL, false, 0);
 }
 
 static int histb_vdp4_plane_atomic_check(struct drm_plane *plane,
@@ -671,7 +679,8 @@ static void histb_vdp4_crtc_atomic_enable(struct drm_crtc *crtc,
 	if (fb) {
 		gem = drm_fb_dma_get_gem_obj(fb, 0);
 		if (gem)
-			histb_vdp4_g0_set(vdp, fb, gem, pstate->visible);
+			histb_vdp4_g0_set(vdp, fb, gem, pstate->visible,
+					  pstate->alpha >> 8);
 	}
 
 	/* G0 is latched; now start the interface, as VDP_DISP_SetIntfEnable. */
@@ -912,6 +921,16 @@ static int histb_vdp4_bind(struct device *dev)
 		goto err_put;
 	}
 	drm_plane_helper_add(&disp->primary, &histb_vdp4_plane_helper_funcs);
+
+	/*
+	 * The layer's global alpha is G0_CTRL's full 8-bit galpha field, so the
+	 * plane can offer opacity even though the format table stays opaque.
+	 */
+	ret = drm_plane_create_alpha_property(&disp->primary);
+	if (ret) {
+		dev_err_probe(dev, ret, "alpha failed\n");
+		goto err_put;
+	}
 
 	ret = drm_crtc_init_with_planes(drm, &disp->crtc, &disp->primary, NULL,
 					&histb_vdp4_crtc_funcs, "histb-vdp4-crtc");
