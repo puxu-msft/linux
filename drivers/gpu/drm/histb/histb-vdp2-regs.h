@@ -97,10 +97,14 @@
  * composites as fully transparent, so XRGB has to use the keyed code that
  * ignores byte 3.
  */
+#define G0_IFMT_RGB444		0x40	/* 16bpp, R in bits 11:8, no alpha */
+#define G0_IFMT_RGB555		0x41	/* 16bpp, R in bits 14:10, no alpha */
 #define G0_IFMT_RGB565		0x42	/* 16bpp, no alpha */
+#define G0_IFMT_RGB888		0x50	/* 24bpp, one byte per channel, no alpha */
 #define G0_IFMT_KRGB888		0x60	/* 32bpp, alpha ignored */
 #define G0_IFMT_ARGB8888	0x68	/* 32bpp, alpha taken from the pixel */
-#define G0_IFMT_RGBA8888	0xe8	/* 32bpp, alpha taken from the pixel */
+#define G0_IFMT_RGBA8888	0xe8	/* 32bpp, R:G:B:A, alpha in the low byte */
+#define G0_IFMT_ABGR8888	0xef	/* 32bpp, A:B:G:R, alpha in the top byte */
 
 /* ------------------------------------------------------------------ */
 /* GP0 graphics post block (G0 -> GP0 -> CBM mixer -> DHD0)            */

@@ -346,7 +346,15 @@ static void histb_vdp2_wait_upd(struct histb_vdp2 *vdp, u32 off)
 static const u32 histb_vdp2_formats[] = {
 	DRM_FORMAT_XRGB8888,
 	DRM_FORMAT_ARGB8888,
+	DRM_FORMAT_ABGR8888,
+	DRM_FORMAT_RGBA8888,
 	DRM_FORMAT_RGB565,
+	DRM_FORMAT_XRGB4444,
+	DRM_FORMAT_XRGB1555,
+	/* one byte per channel; the fetch stride is in 16-byte units, so the
+	 * width has to be a multiple of 16 pixels for the pitch to divide.
+	 */
+	DRM_FORMAT_BGR888,
 };
 
 /* `value - 1`, clamped so that a zero porch/sync width never underflows */
@@ -685,7 +693,7 @@ static void histb_vdp2_g0_set(struct histb_vdp2 *vdp, struct drm_framebuffer *fb
 			    const struct drm_plane_state *pstate, bool enable)
 {
 	u32 ctrl, ifmt;
-	bool palpha;
+	bool palpha, blend;
 	u32 src_x, src_y, src_w, src_h, dst_x, dst_y, dst_w, dst_h;
 	u32 win_w, win_h;
 
@@ -709,29 +717,42 @@ static void histb_vdp2_g0_set(struct histb_vdp2 *vdp, struct drm_framebuffer *fb
 		return;
 
 	/*
-	 * Pixel format. The A-prefixed hardware codes consume the buffer's
-	 * alpha byte, so an XRGB framebuffer must not be described as ARGB8888:
-	 * every pixel would carry alpha 0x00 and the layer would composite as
-	 * fully transparent.
+	 * Pixel format. The A-prefixed codes consume the buffer's alpha byte, so
+	 * an XRGB framebuffer must not be described as ARGB8888: every pixel would
+	 * carry alpha 0x00 and the layer would composite as fully transparent.
+	 * Which memory byte holds which channel was read off the panel with a
+	 * primary-coloured field (the codes here are the SDK's VDP_GFX_IFMT_E):
+	 * 0x60/0x68 put B,G,R in the low three bytes, 0xe8 is R:G:B:A and 0xef is
+	 * A:B:G:R, so they take the matching DRM formats.
 	 */
+	blend = pstate->pixel_blend_mode != DRM_MODE_BLEND_PIXEL_NONE;
 	switch (fb->format->format) {
+	case DRM_FORMAT_XRGB4444:
+		ifmt = G0_IFMT_RGB444;
+		break;
+	case DRM_FORMAT_XRGB1555:
+		ifmt = G0_IFMT_RGB555;
+		break;
 	case DRM_FORMAT_RGB565:
 		ifmt = G0_IFMT_RGB565;
 		break;
+	case DRM_FORMAT_BGR888:
+		ifmt = G0_IFMT_RGB888;
+		break;
 	case DRM_FORMAT_ARGB8888:
-		/*
-		 * The alpha byte only reaches the mixer once the pixel-alpha path is
-		 * switched on, so "None" keeps the opaque coding and the other two
-		 * blend modes hand the byte over.
-		 */
-		ifmt = pstate->pixel_blend_mode == DRM_MODE_BLEND_PIXEL_NONE ?
-		       G0_IFMT_KRGB888 : G0_IFMT_ARGB8888;
+		ifmt = blend ? G0_IFMT_ARGB8888 : G0_IFMT_KRGB888;
+		break;
+	case DRM_FORMAT_RGBA8888:
+		ifmt = G0_IFMT_RGBA8888;
+		break;
+	case DRM_FORMAT_ABGR8888:
+		ifmt = G0_IFMT_ABGR8888;
 		break;
 	default:
 		ifmt = G0_IFMT_KRGB888;
 		break;
 	}
-	palpha = ifmt == G0_IFMT_ARGB8888;
+	palpha = blend && fb->format->has_alpha;
 
 	/*
 	 * bitext, read_mode and upd_mode all have to be set for a layer that
