@@ -577,6 +577,77 @@
 			status = "disabled";
 		};
 
+		vdec: video-decoder@8c30000 {
+			compatible = "hisilicon,hi3798mv200-vdec";
+			/*
+			 * One window for the decode core and its two satellites: the
+			 * vendor's own bases for this part are VDM 0xf8c30000, SCD
+			 * 0xf8c3c000 and BPD 0xf8c3d000, all inside the 64 KiB span
+			 * below.  The vendor build numbers the three interrupts as
+			 * INTID 127, 136 and 181 (vfmw_v5.1 product Hi3798MV310
+			 * sysconfig.h, whose macros already add 32), which are these
+			 * SPI 95, 104 and 149; the running vendor system names them
+			 * vdec_vdh, vdec_scd and mmu_vdh.
+			 *
+			 * No clocks and no resets: this part's CRG30 holds neither an
+			 * enable nor a reset request for the VDH, only the selector at
+			 * bits 9:8 and the pulse-skipping configuration at bits 17:12,
+			 * and the block answers with the selector the boot leaves
+			 * (CRG30 reads 0x300 before anything claims it).  The core
+			 * resets itself through its wrapper instead.
+			 */
+			reg = <0x8c30000 0x10000>;
+			interrupts = <GIC_SPI 95 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "vdm";
+			status = "disabled";
+		};
+
+		venc: video-encoder@8c80000 {
+			compatible = "hisilicon,hi3798mv200-venc";
+			/*
+			 * One window for the encoder core and, 0xf000 bytes in, its
+			 * memory-management unit block -- the span the vendor's
+			 * hardware layer maps is 0xf700 bytes.  Its board layer for
+			 * this part enables CRG35 bits 0 and 1, the core and the AXI
+			 * clock, and pulses bit 4 as the block's soft reset; bit 4 is
+			 * where every CRG35 layout in the vendor tree puts that
+			 * request, and bits 0 and 1 are the two enables the in-tree
+			 * clock table already names.
+			 */
+			reg = <0x8c80000 0x10000>;
+			interrupts = <GIC_SPI 101 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&crg HI3798MV200_VENV_CLK>,
+				 <&crg HI3798MV200_VENV_AXI_CLK>;
+			clock-names = "venc", "venc-axi";
+			resets = <&crg 0x8c 4>;
+			reset-names = "venc";
+			status = "disabled";
+		};
+
+		vpss: video-processor@8cb0000 {
+			compatible = "hisilicon,hi3798mv200-vpss";
+			/*
+			 * The window the vendor's own hardware layer maps: its
+			 * CP band runs to 0x344, the memory-accessor's statistics
+			 * write address sits at 0x5010 and the block's own SMMU
+			 * at 0xf000, so the span has to reach past all three
+			 * (vpss_v4_0/hal/hi3798mv310/drv/inc/vpss_regcp.h:9939,
+			 * :10322, :10548).  The interrupt is the one the vendor's
+			 * interrupt table names vpss0 (hi3798mv200.dts:798).
+			 * CRG60 bit 0 clocks the block and bit 4 holds its reset;
+			 * out of reset the block answers 0x4000 in VPSS_VERSION,
+			 * measured on this board.
+			 */
+			reg = <0x8cb0000 0x10000>;
+			interrupts = <GIC_SPI 93 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&crg HI3798MV200_VPSS_CLK>,
+				 <&crg HI3798MV200_VPSS_SMMU_CLK>;
+			clock-names = "vpss", "vpss-smmu";
+			resets = <&crg 0xf0 4>, <&crg 0x344 4>;
+			reset-names = "vpss", "vpss-smmu";
+			status = "disabled";
+		};
+
 		vdp: display@8cc0000 {
 			compatible = "hisilicon,hi3798mv200-vdp";
 			/*

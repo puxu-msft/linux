@@ -320,3 +320,32 @@
 	status = "okay";
 	timeout-sec = <30>;
 };
+
+/*
+ * The V5R6 video decoder. The driver claims the block, resets it through its
+ * own wrapper and asks for its completion line, so this node has to carry the
+ * clock gate and the interrupt for the block to run at all.
+ */
+&vdec {
+	status = "okay";
+};
+
+/*
+ * The V500 video encoder. Its first measurement is whether the block answers
+ * at all: the driver claims its clocks, pulses the reset request in the clock
+ * and reset generator, and registers its completion line, and one encoded
+ * picture has to come back with a reported length.
+ */
+&venc {
+	status = "okay";
+};
+
+/*
+ * The vpss_v4_0 video processor. What this node has to answer for is whether a
+ * job image handed to the accessor's two channels comes back as the same
+ * picture: the driver checks the id word the vendor itself polls to prove the
+ * reset took, and a pass-through conversion has to leave the bytes alone.
+ */
+&vpss {
+	status = "okay";
+};
