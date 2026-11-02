@@ -30,6 +30,7 @@
 #include <media/videobuf2-v4l2.h>
 
 #include "histb-vpss-regs.h"
+#include "histb-vpss-v4-regs.h"
 #include "histb-vpss-zme-coef.h"
 
 /* Rotation runs as one image per plane, chained. */
@@ -81,11 +82,50 @@ struct histb_vpss_fmt {
 	bool	packed;
 };
 
+struct histb_vpss;
+struct histb_vpss_pass;
+
+/*
+ * What a generation owns: where the constant id word lives, how big one job
+ * image is, which state bits mean done and which mean fault, and the builder
+ * that fills the image. The v4 block also gates its own clocks on the way up.
+ */
+struct histb_vpss_variant {
+	u32	version;
+	u32	version_expect;	/* 0 = any answer but silence will do */
+	u32	image_size;
+	u32	done;
+	u32	errors;
+	u32	timeout;
+	const char *(*err_name)(u32 st);
+	bool	arm_detector;	/* the generation with an AXI transaction latch */
+	bool	status_from_raw;	/* wait on the unmasked status word, as
+					 * the vendor's own check does
+					 */
+	int	(*pass_run)(struct histb_vpss *vpss,
+			    const struct histb_vpss_pass *p);
+	void	(*power_up)(struct histb_vpss *vpss);
+	bool	deinterlacing;
+	bool	scaling;
+	bool	packed;
+};
+
+/*
+ * The v4 block will not run a chain until its clock-gating request and the
+ * hard gate of its post-processing clock are asked for, and it masks and clears
+ * its interrupts the same way on the way up. The vendor's layer does this
+ * against the window as it enables the clock (hal/vpss_cbb_hal.c:867-896), not
+ * against the job image, so it goes in the same place here.
+ */
+
 struct histb_vpss {
 	struct device		*dev;
+	const struct histb_vpss_variant *var;
 	void __iomem		*regs;
 	struct clk		*clk;
+	struct clk		*smmu_clk;	/* the generation that has one */
 	struct reset_control	*rst;
+	struct reset_control	*rst_smmu;	/* the generation with its own unit */
 	struct completion	done;
 	struct v4l2_device	v4l2_dev;
 	struct video_device	vdev;
@@ -175,6 +215,11 @@ static int histb_vpss_reset(struct histb_vpss *vpss);
 static int histb_vpss_kick(struct histb_vpss *vpss, dma_addr_t first);
 static void histb_vpss_reset_crop(struct histb_vpss_ctx *ctx);
 static void histb_vpss_dei_free(struct histb_vpss_ctx *ctx);
+
+static struct device *vpss_dev_of_ctx(const struct histb_vpss_ctx *ctx)
+{
+	return ctx->vpss->dev;
+}
 
 static struct histb_vpss_ctx *histb_vpss_ctx_of(struct file *file)
 {
@@ -335,6 +380,15 @@ static int histb_vpss_s_fmt(struct file *file, void *priv,
 		return ret;
 
 	if (V4L2_TYPE_IS_OUTPUT(f->type)) {
+		const struct histb_vpss_fmt *src = histb_vpss_find(
+			histb_vpss_out_fmts, ARRAY_SIZE(histb_vpss_out_fmts),
+			f->fmt.pix.pixelformat);
+
+		if (src && src->packed && !ctx->vpss->var->packed) {
+			dev_warn_ratelimited(vpss_dev_of_ctx(ctx),
+					     "no packed source on this generation\n");
+			return -EINVAL;
+		}
 		ctx->src_fmt = f->fmt.pix;
 		histb_vpss_reset_crop(ctx);
 	} else {
@@ -351,6 +405,18 @@ static int histb_vpss_s_fmt(struct file *file, void *priv,
 
 		if (!src || !dst || src->fmt422 != dst->fmt422)
 			return -EINVAL;
+		/*
+		 * With no scaler the port can only repeat the window it is
+		 * given. Refusing a size change here beats handing the client
+		 * back the input size and letting it find out from the pixels.
+		 */
+		if (!ctx->vpss->var->scaling &&
+		    (f->fmt.pix.width != ctx->src_fmt.width ||
+		     f->fmt.pix.height != ctx->src_fmt.height)) {
+			dev_warn_ratelimited(vpss_dev_of_ctx(ctx),
+					     "this generation scales nothing\n");
+			return -EINVAL;
+		}
 		ctx->dst_fmt = f->fmt.pix;
 	}
 	return 0;
@@ -634,8 +700,8 @@ struct histb_vpss_pass {
 	bool		vflip;
 };
 
-static int histb_vpss_pass_run(struct histb_vpss *vpss,
-			       const struct histb_vpss_pass *p)
+static int histb_vpss_v3_pass_run(struct histb_vpss *vpss,
+				 const struct histb_vpss_pass *p)
 {
 	u32 *s = vpss->shadow;
 	unsigned int src_c, dst_c, stride;
@@ -847,8 +913,159 @@ static int histb_vpss_rotate_run(struct histb_vpss *vpss,
 	return histb_vpss_kick(vpss, vpss->shadow_dma);
 }
 
+/*
+ * One job of the vpss_v4_0 block. The picture goes in through a channel
+ * descriptor of the memory accessor and out through the one belonging to port
+ * zero, so the geometry is not at the head of the image the way it is on the
+ * older block; both sizes are written as a last index, and the offsets are in
+ * pixels, exactly as the vendor's own channel accessors write them. Every
+ * channel nobody handed a buffer to is bypassed: the block waits for a stream
+ * it was pointed at, and the ones left live would read from, or write to,
+ * address zero.
+ */
+static int histb_vpss_v4_pass_run(struct histb_vpss *vpss,
+				  const struct histb_vpss_pass *p)
+{
+	u32 *s = vpss->shadow;
+	dma_addr_t in_c, out_c;
+	dma_addr_t caddr[4];
+	unsigned int in_fmt, out_fmt;
+
+	if (!s)
+		return -ENODEV;
+	if (upper_32_bits(p->in) || upper_32_bits(p->out))
+		return -ERANGE;
+
+	/*
+	 * A semi-planar pair is one code and the order inside the pair is a bit
+	 * of its own, so the formats this driver offers need no table: 4:2:0 is
+	 * 0 and 4:2:2 is 1, in both directions. s_fmt() is what keeps a packed
+	 * source and a size change away from this generation.
+	 */
+	in_fmt = p->in_422 ? VPSS4_FMT_YUV422SP : VPSS4_FMT_YUV420SP;
+	out_fmt = p->out_422 ? VPSS4_FMT_YUV422SP : VPSS4_FMT_YUV420SP;
+	in_c = p->in + (dma_addr_t)p->in_stride * p->frame_h;
+	out_c = p->out + (dma_addr_t)p->out_stride * p->out_h;
+
+	memset(s, 0, vpss->var->image_size);
+
+	s[VPSS4_CTRL / 4] = VPSS4_CTRL_VHD0_EN;
+	/* img_pro_mode is the rotation path's field, not the field mode: the
+	 * vendor's own check demands 0 whenever rotate_en is 0
+	 * (debug/vpss_cbb_assert.c:163). The read mode of a frame lives in the
+	 * two channels' lm_rmode words above.
+	 */
+	s[VPSS4_CHN_CFG_CTRL / 4] = 0;
+	s[VPSS4_INTMASK / 4] = 0x7e;
+	s[VPSS4_TIMEOUT / 4] = 0xffffffff;
+
+	/* The four parameter regions live in this same image, so each pointer is
+	 * the image's address plus the region's offset in it.
+	 */
+	s[VPSS4_TNR_ADDR / 4] = lower_32_bits(vpss->shadow_dma + VPSS4_TNR_PARA);
+	s[VPSS4_SNR_ADDR / 4] = lower_32_bits(vpss->shadow_dma + VPSS4_SNR_PARA);
+	s[VPSS4_ZME_ADDR / 4] = lower_32_bits(vpss->shadow_dma + VPSS4_ZME_PARA);
+	s[VPSS4_DEI_ADDR / 4] = lower_32_bits(vpss->shadow_dma + VPSS4_DEI_PARA);
+
+	/* The filter bank this generation reaches for a 1:1 job blends across
+	 * edges instead of passing them through, so a job that changes neither
+	 * dimension leaves the scaler out. Everything else the port needs --
+	 * including the produced size -- the image still carries.
+	 */
+	if (p->in_w != p->out_w || p->in_h != p->out_h) {
+		histb_vpss_load_coef(vpss, histb_vpss_zme_bucket(p->in_w, p->out_w),
+				     false, caddr);
+		s[VPSS4_ZME_LHADDR / 4] = lower_32_bits(caddr[0]);
+		s[VPSS4_ZME_LVADDR / 4] = lower_32_bits(caddr[1]);
+		s[VPSS4_ZME_CHADDR / 4] = lower_32_bits(caddr[2]);
+		s[VPSS4_ZME_CVADDR / 4] = lower_32_bits(caddr[3]);
+
+		s[VPSS4_ZME_HSP / 4] = VPSS4_ZME_H_LMSC | VPSS4_ZME_H_CHMSC |
+				       VPSS4_ZME_H_LMID | VPSS4_ZME_H_CHMID |
+				       VPSS4_ZME_H_LFIR | VPSS4_ZME_H_CHFIR |
+				       FIELD_PREP(VPSS4_ZME_H_RATIO,
+						  (p->in_w << VPSS4_ZME_HR_PREC) /
+						  p->out_w);
+		s[VPSS4_ZME_VSP / 4] = VPSS4_ZME_V_LMSC | VPSS4_ZME_V_CHMSC |
+				       VPSS4_ZME_V_LMID | VPSS4_ZME_V_CHMID |
+				       VPSS4_ZME_V_LFIR | VPSS4_ZME_V_CHFIR |
+				       FIELD_PREP(VPSS4_ZME_V_OUT_FMT,
+						  p->out_422 ? 0 : 1);
+		s[VPSS4_ZME_VSR / 4] = FIELD_PREP(VPSS4_ZME_V_RATIO,
+						 (p->in_h << VPSS4_ZME_VR_PREC) /
+						 p->out_h);
+		s[VPSS4_CTRL3 / 4] = VPSS4_CTRL3_ZME_VHD0_EN;
+	}
+	/* The size this port produces: a node without it completes but writes
+	 * only the first sample of each plane.
+	 */
+	s[VPSS4_ZMEORESO / 4] = FIELD_PREP(VPSS4_ZME_OW, p->out_w - 1) |
+				FIELD_PREP(VPSS4_ZME_OH, p->out_h - 1);
+
+	/* The accessor's own request shaping comes from the image as well, so
+	 * the node carries what the window already answers with.
+	 */
+	s[VPSS4_MISCELLANEOUS / 4] = readl(vpss->regs + VPSS4_MISCELLANEOUS);
+	s[VPSS4_MACCFG / 4] = readl(vpss->regs + VPSS4_MACCFG);
+	s[VPSS4_BUS_CTRL / 4] = readl(vpss->regs + VPSS4_BUS_CTRL);
+	s[VPSS4_MST_OUTSTANDING / 4] =
+		readl(vpss->regs + VPSS4_MST_OUTSTANDING);
+	s[VPSS4_MST_CTRL / 4] = readl(vpss->regs + VPSS4_MST_CTRL);
+	s[VPSS4_MST_RCHN_PRIO0 / 4] = readl(vpss->regs + VPSS4_MST_RCHN_PRIO0);
+	s[VPSS4_MST_WCHN_PRIO0 / 4] = readl(vpss->regs + VPSS4_MST_WCHN_PRIO0);
+
+	s[VPSS4_CF_CTRL / 4] = FIELD_PREP(VPSS4_CF_FORMAT, in_fmt) |
+			       FIELD_PREP(VPSS4_CF_TYPE, VPSS4_TYPE_LINEAR) |
+			       FIELD_PREP(VPSS4_CF_BITW, VPSS4_BITW_8) |
+			       FIELD_PREP(VPSS4_CF_LM_RMODE,
+					  VPSS4_LM_PROGRESSIVE) |
+			       VPSS4_CF_TILE_BYPASS | VPSS4_CF_EN |
+			       (p->invert_uv ? VPSS4_CF_UV_INVERT : 0) |
+			       (p->hflip ? VPSS4_CF_MIRROR : 0) |
+			       (p->vflip ? VPSS4_CF_FLIP : 0);
+	s[VPSS4_CF_SIZE / 4] = FIELD_PREP(VPSS4_CF_SIZE_WIDTH, p->in_w - 1) |
+			       FIELD_PREP(VPSS4_CF_SIZE_HEIGHT, p->in_h - 1);
+	s[VPSS4_CF_OFFSET / 4] = FIELD_PREP(VPSS4_CF_OFFSET_HOR, p->off_x) |
+				 FIELD_PREP(VPSS4_CF_OFFSET_VER, p->off_y);
+	s[VPSS4_CF_YADDR_H / 4] = upper_32_bits(p->in);
+	s[VPSS4_CF_YADDR_L / 4] = lower_32_bits(p->in);
+	s[VPSS4_CF_CADDR_H / 4] = upper_32_bits(in_c);
+	s[VPSS4_CF_CADDR_L / 4] = lower_32_bits(in_c);
+	s[VPSS4_CF_STRIDE / 4] = FIELD_PREP(VPSS4_CF_STRIDE_Y, p->in_stride) |
+				 FIELD_PREP(VPSS4_CF_STRIDE_C, p->in_stride);
+
+	s[VPSS4_OUT0_CTRL / 4] = FIELD_PREP(VPSS4_OUT0_FORMAT, out_fmt) |
+				 FIELD_PREP(VPSS4_OUT0_TYPE, VPSS4_TYPE_LINEAR) |
+				 FIELD_PREP(VPSS4_OUT0_BITW, VPSS4_BITW_8) |
+				 VPSS4_OUT0_DITHER_EN | VPSS4_OUT0_H_BYPASS |
+				 VPSS4_OUT0_D_BYPASS |
+				 FIELD_PREP(VPSS4_OUT0_LM_RMODE,
+					  VPSS4_LM_PROGRESSIVE) |
+				 VPSS4_OUT0_EN |
+				 (p->invert_uv ? VPSS4_OUT0_UV_INVERT : 0) |
+				 (p->hflip ? VPSS4_OUT0_MIRROR : 0) |
+				 (p->vflip ? VPSS4_OUT0_FLIP : 0);
+	s[VPSS4_OUT0_YADDR_H / 4] = upper_32_bits(p->out);
+	s[VPSS4_OUT0_YADDR_L / 4] = lower_32_bits(p->out);
+	s[VPSS4_OUT0_CADDR_H / 4] = upper_32_bits(out_c);
+	s[VPSS4_OUT0_CADDR_L / 4] = lower_32_bits(out_c);
+	s[VPSS4_OUT0_STRIDE / 4] = FIELD_PREP(VPSS4_OUT0_STRIDE_Y, p->out_stride) |
+				   FIELD_PREP(VPSS4_OUT0_STRIDE_C, p->out_stride);
+	s[VPSS4_OUT0_SIZE / 4] = FIELD_PREP(VPSS4_OUT0_SIZE_WIDTH, p->out_w - 1) |
+				 FIELD_PREP(VPSS4_OUT0_SIZE_HEIGHT, p->out_h - 1);
+
+	s[VPSS4_PNEXT / 4] = 0;
+	/* The vendor's node fill never touches the node's own start word -- the
+	 * only writer is VPSS_Sys_SetStart(pstVpss, 0, 1) against the window
+	 * (base/vpss_cbb_base.c:46) -- so the image leaves it at 0.
+	 */
+	wmb();
+
+	return histb_vpss_kick(vpss, vpss->shadow_dma);
+}
+
 /* Name the failure the block reported, for the job-failed log line. */
-static const char *histb_vpss_err_name(u32 st)
+static const char *histb_vpss_v3_err_name(u32 st)
 {
 	if (st & VPSS_INTSTATE_TIMEOUT)
 		return "block timeout";
@@ -863,47 +1080,137 @@ static const char *histb_vpss_err_name(u32 st)
 	return "stride tunnel overrun";
 }
 
+static const char *histb_vpss_v4_err_name(u32 st)
+{
+	if (st & VPSS4_INTSTATE_TIMEOUT)
+		return "block timeout";
+	if (st & VPSS4_INTSTATE_BUS_R)
+		return "bus read error";
+	if (st & VPSS4_INTSTATE_BUS_W)
+		return "bus write error";
+	if (st & VPSS4_INTSTATE_DCMP)
+		return "tile decompress error";
+	return "tunnel overrun";
+}
+
+static void histb_vpss_v4_power_up(struct histb_vpss *vpss)
+{
+	writel(0x7e, vpss->regs + VPSS4_INTMASK);
+	writel(0x7e, vpss->regs + VPSS4_INTCLR);
+	writel(0xffffffff, vpss->regs + VPSS4_TIMEOUT);
+	writel(BIT(0), vpss->regs + VPSS4_SMMU_SCR);
+	/* The vendor's power-up path also asks for the clock gates here
+	 * (hal/vpss_cbb_hal.c:890-891); with hard_gate_clk_ppc_en set the block
+	 * ignores the first chain it is handed after a bring-up, so both cells
+	 * stay at their reset value of 0.
+	 */
+	writel(0, vpss->regs + VPSS4_HARDGATE_CTRL);
+	writel(0, vpss->regs + VPSS4_LOWPOWER_CTRL);
+}
+
+static const struct histb_vpss_variant histb_vpss_v3 = {
+	.version = VPSS_VERSION,
+	.image_size = VPSS_REG_IMAGE_SIZE,
+	.done = VPSS_INTSTATE_EOF | VPSS_INTSTATE_DONE,
+	.errors = VPSS_INTSTATE_ERRORS,
+	.timeout = VPSS_INTSTATE_TIMEOUT,
+	.err_name = histb_vpss_v3_err_name,
+	.pass_run = histb_vpss_v3_pass_run,
+	.deinterlacing = true,
+	.scaling = true,
+	.packed = true,
+};
+
+static const struct histb_vpss_variant histb_vpss_v4 = {
+	.version = VPSS4_VERSION,
+	.version_expect = VPSS4_VERSION_RELEASED,
+	.image_size = VPSS4_REG_IMAGE_SIZE,
+	.done = VPSS4_INTSTATE_EOF | VPSS4_INTSTATE_EOF_END,
+	.errors = VPSS4_INTSTATE_ERRORS,
+	.timeout = VPSS4_INTSTATE_TIMEOUT,
+	.err_name = histb_vpss_v4_err_name,
+	.arm_detector = true,
+	.status_from_raw = true,
+	.pass_run = histb_vpss_v4_pass_run,
+	.power_up = histb_vpss_v4_power_up,
+};
+
 /* Hand the chain head to the block and wait for the completion it releases. */
 static int histb_vpss_kick(struct histb_vpss *vpss, dma_addr_t first)
 {
+	unsigned int attempt, attempts = vpss->var->status_from_raw ? 2 : 1;
 	unsigned long deadline;
-	u32 st;
+	u32 st, acted;
 
-	/*
-	 * The state bits are latched: a completion left over from the previous
-	 * job would end this one before the block had even started.
+	/* This generation ignores the first chain it is handed after the block has
+	 * been brought up: that attempt leaves no raw status and no transaction
+	 * counted, and the same image completes once the block has been cleared
+	 * and reset again. An attempt that moved
+	 * nothing therefore gets re-armed and started once more; anything that
+	 * reached the bus is reported as it stands, so no buffer is ever written
+	 * twice by one job.
 	 */
-	writel(0xffffffff, vpss->regs + VPSS_INTCLR);
-	writel(lower_32_bits(first), vpss->regs + VPSS_PNEXT);
-	writel(1, vpss->regs + VPSS_START);
-
-	deadline = jiffies + msecs_to_jiffies(200);
-	do {
-		st = readl(vpss->regs + VPSS_INTSTATE);
-		/* A single-image chain may report either the node or the chain
-		 * end; either means the frame is written.
-		 */
-		if (st & (VPSS_INTSTATE_EOF | VPSS_INTSTATE_DONE)) {
-			writel(st, vpss->regs + VPSS_INTCLR);
-			return 0;
-		}
+	for (attempt = 1; ; attempt++) {
 		/*
-		 * A block that has said "no" does not change its mind by waiting,
-		 * so report it now instead of spending the timeout on a poll. Only
-		 * its own timeout word maps to ETIMEDOUT; the rest are faults.
+		 * The state bits are latched: a completion left over from the
+		 * previous job would end this one before the block had even
+		 * started.
 		 */
-		if (st & VPSS_INTSTATE_ERRORS) {
-			writel(st, vpss->regs + VPSS_INTCLR);
-			dev_err(vpss->dev, "job failed: intstate %#x (%s)\n", st,
-				histb_vpss_err_name(st));
-			if (st & VPSS_INTSTATE_TIMEOUT)
-				return -ETIMEDOUT;
-			return -EIO;
+		writel(0xffffffff, vpss->regs + VPSS_INTCLR);
+		if (vpss->var->arm_detector) {
+			writel(VPSS4_MST_AXI_DET_EN,
+			       vpss->regs + VPSS4_MST_DEBUG_CLR);
+			writel(VPSS4_MST_AXI_DET_EN,
+			       vpss->regs + VPSS4_MST_DEBUG_CTRL);
 		}
-		usleep_range(200, 400);
-	} while (time_before(jiffies, deadline));
+		writel(lower_32_bits(first), vpss->regs + VPSS_PNEXT);
+		writel(1, vpss->regs + VPSS_START);
 
-	dev_warn(vpss->dev, "job timed out, intstate %#x\n", st);
+		deadline = jiffies + msecs_to_jiffies(1000);
+		do {
+			st = readl(vpss->regs + (vpss->var->status_from_raw ?
+						 VPSS4_RAWINT : VPSS_INTSTATE));
+			/* A single-image chain may report either the node or the
+			 * chain end; either means the frame is written.
+			 */
+			if (st & vpss->var->done) {
+				writel(st, vpss->regs + VPSS_INTCLR);
+				return 0;
+			}
+			/*
+			 * A block that has said "no" does not change its mind by
+			 * waiting, so report it now instead of spending the timeout
+			 * on a poll. Only its own timeout word maps to ETIMEDOUT;
+			 * the rest are faults.
+			 */
+			if (st & vpss->var->errors) {
+				writel(st, vpss->regs + VPSS_INTCLR);
+				dev_err(vpss->dev, "job failed: status %#x (%s)\n",
+					st, vpss->var->err_name(st));
+				if (st & vpss->var->timeout)
+					return -ETIMEDOUT;
+				return -EIO;
+			}
+			usleep_range(200, 400);
+		} while (time_before(jiffies, deadline));
+
+		acted = st;
+		if (vpss->var->arm_detector)
+			acted |= readl(vpss->regs + VPSS4_PFCNT);
+		if (acted || attempt == attempts)
+			break;
+		/* Nothing reached the bus, so starting over cannot duplicate work
+		 * the block already did.
+		 */
+		writel(0xffffffff, vpss->regs + VPSS_INTCLR);
+		if (histb_vpss_reset(vpss))
+			return -EIO;
+		dev_info(vpss->dev,
+			 "chain %llx left no trace, re-arming the block\n",
+			 (unsigned long long)first);
+	}
+
+	dev_warn(vpss->dev, "job timed out, status %#x\n", st);
 	writel(0xffffffff, vpss->regs + VPSS_INTCLR);
 	if (histb_vpss_reset(vpss))
 		return -EIO;
@@ -940,7 +1247,7 @@ static int histb_vpss_run(struct histb_vpss *vpss,
 	struct histb_vpss_pass p = { 0 };
 
 	histb_vpss_pass_fill(&p, job);
-	return histb_vpss_pass_run(vpss, &p);
+	return vpss->var->pass_run(vpss, &p);
 }
 
 /*
@@ -1500,14 +1807,18 @@ static int histb_vpss_ctrls_create(struct histb_vpss_ctx *ctx)
 	v4l2_ctrl_handler_init(hdl, 5);
 	ctx->hflip = v4l2_ctrl_new_std(hdl, NULL, V4L2_CID_HFLIP, 0, 1, 1, 0);
 	ctx->vflip = v4l2_ctrl_new_std(hdl, NULL, V4L2_CID_VFLIP, 0, 1, 1, 0);
-	ctx->sharpness = v4l2_ctrl_new_std(hdl, NULL, V4L2_CID_SHARPNESS, 0, 255,
-					   1, 0);
-	ctx->rotate = v4l2_ctrl_new_std(hdl, NULL, V4L2_CID_ROTATE, 0, 270, 90, 0);
-	ctx->dei_ctrl = v4l2_ctrl_new_std_menu_items(hdl, NULL,
-						     V4L2_CID_DEINTERLACING_MODE,
-						     VPSS_DEI_MAD, 0,
-						     VPSS_DEI_NONE,
-						     histb_vpss_dei_menu);
+	if (ctx->vpss->var->scaling) {
+		ctx->sharpness = v4l2_ctrl_new_std(hdl, NULL, V4L2_CID_SHARPNESS,
+						   0, 255, 1, 0);
+		ctx->rotate = v4l2_ctrl_new_std(hdl, NULL, V4L2_CID_ROTATE, 0,
+						270, 90, 0);
+	}
+	if (ctx->vpss->var->deinterlacing)
+		ctx->dei_ctrl = v4l2_ctrl_new_std_menu_items(hdl, NULL,
+							     V4L2_CID_DEINTERLACING_MODE,
+							     VPSS_DEI_MAD, 0,
+							     VPSS_DEI_NONE,
+							     histb_vpss_dei_menu);
 	if (hdl->error)
 		return hdl->error;
 
@@ -1642,7 +1953,7 @@ static int histb_vpss_reset(struct histb_vpss *vpss)
 
 	deadline = jiffies + msecs_to_jiffies(20);
 	do {
-		if (readl(vpss->regs + VPSS_VERSION) == vpss->version)
+		if (readl(vpss->regs + vpss->var->version) == vpss->version)
 			return 0;
 		usleep_range(200, 400);
 	} while (time_before(jiffies, deadline));
@@ -1658,6 +1969,10 @@ static int histb_vpss_runtime_suspend(struct device *dev)
 {
 	struct histb_vpss *vpss = dev_get_drvdata(dev);
 
+	if (vpss->rst_smmu)
+		reset_control_assert(vpss->rst_smmu);
+	if (vpss->smmu_clk)
+		clk_disable_unprepare(vpss->smmu_clk);
 	clk_disable_unprepare(vpss->clk);
 	return 0;
 }
@@ -1670,12 +1985,40 @@ static int histb_vpss_runtime_resume(struct device *dev)
 	ret = clk_prepare_enable(vpss->clk);
 	if (ret)
 		return ret;
+	/* The accessor's own transactions cross this block's translation unit
+	 * even while that unit is bypassed, so it needs its clock too: with the
+	 * clock off every fetch the job makes is answered with a bus error.
+	 */
+	if (vpss->smmu_clk) {
+		ret = clk_prepare_enable(vpss->smmu_clk);
+		if (ret) {
+			clk_disable_unprepare(vpss->clk);
+			return ret;
+		}
+	}
+	/* The unit has to be let out of reset only once its clock runs, the same
+	 * order the block's own reset below needs.
+	 */
+	if (vpss->rst_smmu) {
+		ret = reset_control_deassert(vpss->rst_smmu);
+		if (ret) {
+			if (vpss->smmu_clk)
+				clk_disable_unprepare(vpss->smmu_clk);
+			clk_disable_unprepare(vpss->clk);
+			return ret;
+		}
+	}
 	/*
 	 * Coming back means the block lost its clock, so start from a known
 	 * state instead of trusting registers that are now whatever the power
 	 * domain left. The job itself re-programs everything it needs.
 	 */
-	return histb_vpss_reset(vpss);
+	ret = histb_vpss_reset(vpss);
+	if (ret)
+		return ret;
+	if (vpss->var->power_up)
+		vpss->var->power_up(vpss);
+	return 0;
 }
 
 static const struct dev_pm_ops histb_vpss_pm_ops = {
@@ -1722,6 +2065,9 @@ static int histb_vpss_probe(struct platform_device *pdev)
 		return ret;
 
 	vpss->dev = &pdev->dev;
+	vpss->var = of_device_get_match_data(&pdev->dev);
+	if (!vpss->var)
+		return dev_err_probe(&pdev->dev, -ENODEV, "no generation data\n");
 	mutex_init(&vpss->lock);
 	init_completion(&vpss->done);
 
@@ -1733,13 +2079,25 @@ static int histb_vpss_probe(struct platform_device *pdev)
 	if (IS_ERR(vpss->clk))
 		return dev_err_probe(&pdev->dev, PTR_ERR(vpss->clk),
 				     "no vpss clock\n");
+	vpss->smmu_clk = devm_clk_get_optional(&pdev->dev, "vpss-smmu");
+	if (IS_ERR(vpss->smmu_clk))
+		return dev_err_probe(&pdev->dev, PTR_ERR(vpss->smmu_clk),
+				     "no vpss-smmu clock\n");
 	vpss->rst = devm_reset_control_get_exclusive(&pdev->dev, "vpss");
 	if (IS_ERR(vpss->rst))
 		return dev_err_probe(&pdev->dev, PTR_ERR(vpss->rst),
 				     "no vpss reset\n");
+	/* The translation unit beside the block has its own reset line, and it
+	 * answers in reset until that line is released.
+	 */
+	vpss->rst_smmu = devm_reset_control_get_optional_exclusive(&pdev->dev,
+							   "vpss-smmu");
+	if (IS_ERR(vpss->rst_smmu))
+		return dev_err_probe(&pdev->dev, PTR_ERR(vpss->rst_smmu),
+				     "no vpss-smmu reset\n");
 
 	vpss->shadow = dma_alloc_coherent(&pdev->dev,
-					  VPSS_REG_IMAGE_SIZE * HISTB_VPSS_IMAGES,
+					  vpss->var->image_size * HISTB_VPSS_IMAGES,
 					  &vpss->shadow_dma, GFP_KERNEL);
 	if (!vpss->shadow)
 		return -ENOMEM;
@@ -1768,9 +2126,12 @@ static int histb_vpss_probe(struct platform_device *pdev)
 	/* Remember what the block answers with, so a later reset can tell
 	 * "back up" from "the window stopped decoding".
 	 */
-	vpss->version = readl(vpss->regs + VPSS_VERSION);
-	if (!vpss->version) {
-		dev_err(&pdev->dev, "block does not answer (VPSS_VERSION reads 0)\n");
+	vpss->version = readl(vpss->regs + vpss->var->version);
+	if (!vpss->version ||
+	    (vpss->var->version_expect && vpss->version != vpss->var->version_expect)) {
+		dev_err(&pdev->dev, "block does not answer as expected (id word reads %#010x, "
+			"wanted %#010x)\n",
+			vpss->version, vpss->var->version_expect);
 		ret = -ENODEV;
 		goto err_pm;
 	}
@@ -1806,7 +2167,7 @@ err_pm_disable:
 	dma_free_coherent(vpss->dev, VPSS_COEF_BYTES, vpss->coef,
 			  vpss->coef_dma);
 err_shadow:
-	dma_free_coherent(vpss->dev, VPSS_REG_IMAGE_SIZE * HISTB_VPSS_IMAGES,
+	dma_free_coherent(vpss->dev, vpss->var->image_size * HISTB_VPSS_IMAGES,
 			  vpss->shadow, vpss->shadow_dma);
 	return ret;
 }
@@ -1833,14 +2194,15 @@ static void histb_vpss_remove(struct platform_device *pdev)
 	pm_runtime_suspend(&pdev->dev);
 	pm_runtime_dont_use_autosuspend(&pdev->dev);
 	pm_runtime_disable(&pdev->dev);
-	dma_free_coherent(vpss->dev, VPSS_REG_IMAGE_SIZE * HISTB_VPSS_IMAGES,
+	dma_free_coherent(vpss->dev, vpss->var->image_size * HISTB_VPSS_IMAGES,
 			  vpss->shadow, vpss->shadow_dma);
 	dma_free_coherent(vpss->dev, VPSS_COEF_BYTES, vpss->coef,
 			  vpss->coef_dma);
 }
 
 static const struct of_device_id histb_vpss_of_match[] = {
-	{ .compatible = "hisilicon,hi3798mv100-vpss" },
+	{ .compatible = "hisilicon,hi3798mv100-vpss", .data = &histb_vpss_v3 },
+	{ .compatible = "hisilicon,hi3798mv200-vpss", .data = &histb_vpss_v4 },
 	{ }
 };
 MODULE_DEVICE_TABLE(of, histb_vpss_of_match);
