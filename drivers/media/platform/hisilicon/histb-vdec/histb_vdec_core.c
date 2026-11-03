@@ -1044,6 +1044,8 @@ static const struct of_device_id histb_vdec_of_match[] = {
 	  .data = &histb_vdec_v2_mv100_variant },
 	{ .compatible = "hisilicon,hi3716cv200-vdec",
 	  .data = &histb_vdec_v2_cv200_variant },
+	{ .compatible = "hisilicon,hi3798mv200-vdec",
+	  .data = &histb_vdec_v5_mv200h_variant },
 	{ }
 };
 MODULE_DEVICE_TABLE(of, histb_vdec_of_match);

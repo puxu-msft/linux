@@ -14,14 +14,19 @@ config VIDEO_HISTB_VDEC
 	  request controls, and the hardware decodes H.264, HEVC, MPEG-2,
 	  MPEG-4 and H.263 into NV21 frames.
 
-	  This backend serves the Hi3716CV200 part (HiVDHV200R004) and the
-	  Hi3798MV100 part (HiVDHV300R001): both pack fully parsed syntax into
-	  a downstream message pool and write 16x16-tiled frames, and the V2
-	  part has no HEVC path, so HEVC is offered only on Hi3798MV100.
+	  Two hardware generations are covered. The v2 backend serves the
+	  Hi3716CV200 part (HiVDHV200R004) and the Hi3798MV100 part
+	  (HiVDHV300R001): both pack fully parsed syntax into a downstream
+	  message pool and write 16x16-tiled frames, and the V2 part has no
+	  HEVC path, so HEVC is offered only on Hi3798MV100. The v5 backend
+	  drives the HiVDHV5R6C02 block of hi3798mv200h, which takes a command
+	  image and writes NV21 in 16-row bands.
 
-	  The backend suffix is the hardware generation it starts from: v2
-	  covers VDH V2/V3. It is not the vendor's vdec_vX.Y layer number,
-	  which counts these parts the other way round (vdec_v1.0 for these).
+	  The backend suffix is the hardware generation it starts from, taken
+	  the same way in both video blocks: v2 covers VDH V2/V3, v5 covers VDH
+	  V5R6. It is not the vendor's vdec_vX.Y layer number, which counts
+	  these parts the other way round (vdec_v1.0 for the v2 backends,
+	  vdec_v2.1 for the v5 ones).
 
 	  To compile this driver as a module, choose M here: the module will be
 	  called histb-vdec.

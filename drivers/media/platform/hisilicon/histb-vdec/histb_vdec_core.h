@@ -164,6 +164,7 @@ struct histb_vdec_variant {
 
 extern const struct histb_vdec_variant histb_vdec_v2_mv100_variant;
 extern const struct histb_vdec_variant histb_vdec_v2_cv200_variant;
+extern const struct histb_vdec_variant histb_vdec_v5_mv200h_variant;
 
 /* Registration and teardown of the media node; called by a backend's probe. */
 int histb_vdec_core_init(struct histb_vdec_common *common,
