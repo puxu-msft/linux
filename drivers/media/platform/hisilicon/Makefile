@@ -3,3 +3,4 @@ obj-y += histb-vdec/
 obj-y += histb-venc/
 obj-$(CONFIG_VIDEO_HISTB_JPGD) += histb-jpgd.o
 obj-$(CONFIG_VIDEO_HISTB_JPGE) += histb-jpge.o
+obj-$(CONFIG_VIDEO_HISTB_VPSS) += histb-vpss.o
