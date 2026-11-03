@@ -88,6 +88,8 @@ static const struct of_device_id histb_venc_of_match[] = {
 	  .data = &histb_venc_v2_variant },
 	{ .compatible = "hisilicon,hi3716cv200-venc",
 	  .data = &histb_venc_v2_variant },
+	{ .compatible = "hisilicon,hi3798mv200-venc",
+	  .data = &histb_venc_v5_variant },
 	{ }
 };
 MODULE_DEVICE_TABLE(of, histb_venc_of_match);

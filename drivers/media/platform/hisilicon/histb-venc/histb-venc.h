@@ -29,8 +29,11 @@ struct histb_venc_variant {
 };
 
 extern const struct histb_venc_variant histb_venc_v2_variant;
+extern const struct histb_venc_variant histb_venc_v5_variant;
 
 int histb_venc_v2_probe(struct platform_device *pdev);
 void histb_venc_v2_remove(struct platform_device *pdev);
+int histb_venc_v5_probe(struct platform_device *pdev);
+void histb_venc_v5_remove(struct platform_device *pdev);
 
 #endif /* __HISTB_VENC_H__ */

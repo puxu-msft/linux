@@ -9,14 +9,21 @@ config VIDEO_HISTB_VENC
 	select V4L2_MEM2MEM_DEV
 	help
 	  Support for the VEDU video encoder family on HiSilicon HiSTB
-	  set-top-box SoCs. The encoder is stateful: a raw picture goes in and
-	  H.264 network abstraction layer data comes out, with the parameter
-	  sets and the slice headers written by the driver.
+	  set-top-box SoCs. Both generations are stateful encoders: a raw
+	  picture goes in and H.264 network abstraction layer data comes out,
+	  with the parameter sets and the slice headers written by the driver.
 
-	  This backend serves the v2 VEDU of Hi3716CV200 and Hi3798MV100 -- the
-	  part the vendor calls V2R8, built through its venc_v1.0 layer. It is
-	  programmed with register writes and a 64-byte packet ring, and codes
-	  IDR pictures only.
+	  The v2 VEDU of hi3716cv200 and hi3798mv100 -- the part the vendor
+	  calls V2R8, built through its venc_v1.0 layer -- is programmed by
+	  register writes and a 64-byte packet ring, and codes IDR pictures. The
+	  v5 V500 of hi3798mv200h (HiVEDUV500R001, the venc_v2.0 layer) takes a
+	  command image in DMA memory, owns a memory-management unit and codes P
+	  pictures too.
+
+	  The backend suffix is the hardware generation the block belongs to,
+	  taken the same way in both video blocks: v2 is this family's VEDU V2R8
+	  and VDH V2/V3, v5 is VEDU V500 and VDH V5R6. It is not the vendor's
+	  venc_vX.Y layer number, which counts the other way round.
 
 	  To compile this driver as a module, choose M here: the module will be
 	  called histb-venc.
