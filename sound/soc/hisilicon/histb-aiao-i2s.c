@@ -94,7 +94,18 @@
 #define   TX_PRECISION			GENMASK(3, 2)
 #define   TX_CH_NUM			GENMASK(5, 4)
 #define   TX_SD_OFFSET			GENMASK(15, 8)
+#define   TX_TRACKMODE			GENMASK(18, 16)
+/*
+ * Which serializer this port's samples leave through: 1 = the I2S pins,
+ * 0 = the SPDIF one (the vendor's SND_OP_TYPE_I2S is 1 and SND_OP_TYPE_SPDIF
+ * is 0, and this field is written straight from that enum).
+ */
+#define   TX_SPD_I2S_SEL		BIT(19)
 #define   TX_SD_SOURCE_SEL		GENMASK(23, 20)
+#define   TX_SD0_SEL			GENMASK(25, 24)
+#define   TX_SD1_SEL			GENMASK(27, 26)
+#define   TX_SD2_SEL			GENMASK(29, 28)
+#define   TX_SD3_SEL			GENMASK(31, 30)
 #define  TX_DSP_CTRL			0x04
 #define   TX_BYPASS_EN			BIT(27)
 #define   TX_ENABLE			BIT(28)
@@ -118,6 +129,7 @@
 #define AIAO_BCLK_DIV_IDX		3	/* index 3 of the bclk divider table selects 4 */
 #define AIAO_FSCLK_DIV_IDX		3	/* index 3 of the fs divider table selects 64 */
 
+#define AIAO_BUFFER_ALIGN		128
 #define AIAO_PERIOD_BYTES_MAX		4096
 #define AIAO_BUFFER_BYTES		(8 * AIAO_PERIOD_BYTES_MAX)
 
@@ -172,6 +184,8 @@ struct histb_aiao_port_spec {
 struct histb_aiao_variant {
 	const struct histb_aiao_port_spec *ports;
 	unsigned int num_ports;
+	u8 tx_sd_offset;
+	bool tx_sd_own_lanes;
 };
 
 struct histb_aiao {
@@ -239,6 +253,7 @@ static int histb_aiao_tx_hw_params(struct snd_pcm_substream *substream,
 {
 	struct snd_pcm_runtime *runtime = substream->runtime;
 	unsigned int period = params_period_bytes(params);
+	u32 val;
 
 	/*
 	 * Route this port's bit clock and frame sync to its own clock
@@ -249,13 +264,17 @@ static int histb_aiao_tx_hw_params(struct snd_pcm_substream *substream,
 				   AIAO_TX_CRG_SRC(port->id));
 
 	/*
-	 * I2S, 16-bit, two channels, one bit of delay before the first sample,
-	 * and the port's own serial-data lanes selected.
+	 * I2S out through this port's own serializer, 16-bit, two channels,
+	 * the port's own serial-data lanes selected.
 	 */
-	writel(FIELD_PREP(TX_MODE, 0) | FIELD_PREP(TX_PRECISION, 1) |
-	       FIELD_PREP(TX_CH_NUM, 1) | FIELD_PREP(TX_SD_OFFSET, 1) |
-	       FIELD_PREP(TX_SD_SOURCE_SEL, port->id),
-	       port->regs + TX_IF_ATTRI);
+	val = FIELD_PREP(TX_MODE, 0) | FIELD_PREP(TX_PRECISION, 1) |
+	      FIELD_PREP(TX_CH_NUM, 1) | TX_SPD_I2S_SEL |
+	      FIELD_PREP(TX_SD_OFFSET, aiao->variant->tx_sd_offset) |
+	      FIELD_PREP(TX_SD_SOURCE_SEL, port->id);
+	if (aiao->variant->tx_sd_own_lanes)
+		val |= FIELD_PREP(TX_SD0_SEL, 0) | FIELD_PREP(TX_SD1_SEL, 1) |
+		       FIELD_PREP(TX_SD2_SEL, 2) | FIELD_PREP(TX_SD3_SEL, 3);
+	writel(val, port->regs + TX_IF_ATTRI);
 	/* The port's mute/volume stage stays bypassed; bit0 there would silence. */
 	writel(TX_BYPASS_EN, port->regs + TX_DSP_CTRL);
 
@@ -665,11 +684,13 @@ static const struct histb_aiao_port_spec hi3798mv200_ports[] = {
 static const struct histb_aiao_variant hi3798mv100_aiao = {
 	.ports = hi3798mv100_ports,
 	.num_ports = ARRAY_SIZE(hi3798mv100_ports),
+	.tx_sd_offset = 1,
 };
 
 static const struct histb_aiao_variant hi3798mv200_aiao = {
 	.ports = hi3798mv200_ports,
 	.num_ports = ARRAY_SIZE(hi3798mv200_ports),
+	.tx_sd_own_lanes = true,
 };
 
 /*
