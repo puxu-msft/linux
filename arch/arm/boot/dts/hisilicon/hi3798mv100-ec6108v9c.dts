@@ -328,6 +328,11 @@
 	status = "okay";
 };
 
+&vpss {
+	memory-region = <&media_cma>;
+	status = "okay";
+};
+
 &jpgd {
 	memory-region = <&media_cma>;
 	status = "okay";

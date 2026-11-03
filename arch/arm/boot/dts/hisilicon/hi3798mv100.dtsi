@@ -60,6 +60,17 @@
 		status = "disabled";
 	};
 
+	vpss: video-processor@8cb0000 {
+		compatible = "hisilicon,hi3798mv100-vpss";
+		reg = <0x8cb0000 0x10000>;
+		interrupts = <GIC_SPI 93 IRQ_TYPE_LEVEL_HIGH>;
+		clocks = <&crg HI3798MV100_VPSS_CLK>;
+		clock-names = "vpss";
+		resets = <&crg 0xf0 4>;
+		reset-names = "vpss";
+		status = "disabled";
+	};
+
 	vdec: video-codec@8c30000 {
 		compatible = "hisilicon,hi3798mv100-vdec";
 		reg = <0x8c30000 0x1100>, <0x8c3c000 0x1000>;
