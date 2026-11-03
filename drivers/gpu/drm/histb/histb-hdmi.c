@@ -18,6 +18,7 @@
 #include <linux/clk.h>
 #include <linux/component.h>
 #include <linux/delay.h>
+#include <linux/hdmi.h>
 #include <linux/i2c.h>
 #include <linux/iopoll.h>
 #include <linux/mutex.h>
@@ -31,6 +32,7 @@
 
 #include <drm/drm_atomic_state_helper.h>
 #include <drm/drm_bridge.h>
+#include <drm/display/drm_hdmi_state_helper.h>
 #include <drm/drm_connector.h>
 #include <drm/drm_device.h>
 #include <drm/drm_edid.h>
@@ -39,9 +41,9 @@
 
 /*
  * Digital window. Offsets and bit layouts are the ones in the SDK's register
- * file for this part;
- * the reset value of TX_PWD_RST_CTRL, where only the HDCP 2.2 MCU request bit
- * is set, was read back from a board running the vendor's own system.
+ * file for this part; the reset value of TX_PWD_RST_CTRL, where only the
+ * HDCP 2.2 MCU request bit is set, was read back from a board running the
+ * vendor's own system.
  */
 #define TX_PWD_RST_CTRL		0x0010
 #define  TX_PWD_SRST		BIT(0)
@@ -59,6 +61,34 @@
 #define  TX_PWD_HELD		(TX_HDCP2X_SRST | TX_MCU_SRST)
 
 #define VIDEO_DMUX_CTRL		0x09a8
+/*
+ * Video path (TX + 0x800) -- hal/ctrl/hisiv100/regs/hdmi_reg_video_path.h.
+ * The two halves of this block decide the question the panel cannot answer for
+ * us on this board: VIDEO_PATH_CTRL bit 0 blanks the outgoing video (so a set
+ * bit means black even with a live source), and the FORMAT DETECTOR measures the
+ * timing that actually arrives from the VDP -- hsync_active_cnt [12:0] and
+ * hsync_total_cnt [25:13] at +0x8c0, the vertical pair at +0x8c4, flags
+ * interlaced[0]/hsync[1]/vsync[2] at +0x8bc.  FDET_STATUS is latched: the
+ * vendor re-arms it by clearing bit 3 of +0x8b8 and raising it again.
+ */
+#define TIMING_GEN_CTRL		0x0800
+#define   TG_GEN_EN			BIT(0)
+#define   TG_EXTMODE			BIT(1)
+#define   TG_TIMING_SEL			GENMASK(7, 2)
+#define VIDEO_PATH_CTRL		0x0830
+#define   VIDEO_BLANK_EN		BIT(0)
+#define FORMAT_DET_CONFIG	0x08b8
+#define   FDET_SYNC_FORCE		BIT(0)
+#define   FDET_HSYNC_POL_VAL		BIT(1)
+#define   FDET_VSYNC_POL_VAL		BIT(2)
+#define   FDET_STATUS_CLEAR		BIT(3)
+#define   FDET_PIXEL_CNT_THREHOLD	GENMASK(7, 4)
+#define FDET_STATUS			0x08bc
+#define   FDET_INTERLACED		BIT(0)
+#define FDET_HORI_RES		0x08c0
+#define FDET_VERT_RES		0x08c4
+#define   FDET_ACTIVE			GENMASK(12, 0)
+#define   FDET_TOTAL			GENMASK(25, 13)
 
 #define  DMUX_SYNCMASK_EN	GENMASK(24, 21)
 #define  DMUX_INVER_SYNC	GENMASK(28, 25)
@@ -66,11 +96,34 @@
 #define  DMUX_INVER_H		BIT(1)
 #define  DMUX_INVER_DE		BIT(3)
 
+#define VIDEO_DITHER_CTRL	0x08ec
+#define  DITHER_MODE_8BIT	(2 << 1)
+#define VIDEO_CSC_CTRL		0x0934
+#define  CSC_MODE_RGB8		(0x88 << 4)
+#define  CSC_EN			BIT(0)
+#define  CSC_SATURATE_EN	BIT(3)
+#define VIDEO_DWSM_CTRL		0x0980
+#define  DWSM_VERT_BYPASS	BIT(3)
+#define VIDEO_DATA_ALIGN	0x098c
+#define PACK_FIFO_CTRL		0x1800
+#define  PACK_FIFO_AUTO_RST_EN	BIT(2)
+#define  PACK_FIFO_CK_DET_EN	BIT(4)
+/* R->Cr, G->Y, B->Cb puts native RGB lanes on the three TMDS channels. */
+#define  DMUX_NATIVE_RGB	0x11
+#define AVI_PACKET		0x1818
+#define AVI_PACKET_CFG		0x19a4
+#define HDMI_VS_PACKET		0x1980
+#define HDMI_VS_PACKET_CFG	0x19d0
+#define  PACKET_CFG_DISABLE	0
+#define  PACKET_CFG_ENABLE	3
+#define AVMUTE_CTRL		0x1a0c
 #define AVMIXER_CONFIG		0x1a08
 #define  AVMIX_HDMI_MODE	BIT(0)
+#define  AVMIX_NULL_PKT_EN	BIT(2)
 
 #define HDMI_ENC_CTRL		0x1a60
 #define  ENC_HDMI2_ON		BIT(0)
+#define  ENC_HDMI2_SEL		BIT(1)	/* set by the 2.0 timing rows only */
 #define  ENC_BYPASS		BIT(5)
 #define  ENC_CK_DIV_SEL		GENMASK(7, 6)
 
@@ -262,6 +315,7 @@ struct histb_hdmi_ddc {
 	struct mutex lock;
 };
 
+
 #define HISTB_HDMI_MAX_KHZ	600000
 
 struct histb_hdmi {
@@ -412,6 +466,34 @@ static enum drm_mode_status histb_hdmi_mode_valid(struct drm_bridge *bridge,
 	return MODE_OK;
 }
 
+/*
+ * Colour format.  The transmitter's own converter is what makes YCbCr444 out
+ * of the RGB the display interface hands over; the mode byte selects the
+ * direction, colourimetry and quantization range (bit 7 RGB in, bit 6 full
+ * range in, bits [5:4] colourimetry in, bit 3 RGB out, bit 2 full range out,
+ * bits [1:0] colourimetry out, at [11:4] in the register).  RGB is declared
+ * with the converter off.  The YCbCr output is limited range: asking the
+ * converter for full range stops the packer on this part, so the mode leaves
+ * bit 2 clear and the infoframe says limited.
+ */
+static void histb_hdmi_color_csc(struct histb_hdmi *hdmi, bool yuv444, u32 khz)
+{
+	u32 val;
+
+	if (!yuv444) {
+		histb_hdmi_write(hdmi, VIDEO_DMUX_CTRL, DMUX_NATIVE_RGB);
+		val = CSC_MODE_RGB8;
+	} else {
+		u32 cm = khz > 27000 ? 1 : 0;
+
+		histb_hdmi_write(hdmi, VIDEO_DMUX_CTRL, DMUX_NATIVE_RGB);
+		val = ((BIT(7) | BIT(6) | cm << 4 | cm) << 4) |
+		      CSC_EN | CSC_SATURATE_EN;
+	}
+
+	histb_hdmi_write(hdmi, VIDEO_CSC_CTRL, val);
+}
+
 static int histb_hdmi_atomic_check(struct drm_bridge *bridge,
 				   struct drm_bridge_state *bridge_state,
 				   struct drm_crtc_state *crtc_state,
@@ -422,17 +504,27 @@ static int histb_hdmi_atomic_check(struct drm_bridge *bridge,
 	if (!histb_hdmi_phy_cfg(mode->clock) || mode->clock > HISTB_HDMI_MAX_KHZ)
 		return -EINVAL;
 
+	/* The converter always produces limited-range YCbCr. */
+	if (conn_state->hdmi.output_format == DRM_OUTPUT_COLOR_FORMAT_YCBCR444)
+		conn_state->hdmi.is_limited_range = true;
+
 	return 0;
 }
+
+
+static int histb_hdmi_write_avi_infoframe(struct drm_bridge *bridge,
+					  const u8 *buffer, size_t length);
 
 static void histb_hdmi_atomic_enable(struct drm_bridge *bridge,
 				     struct drm_atomic_commit *commit)
 {
 	struct histb_hdmi *hdmi = bridge_to_histb_hdmi(bridge);
 	struct drm_device *drm = bridge->dev;
+	struct drm_connector *connector;
+	struct drm_connector_state *conn_state;
 	const struct drm_display_mode *mode;
 	const struct histb_hdmi_phy_cfg *cfg;
-	u32 invers;
+	bool yuv444;
 	int ret;
 
 	mode = &bridge->encoder->crtc->state->adjusted_mode;
@@ -480,25 +572,57 @@ static void histb_hdmi_atomic_enable(struct drm_bridge *bridge,
 		goto err_resets;
 	}
 
-	/* Pass the channel's syncs through, inverted as the mode asks. */
-	invers = FIELD_PREP(DMUX_INVER_SYNC,
-			    (mode->flags & DRM_MODE_FLAG_NVSYNC ? DMUX_INVER_V : 0) |
-			    (mode->flags & DRM_MODE_FLAG_NHSYNC ? DMUX_INVER_H : 0));
-	histb_hdmi_write(hdmi, VIDEO_DMUX_CTRL,
-			 (histb_hdmi_read(hdmi, VIDEO_DMUX_CTRL) &
-			  ~(DMUX_INVER_SYNC | DMUX_SYNCMASK_EN)) | invers);
+	connector = drm_atomic_get_new_connector_for_encoder(commit,
+							     bridge->encoder);
+	conn_state = connector ?
+		drm_atomic_get_new_connector_state(commit, connector) : NULL;
+	yuv444 = conn_state &&
+		 conn_state->hdmi.output_format ==
+		 DRM_OUTPUT_COLOR_FORMAT_YCBCR444;
+	histb_hdmi_color_csc(hdmi, yuv444, mode->clock);
 
+	/*
+	 * Video path: 8-bit components straight into the encoder, dither and the
+	 * transmitter's own conversion off, one data reset, then the packer's
+	 * clock detection.  Without that last bit the packer emits nothing and a
+	 * sink sees a clock with no data on it.
+	 */
+	histb_hdmi_write(hdmi, VIDEO_DITHER_CTRL, DITHER_MODE_8BIT);
+	histb_hdmi_write(hdmi, VIDEO_DWSM_CTRL, DWSM_VERT_BYPASS);
+	histb_hdmi_write(hdmi, VIDEO_DATA_ALIGN, 0);
+	histb_hdmi_write(hdmi, TIMING_GEN_CTRL,
+			 histb_hdmi_read(hdmi, TIMING_GEN_CTRL) & ~TG_GEN_EN);
+	histb_hdmi_write(hdmi, VIDEO_PATH_CTRL, 0);
+	histb_hdmi_write(hdmi, HDMI_ENC_CTRL,
+			 cfg->hdmi2 ? ENC_HDMI2_ON | ENC_HDMI2_SEL : 0);
 	histb_hdmi_write(hdmi, AVMIXER_CONFIG,
-			 histb_hdmi_read(hdmi, AVMIXER_CONFIG) | AVMIX_HDMI_MODE);
-	ret = histb_hdmi_read(hdmi, HDMI_ENC_CTRL);
-	ret &= ~(ENC_HDMI2_ON | ENC_BYPASS);
-	if (cfg->hdmi2)
-		ret |= ENC_HDMI2_ON;
-	histb_hdmi_write(hdmi, HDMI_ENC_CTRL, ret);
+			 AVMIX_HDMI_MODE | AVMIX_NULL_PKT_EN);
+	histb_hdmi_write(hdmi, AVMUTE_CTRL, 0);
+
+	histb_hdmi_write(hdmi, TX_PWD_RST_CTRL,
+			 TX_HDMI_SRST | TX_AUD_SRST | TX_ACR_SRST |
+			 TX_AFIFO_SRST);
+	udelay(5);
+	histb_hdmi_write(hdmi, TX_PWD_RST_CTRL, 0);
+	histb_hdmi_write(hdmi, PACK_FIFO_CTRL,
+			 PACK_FIFO_AUTO_RST_EN | PACK_FIFO_CK_DET_EN);
+	usleep_range(1000, 2000);
+
+	/*
+	 * Push the infoframes the sink needs to interpret the lanes; without
+	 * them it has to guess, and the guess is not RGB.
+	 */
+	if (connector) {
+		ret = drm_atomic_helper_connector_hdmi_update_infoframes(
+			connector, commit);
+		if (ret)
+			drm_err(drm, "failed to update infoframes: %d\n", ret);
+	}
 
 	/* Drive the pins last: from here a sink can find a clock. */
 	histb_hdmi_phy_write(hdmi, PHY_TOP_PD,
 			     histb_hdmi_phy_read(hdmi, PHY_TOP_PD) & ~PHY_GC_PD);
+
 
 	return;
 
@@ -515,6 +639,7 @@ static void histb_hdmi_atomic_disable(struct drm_bridge *bridge,
 {
 	struct histb_hdmi *hdmi = bridge_to_histb_hdmi(bridge);
 	u32 val;
+
 
 	/* Stop driving before the PLL goes down, the vendor's order. */
 	val = histb_hdmi_phy_read(hdmi, PHY_TOP_PD);
@@ -792,6 +917,72 @@ static const struct drm_edid *histb_hdmi_edid_read(struct drm_bridge *bridge,
 	return drm_edid_read_ddc(connector, bridge->ddc);
 }
 
+/*
+ * Info packets.  The packer takes the three header bytes plus four seven-byte
+ * subpackets, laid out as alternating four- and three-byte words; the config
+ * word enables transmission.  Without an AVI infoframe a sink has to guess how
+ * to read the lanes, and the answer it picks is not the one this pipeline
+ * sends.
+ */
+static int histb_hdmi_write_packet(struct histb_hdmi *hdmi, u32 packet,
+				   u32 cfg, const u8 *buffer, size_t length)
+{
+	unsigned int sub, byte, index;
+	u32 word;
+
+	if (length < 4 || length > 31)
+		return -EINVAL;
+
+	histb_hdmi_write(hdmi, cfg, PACKET_CFG_DISABLE);
+	histb_hdmi_write(hdmi, packet,
+			 buffer[0] | buffer[1] << 8 | buffer[2] << 16);
+	for (sub = 0; sub < 8; sub++) {
+		word = 0;
+		for (byte = 0; byte < (sub & 1 ? 3 : 4); byte++) {
+			index = 3 + (sub / 2) * 7 + (sub & 1 ? 4 : 0) + byte;
+			if (index < length)
+				word |= (u32)buffer[index] << (byte * 8);
+		}
+		histb_hdmi_write(hdmi, packet + 4 + sub * 4, word);
+	}
+	histb_hdmi_write(hdmi, cfg, PACKET_CFG_ENABLE);
+
+	return 0;
+}
+
+static int histb_hdmi_write_avi_infoframe(struct drm_bridge *bridge,
+					  const u8 *buffer, size_t length)
+{
+	return histb_hdmi_write_packet(bridge_to_histb_hdmi(bridge),
+				       AVI_PACKET, AVI_PACKET_CFG,
+				       buffer, length);
+}
+
+static int histb_hdmi_clear_avi_infoframe(struct drm_bridge *bridge)
+{
+	struct histb_hdmi *hdmi = bridge_to_histb_hdmi(bridge);
+
+	histb_hdmi_write(hdmi, AVI_PACKET_CFG, PACKET_CFG_DISABLE);
+
+	return 0;
+}
+
+/*
+ * The transmitter has no HDMI vendor-specific packet slot this driver knows
+ * how to fill; the callbacks exist because the bridge connector requires them,
+ * and accept silently.
+ */
+static int histb_hdmi_write_hdmi_infoframe(struct drm_bridge *bridge,
+					   const u8 *buffer, size_t length)
+{
+	return 0;
+}
+
+static int histb_hdmi_clear_hdmi_infoframe(struct drm_bridge *bridge)
+{
+	return 0;
+}
+
 static const struct drm_bridge_funcs histb_hdmi_bridge_funcs = {
 	.attach = histb_hdmi_attach,
 	.detect = histb_hdmi_detect,
@@ -801,6 +992,10 @@ static const struct drm_bridge_funcs histb_hdmi_bridge_funcs = {
 	.atomic_enable = histb_hdmi_atomic_enable,
 	.atomic_disable = histb_hdmi_atomic_disable,
 	.atomic_create_state = drm_atomic_helper_bridge_create_state,
+	.hdmi_write_avi_infoframe = histb_hdmi_write_avi_infoframe,
+	.hdmi_clear_avi_infoframe = histb_hdmi_clear_avi_infoframe,
+	.hdmi_write_hdmi_infoframe = histb_hdmi_write_hdmi_infoframe,
+	.hdmi_clear_hdmi_infoframe = histb_hdmi_clear_hdmi_infoframe,
 	.atomic_destroy_state = drm_atomic_helper_bridge_destroy_state,
 	.atomic_duplicate_state = drm_atomic_helper_bridge_duplicate_state,
 };
@@ -1297,8 +1492,14 @@ static int histb_hdmi_probe(struct platform_device *pdev)
 
 	hdmi->bridge.of_node = pdev->dev.of_node;
 	hdmi->bridge.type = DRM_MODE_CONNECTOR_HDMIA;
-	hdmi->bridge.ops = DRM_BRIDGE_OP_DETECT | DRM_BRIDGE_OP_EDID;
+	hdmi->bridge.ops = DRM_BRIDGE_OP_DETECT | DRM_BRIDGE_OP_EDID |
+			 DRM_BRIDGE_OP_HDMI;
+	hdmi->bridge.supported_formats =
+		BIT(DRM_OUTPUT_COLOR_FORMAT_RGB444) |
+		BIT(DRM_OUTPUT_COLOR_FORMAT_YCBCR444);
 	hdmi->bridge.ddc = &hdmi->ddc.adapter;
+	hdmi->bridge.vendor = "HISI";
+	hdmi->bridge.product = "Hi3798MV200 HDMI";
 
 	ret = devm_drm_bridge_add(&pdev->dev, &hdmi->bridge);
 	if (ret)

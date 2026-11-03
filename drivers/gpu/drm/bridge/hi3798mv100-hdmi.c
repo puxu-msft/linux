@@ -310,13 +310,10 @@ static const struct sii9134_phy_ops hi3798mv100_hdmi_phy_ops = {
 static void hi3716cv200_hdmi_phy_init(struct sii9134 *sii)
 {
 	/*
-	 * si_phy.c:193-232. Register 0x09 depends on the die revision: the
-	 * vendor branches on bits 15..8 of 0xf8a9007c -- 0x41 is the "EC" part
-	 * whose PHY is the 19 m one and gets 0x00, 0x40 is the original and gets
-	 * 0x1a, and an unknown tag falls back to the original
-	 * (boot/product/driver/hdmi/hdmi_1_4/phy.c:9-32). This board's tag was
-	 * measured as 0x40 from its own boot system, so 0x1a is what the vendor
-	 * would write here.
+	 * Register 0x09 depends on the die revision, read from bits 15..8 of a
+	 * SoC-ID word: the EC part (tag 0x41) has the 19 m PHY and takes 0x00,
+	 * the original (tag 0x40) takes 0x1a, and an unknown tag falls back to
+	 * the original. This part measures tag 0x40, so its PHY gets 0x1a.
 	 */
 	hi3798mv100_hdmi_phy_write(sii, CV200_PHY_CTRL2, 0x89);
 	hi3798mv100_hdmi_phy_write(sii, CV200_PHY_TERM_EN, 0x00);
