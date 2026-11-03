@@ -25,6 +25,7 @@
 
 #include <linux/bitfield.h>
 #include <linux/delay.h>
+#include <linux/dma-mapping.h>
 #include <linux/clk.h>
 #include <linux/component.h>
 #include <linux/io.h>
@@ -68,6 +69,7 @@
 #include <drm/drm_vblank.h>
 #include <drm/drm_writeback.h>
 
+#include "histb-vdp.h"
 #include "histb-vdp2-regs.h"
 
 /*
@@ -206,6 +208,7 @@ static const struct histb_vdp2_chip histb_vdp2_cv200 = {
 };
 
 struct histb_vdp2 {
+	struct histb_vdp	base;
 	struct device		*dev;
 	void __iomem		*regs;
 
@@ -232,12 +235,8 @@ struct histb_vdp2 {
  * released by its unbind.
  */
 struct histb_vdp2_display {
+	struct histb_vdp_display	base;
 	struct histb_vdp2		*vdp;
-	struct drm_device	*drm;
-
-	struct drm_plane	primary;
-	struct drm_crtc		crtc;
-	struct drm_encoder	encoder;
 
 	struct drm_encoder	wb_enc;
 	struct drm_writeback_connector	wb;
@@ -253,14 +252,32 @@ struct histb_vdp2_display {
 	struct drm_writeback_connector *wb_running[2];
 };
 
+static inline struct histb_vdp2_display *
+plane_to_display(struct drm_plane *plane)
+{
+	struct histb_vdp_display *base =
+		container_of(plane, struct histb_vdp_display, primary);
+
+	return container_of(base, struct histb_vdp2_display, base);
+}
+
+static inline struct histb_vdp2_display *
+crtc_to_display(struct drm_crtc *crtc)
+{
+	struct histb_vdp_display *base =
+		container_of(crtc, struct histb_vdp_display, crtc);
+
+	return container_of(base, struct histb_vdp2_display, base);
+}
+
 static inline struct histb_vdp2 *plane_to_vdp(struct drm_plane *plane)
 {
-	return container_of(plane, struct histb_vdp2_display, primary)->vdp;
+	return plane_to_display(plane)->vdp;
 }
 
 static inline struct histb_vdp2 *crtc_to_vdp(struct drm_crtc *crtc)
 {
-	return container_of(crtc, struct histb_vdp2_display, crtc)->vdp;
+	return crtc_to_display(crtc)->vdp;
 }
 
 /*
@@ -1269,8 +1286,10 @@ static int histb_wb_enc_atomic_check(struct drm_encoder *encoder,
 	const struct histb_wb_fmt *fmt;
 	const struct drm_display_mode *mode = &crtc_state->mode;
 	struct histb_vdp2_display *disp;
+	struct histb_vdp_display *base;
 
-	disp = container_of(crtc_state->crtc, struct histb_vdp2_display, crtc);
+	base = container_of(crtc_state->crtc, struct histb_vdp_display, crtc);
+	disp = container_of(base, struct histb_vdp2_display, base);
 
 	fb = conn_state->writeback_job ? conn_state->writeback_job->fb : NULL;
 	if (!conn_state->writeback_job || !conn_state->writeback_job->fb)
@@ -1333,10 +1352,10 @@ static int histb_wb_one(struct histb_vdp2_display *disp,
 			struct drm_encoder *enc, struct drm_writeback_connector *wb,
 			const u32 *fmts, unsigned int n_fmts, const char *name)
 {
-	struct drm_device *drm = disp->drm;
+	struct drm_device *drm = disp->base.drm;
 	int ret;
 
-	enc->possible_crtcs = drm_crtc_mask(&disp->crtc);
+	enc->possible_crtcs = drm_crtc_mask(&disp->base.crtc);
 	ret = drmm_encoder_init(drm, enc, NULL, DRM_MODE_ENCODER_VIRTUAL, name);
 	if (ret)
 		return ret;
@@ -1379,9 +1398,9 @@ static int histb_wb_init(struct histb_vdp2_display *disp)
 	 * cloneable before it accepts such a commit.
 	 */
 	/* every encoder of the CRTC has to list the others as cloneable */
-	both = drm_encoder_mask(&disp->encoder) | drm_encoder_mask(&disp->wb_enc) |
+	both = drm_encoder_mask(&disp->base.encoder) | drm_encoder_mask(&disp->wb_enc) |
 	       drm_encoder_mask(&disp->wb_gp0_enc);
-	disp->encoder.possible_clones = both;
+	disp->base.encoder.possible_clones = both;
 	disp->wb_enc.possible_clones = both;
 	disp->wb_gp0_enc.possible_clones = both;
 
@@ -1963,7 +1982,7 @@ static void histb_vdp2_crtc_atomic_enable(struct drm_crtc *crtc,
 	 * stage both follow that decision.
 	 */
 	conn = drm_atomic_get_new_connector_for_encoder(state,
-							&vdp->disp->encoder);
+							&vdp->disp->base.encoder);
 	conn_state = conn ? drm_atomic_get_new_connector_state(state, conn) :
 			    NULL;
 	yuv444 = conn_state && conn_state->hdmi.output_format ==
@@ -2023,8 +2042,7 @@ static void histb_vdp2_crtc_atomic_disable(struct drm_crtc *crtc,
 					 struct drm_atomic_commit *state)
 {
 	struct histb_vdp2 *vdp = crtc_to_vdp(crtc);
-	struct histb_vdp2_display *disp = container_of(crtc,
-						  struct histb_vdp2_display, crtc);
+	struct histb_vdp2_display *disp = crtc_to_display(crtc);
 	unsigned int tap;
 	u32 ctrl;
 
@@ -2087,8 +2105,7 @@ static void histb_vdp2_crtc_atomic_flush(struct drm_crtc *crtc,
 				       struct drm_atomic_commit *state)
 {
 	struct drm_crtc_state *new_state = drm_atomic_get_new_crtc_state(state, crtc);
-	struct histb_vdp2_display *disp = container_of(crtc,
-						  struct histb_vdp2_display, crtc);
+	struct histb_vdp2_display *disp = crtc_to_display(crtc);
 	struct drm_connector_state *conn_state;
 	struct drm_framebuffer *fb;
 	const struct histb_wb_fmt *fmt;
@@ -2202,7 +2219,7 @@ static irqreturn_t histb_vdp2_irq_handler(int irq, void *data)
 	/* the line stays requested across an aggregate unbind, no CRTC then */
 	if (disp) {
 		if (sta & VO_INT_DHD0_VTTHD1)
-			drm_crtc_handle_vblank(&disp->crtc);
+			drm_crtc_handle_vblank(&disp->base.crtc);
 		histb_wb_update(disp, sta);
 	}
 
@@ -2219,262 +2236,9 @@ static const struct drm_mode_config_funcs histb_vdp2_mode_config_funcs = {
 	.atomic_commit		= drm_atomic_helper_commit,
 };
 
-static const struct drm_encoder_funcs histb_vdp2_encoder_funcs = {
-	.destroy		= drm_encoder_cleanup,
-};
-
-static const struct drm_encoder_helper_funcs histb_vdp2_encoder_helper_funcs = {
-};
-
-DEFINE_DRM_GEM_DMA_FOPS(histb_vdp2_fops);
-
-static const struct drm_driver histb_vdp2_driver = {
-	.driver_features	= DRIVER_GEM | DRIVER_MODESET | DRIVER_ATOMIC,
-	.fops			= &histb_vdp2_fops,
-	DRM_GEM_DMA_DRIVER_OPS,
-	DRM_FBDEV_DMA_DRIVER_OPS,
-	.name			= "histb-vdp2",
-	.desc			= "HiSTB VDP v2 display engine",
-	.major			= 1,
-	.minor			= 0,
-};
-
-static int histb_vdp2_bind(struct device *dev)
-{
-	struct histb_vdp2 *vdp = dev_get_drvdata(dev);
-	struct histb_vdp2_display *disp;
-	struct drm_device *drm;
-	struct drm_bridge *bridge;
-	struct drm_connector *connector;
-	int ret;
-
-	ret = component_bind_all(dev, NULL);
-	if (ret)
-		return dev_err_probe(dev, ret, "component_bind_all failed\n");
-
-	/*
-	 * Only the devm variant of this lookup exists, so each rebind adds a
-	 * bridge reference tied to this device rather than to the aggregate.
-	 * They are all dropped when the device goes away; the transmitter
-	 * outlives the aggregate by construction (it is a component of it).
-	 */
-	bridge = devm_drm_of_get_bridge(dev, dev->of_node, 0, 0);
-	if (IS_ERR(bridge)) {
-		ret = PTR_ERR(bridge);
-		dev_err_probe(dev, ret, "failed to find downstream HDMI bridge\n");
-		goto err_unbind;
-	}
-
-	drm = drm_dev_alloc(&histb_vdp2_driver, dev);
-	if (IS_ERR(drm)) {
-		ret = PTR_ERR(drm);
-		dev_err_probe(dev, ret, "drm_dev_alloc failed\n");
-		goto err_unbind;
-	}
-
-	disp = drmm_kzalloc(drm, sizeof(*disp), GFP_KERNEL);
-	if (!disp) {
-		ret = -ENOMEM;
-		goto err_put;
-	}
-	if (!vdp->zme_coef) {
-		size_t bytes = sizeof(histb_vdp2_zme_coef);
-		void *coef;
-
-		coef = dmam_alloc_coherent(dev, bytes, &vdp->zme_coef_dma,
-					   GFP_KERNEL);
-		if (!coef) {
-			ret = -ENOMEM;
-			goto err_put;
-		}
-		memcpy(coef, histb_vdp2_zme_coef, bytes);
-		vdp->zme_coef = coef;
-	}
-
-	disp->vdp = vdp;
-	disp->drm = drm;
-	drm->dev_private = disp;
-	WRITE_ONCE(vdp->disp, disp);
-
-	ret = drmm_mode_config_init(drm);
-	if (ret) {
-		dev_err_probe(dev, ret, "mode_config_init failed\n");
-		goto err_put;
-	}
-
-	drm->mode_config.min_width	= 64;
-	drm->mode_config.max_width	= 3840;
-	drm->mode_config.min_height	= 64;
-	drm->mode_config.max_height	= 2160;
-	drm->mode_config.funcs		= &histb_vdp2_mode_config_funcs;
-
-	/* one CRTC, so the vblank core must exist before the IRQ can be served
-	 * and before any atomic commit waits on it
-	 */
-	ret = drm_vblank_init(drm, 1);
-	if (ret) {
-		dev_err_probe(dev, ret, "vblank_init failed\n");
-		goto err_put;
-	}
-
-	/*
-	 * One CRTC, and the plane has to advertise it: a zero mask makes
-	 * generic atomic clients skip the primary plane entirely (the fbdev
-	 * client works anyway because it drives the CRTC's plane directly).
-	 */
-	ret = drm_universal_plane_init(drm, &disp->primary, 1,
-				       &histb_vdp2_plane_funcs,
-				       histb_vdp2_formats,
-				       ARRAY_SIZE(histb_vdp2_formats),
-				       NULL, DRM_PLANE_TYPE_PRIMARY, NULL);
-	if (ret) {
-		dev_err_probe(dev, ret, "plane_init failed\n");
-		goto err_put;
-	}
-	drm_plane_helper_add(&disp->primary, &histb_vdp2_plane_helper_funcs);
-
-	/*
-	 * The mixer can take the alpha byte as a coverage weight, and it can treat
-	 * the surface as premultiplied, so both upstream modes are offered next to
-	 * "None". Measured over a non-black background with the pixel-alpha path and
-	 * its range bit set, alpha 0x00/0x40/0x80/0xc0/0xff came back at the panel
-	 * within one luma step of a*c + (1-a)*bg; with the range bit clear only part
-	 * of the byte is used, so that bit is always set here. See
-	 * histb_vdp2_g0_set().
-	 */
-	ret = drm_plane_create_blend_mode_property(&disp->primary,
-					BIT(DRM_MODE_BLEND_PIXEL_NONE) |
-					BIT(DRM_MODE_BLEND_PREMULTI) |
-					BIT(DRM_MODE_BLEND_COVERAGE));
-	if (ret) {
-		dev_err_probe(dev, ret, "blend_mode failed\n");
-		goto err_put;
-	}
-
-	/*
-	 * The layer's global alpha is a full 8-bit field, unlike the 7-bit
-	 * per-pixel one that made the blend mode above refuse to promise anything,
-	 * so the plane can offer opacity.
-	 */
-	ret = drm_plane_create_alpha_property(&disp->primary);
-	if (ret) {
-		dev_err_probe(dev, ret, "alpha failed\n");
-		goto err_put;
-	}
-
-	ret = drm_crtc_init_with_planes(drm, &disp->crtc, &disp->primary, NULL,
-					&histb_vdp2_crtc_funcs, "histb-vdp2-crtc");
-	if (ret) {
-		dev_err_probe(dev, ret, "crtc_init failed\n");
-		goto err_put;
-	}
-	drm_crtc_helper_add(&disp->crtc, &histb_vdp2_crtc_helper_funcs);
-	drm_crtc_vblank_reset(&disp->crtc);
-
-	disp->encoder.possible_crtcs = drm_crtc_mask(&disp->crtc);
-	ret = drm_encoder_init(drm, &disp->encoder, &histb_vdp2_encoder_funcs,
-			       DRM_MODE_ENCODER_TMDS, "histb-vdp2-encoder");
-	if (ret) {
-		dev_err_probe(dev, ret, "encoder_init failed\n");
-		goto err_put;
-	}
-	drm_encoder_helper_add(&disp->encoder, &histb_vdp2_encoder_helper_funcs);
-
-	ret = drm_bridge_attach(&disp->encoder, bridge, NULL,
-				DRM_BRIDGE_ATTACH_NO_CONNECTOR);
-	if (ret) {
-		dev_err_probe(dev, ret, "bridge_attach failed\n");
-		goto err_put;
-	}
-
-	connector = drm_bridge_connector_init(drm, &disp->encoder);
-	if (IS_ERR(connector)) {
-		dev_err_probe(dev, PTR_ERR(connector),
-			      "failed to init bridge connector\n");
-		goto err_put;
-	}
-	drm_connector_attach_encoder(connector, &disp->encoder);
-
-	ret = histb_wb_init(disp);
-	if (ret) {
-		dev_err_probe(dev, ret, "failed to init the write-back connector\n");
-		goto err_put;
-	}
-
-	/*
-	 * The transmitter has no usable HPD output (it is a level signal that
-	 * storms while a sink is attached), so the connector the bridge
-	 * helper created asks for DRM_CONNECTOR_POLL_CONNECT|DISCONNECT.
-	 * Without starting the poll work here nothing would ever re-detect a
-	 * plug event. The drmm variant stops with the DRM device.
-	 */
-	drmm_kms_helper_poll_init(drm);
-
-	drm_mode_config_reset(drm);
-
-	ret = drm_dev_register(drm, 0);
-	if (ret) {
-		dev_err_probe(dev, ret, "drm_dev_register failed\n");
-		goto err_put;
-	}
-
-	drm_client_setup(drm, NULL);
-
-	return 0;
-
-err_put:
-	WRITE_ONCE(vdp->disp, NULL);
-	drm_dev_put(drm);
-err_unbind:
-	component_unbind_all(dev, NULL);
-	return ret;
-}
-
-static void histb_vdp2_unbind(struct device *dev)
-{
-	struct histb_vdp2 *vdp = dev_get_drvdata(dev);
-	struct histb_vdp2_display *disp = vdp->disp;
-	struct drm_device *drm = disp->drm;
-
-	/* drm_dev_unplug() also unregisters; tear down while clocks are on */
-	drm_dev_unplug(drm);
-	drm_atomic_helper_shutdown(drm);
-
-	WRITE_ONCE(vdp->disp, NULL);
-	component_unbind_all(dev, NULL);
-	drm_dev_put(drm);
-}
-
-/*
- * Who belongs to this pipeline is read out of the device tree, not out of the
- * order someone happens to echo into unbind: the transmitter on the far side of
- * our own graph endpoint is added as a component of this aggregate, so removing
- * its driver takes the DRM device down before that driver's bridge, regmaps and
- * MMIO are released. Without it, unbinding the transmitter under a live card
- * lets the atomic paths dereference the freed bridge.
- */
-static const struct component_master_ops histb_vdp2_master_ops = {
-	.bind		= histb_vdp2_bind,
-	.unbind		= histb_vdp2_unbind,
-};
-
-static int histb_vdp2_add_master(struct device *dev)
-{
-	struct component_match *match = NULL;
-	struct device_node *endpoint;
-
-	for_each_endpoint_of_node(dev->of_node, endpoint) {
-		struct device_node *remote =
-			of_graph_get_remote_port_parent(endpoint);
-
-		if (remote && of_device_is_available(remote))
-			drm_of_component_match_add(dev, &match,
-						   component_compare_of, remote);
-		of_node_put(remote);
-	}
-
-	return component_master_add_with_match(dev, &histb_vdp2_master_ops, match);
-}
+/* ------------------------------------------------------------------ */
+/* Generation hooks                                                    */
+/* ------------------------------------------------------------------ */
 
 /*
  * The VOU reset request is CRG54[30]. A reset only reaches the block while it
@@ -2591,7 +2355,7 @@ static int histb_vdp2_suspend(struct device *dev)
 	if (!disp)
 		return 0;
 
-	return drm_mode_config_helper_suspend(disp->drm);
+	return drm_mode_config_helper_suspend(disp->base.drm);
 }
 
 static int histb_vdp2_resume(struct device *dev)
@@ -2602,15 +2366,11 @@ static int histb_vdp2_resume(struct device *dev)
 	if (!disp)
 		return 0;
 
-	return drm_mode_config_helper_resume(disp->drm);
+	return drm_mode_config_helper_resume(disp->base.drm);
 }
 
-static const struct dev_pm_ops histb_vdp2_pm_ops = {
-	RUNTIME_PM_OPS(histb_vdp2_runtime_suspend, histb_vdp2_runtime_resume, NULL)
-	SYSTEM_SLEEP_PM_OPS(histb_vdp2_suspend, histb_vdp2_resume)
-};
-
-static int histb_vdp2_probe(struct platform_device *pdev)
+static int histb_vdp2_probe(struct platform_device *pdev,
+			    const struct histb_vdp_variant *variant)
 {
 	struct device *dev = &pdev->dev;
 	struct histb_vdp2 *vdp;
@@ -2620,13 +2380,15 @@ static int histb_vdp2_probe(struct platform_device *pdev)
 	if (!vdp)
 		return -ENOMEM;
 
-	vdp->chip = of_device_get_match_data(dev);
+	vdp->chip = variant->data;
 	if (!vdp->chip)
 		return -ENODEV;
 	vdp->zme = vdp->chip->zme;
 
 	vdp->dev = dev;
-	platform_set_drvdata(pdev, vdp);
+	vdp->base.dev = dev;
+	vdp->base.variant = variant;
+	platform_set_drvdata(pdev, &vdp->base);
 
 	vdp->regs = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(vdp->regs))
@@ -2715,10 +2477,6 @@ static int histb_vdp2_probe(struct platform_device *pdev)
 		}
 	}
 
-	ret = histb_vdp2_add_master(dev);
-	if (ret)
-		goto err_pm_put;
-
 	return 0;
 
 err_pm_put:
@@ -2730,54 +2488,70 @@ err_pm_disable:
 
 static void histb_vdp2_remove(struct platform_device *pdev)
 {
-	component_master_del(&pdev->dev, &histb_vdp2_master_ops);
-
 	pm_runtime_put_sync_suspend(&pdev->dev);
 	pm_runtime_disable(&pdev->dev);
 }
 
-/*
- * drm_dev_register() documents that a KMS driver stops the pipeline at shutdown
- * and reboot: the channel would otherwise keep scanning a framebuffer whose
- * pages are about to be torn down underneath it.
- */
-static void histb_vdp2_shutdown(struct platform_device *pdev)
+static int histb_vdp2_display_init(struct histb_vdp_display *base)
 {
-	struct histb_vdp2 *vdp = platform_get_drvdata(pdev);
-	struct histb_vdp2_display *disp = READ_ONCE(vdp->disp);
+	struct histb_vdp2_display *disp =
+		container_of(base, struct histb_vdp2_display, base);
+	struct histb_vdp2 *vdp = (struct histb_vdp2 *)base->vdp;
+	int ret;
 
-	if (disp)
-		drm_atomic_helper_shutdown(disp->drm);
+	if (!vdp->zme_coef) {
+		size_t bytes = sizeof(histb_vdp2_zme_coef);
+		void *coef;
+
+		coef = dmam_alloc_coherent(vdp->dev, bytes,
+					     &vdp->zme_coef_dma, GFP_KERNEL);
+		if (!coef)
+			return -ENOMEM;
+		memcpy(coef, histb_vdp2_zme_coef, bytes);
+		vdp->zme_coef = coef;
+	}
+
+	disp->vdp = vdp;
+	WRITE_ONCE(vdp->disp, disp);
+
+	ret = histb_wb_init(disp);
+	if (ret)
+		return ret;
+
+	return 0;
 }
 
-static const struct of_device_id histb_vdp2_of_match[] = {
-	{ .compatible = "hisilicon,hi3798mv100-vdp",
-	  .data = &histb_vdp2_mv100 },
-	/*
-	 * Hi3716CV200 drives its output channel through the same register file: of
-	 * the 48 registers this driver touches, every offset is identical on this
-	 * part -- counted against msp/drv/vo/vdp_v1_0/hal/cv200/vdp_reg.h -- except
-	 * the GP0 zoom block, whose cv200 offsets and 4.12 precisions are recorded
-	 * in histb-vdp2-regs.h beside the board reading that fixed them.
-	 */
-	{ .compatible = "hisilicon,hi3716cv200-vdp",
-	  .data = &histb_vdp2_cv200 },
-	{ }
+static const struct histb_vdp_ops histb_vdp2_ops = {
+	.runtime_suspend	= histb_vdp2_runtime_suspend,
+	.runtime_resume		= histb_vdp2_runtime_resume,
+	.system_suspend		= histb_vdp2_suspend,
+	.system_resume		= histb_vdp2_resume,
+	.display_init		= histb_vdp2_display_init,
 };
-MODULE_DEVICE_TABLE(of, histb_vdp2_of_match);
 
-static struct platform_driver histb_vdp2_platform_driver = {
-	.probe		= histb_vdp2_probe,
-	.remove		= histb_vdp2_remove,
-	.shutdown	= histb_vdp2_shutdown,
-	.driver		= {
-		.name			= "histb-vdp2",
-		.of_match_table		= histb_vdp2_of_match,
-		.pm			= pm_ptr(&histb_vdp2_pm_ops),
-	},
-};
-module_platform_driver(histb_vdp2_platform_driver);
+#define HISTB_VDP2_VARIANT(_name, _data)				\
+	const struct histb_vdp_variant _name = {				\
+		.ops			= &histb_vdp2_ops,			\
+		.data			= _data,				\
+		.probe			= histb_vdp2_probe,			\
+		.remove			= histb_vdp2_remove,			\
+		.display_size		= sizeof(struct histb_vdp2_display),	\
+		.min_width		= 64,					\
+		.min_height		= 64,					\
+		.max_width		= 3840,					\
+		.max_height		= 2160,					\
+		.formats		= histb_vdp2_formats,			\
+		.num_formats		= ARRAY_SIZE(histb_vdp2_formats),	\
+		.plane_funcs		= &histb_vdp2_plane_funcs,		\
+		.plane_helper		= &histb_vdp2_plane_helper_funcs,	\
+		.crtc_funcs		= &histb_vdp2_crtc_funcs,		\
+		.crtc_helper		= &histb_vdp2_crtc_helper_funcs,	\
+		.mode_config_funcs	= &histb_vdp2_mode_config_funcs,	\
+		.plane_possible_crtcs	= 1,					\
+		.blend_mode_property	= true,					\
+		.crtc_name		= "histb-vdp-crtc",			\
+		.encoder_name		= "histb-vdp-encoder",			\
+	}
 
-MODULE_AUTHOR("David Yang <mmyangfl@gmail.com>");
-MODULE_DESCRIPTION("DRM driver for the HiSTB VDP v2 display engine (hi3798mv100)");
-MODULE_LICENSE("GPL");
+HISTB_VDP2_VARIANT(histb_vdp2_mv100_variant, &histb_vdp2_mv100);
+HISTB_VDP2_VARIANT(histb_vdp2_cv200_variant, &histb_vdp2_cv200);
