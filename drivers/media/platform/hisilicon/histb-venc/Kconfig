@@ -1,0 +1,22 @@
+# SPDX-License-Identifier: GPL-2.0-only
+config VIDEO_HISTB_VENC
+	tristate "HiSilicon HiSTB H.264 encoder driver"
+	depends on ARCH_HISI || COMPILE_TEST
+	depends on V4L_MEM2MEM_DRIVERS
+	depends on VIDEO_DEV
+	select VIDEOBUF2_DMA_CONTIG
+	select VIDEOBUF2_VMALLOC
+	select V4L2_MEM2MEM_DEV
+	help
+	  Support for the VEDU video encoder family on HiSilicon HiSTB
+	  set-top-box SoCs. The encoder is stateful: a raw picture goes in and
+	  H.264 network abstraction layer data comes out, with the parameter
+	  sets and the slice headers written by the driver.
+
+	  This backend serves the v2 VEDU of Hi3716CV200 and Hi3798MV100 -- the
+	  part the vendor calls V2R8, built through its venc_v1.0 layer. It is
+	  programmed with register writes and a 64-byte packet ring, and codes
+	  IDR pictures only.
+
+	  To compile this driver as a module, choose M here: the module will be
+	  called histb-venc.
