@@ -13,3 +13,4 @@ histb-vdec-y += histb_vdec_v5_core.o
 histb-vdec-y += histb_vdec_v5_h264.o
 histb-vdec-y += histb_vdec_v5_hevc.o
 histb-vdec-y += histb_vdec_v5_mpeg2.o
+histb-vdec-y += histb_vdec_v5_mpeg4.o

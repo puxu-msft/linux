@@ -68,6 +68,8 @@ static const histb_vdec_v5_fmt_desc *const histb_vdec_v5_fmt_list[] = {
 	&histb_vdec_v5_h264_fmt,
 	&histb_vdec_v5_hevc_fmt,
 	&histb_vdec_v5_mpeg2_fmt,
+	&histb_vdec_v5_mpeg4_fmt,
+	&histb_vdec_v5_h263_fmt,
 };
 
 static const struct histb_vdec_chip histb_vdec_v5_chip_mv200h = {
