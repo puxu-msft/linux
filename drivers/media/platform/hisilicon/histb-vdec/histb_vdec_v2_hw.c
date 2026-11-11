@@ -26,15 +26,38 @@
  * histb_vdec_hw_init() - prepare the VDM register interface
  * @dev: decoder device
  *
- * Masks every interrupt source and drops anything latched across the reset.
- * Runs once at probe, after the reset is released and before the interrupt
- * handler is registered; the per-frame start path unmasks the frame-done source
- * again.
+ * VDH 门控位于 CRG30 的型号上，先打开门控并脉冲软复位。随后屏蔽所有中断源，并丢弃复位期间锁存的一切状态。在 probe 时（注册中断处理函数之前）以及每次 runtime resume 时运行；逐帧启动路径会重新打开 frame-done 中断源。
  *
  * Return: 0 on success, a negative error code otherwise.
  */
 int histb_vdec_hw_init(struct histb_vdec_dev *dev)
 {
+	int ret;
+
+	if (dev->crg) {
+		/*
+		 * CRG30：bit 0 是 VDH 门控，bit 1 是 DSP 门控，bit 4/5/6 是 global/SCD/MFD 软复位，正是厂商 V5R2C1 的 VDM/DSP/SCD_OpenHardware() 置位与清零的那些位。先打开门控，再脉冲复位；不开门控时整个 VDM 窗口都读回 0。
+		 */
+		ret = regmap_update_bits(dev->crg, VDH_CRG30,
+					 BIT(0) | BIT(1), BIT(0) | BIT(1));
+		if (ret)
+			return ret;
+		udelay(10);
+
+		ret = regmap_update_bits(dev->crg, VDH_CRG30,
+					 BIT(4) | BIT(5) | BIT(6),
+					 BIT(4) | BIT(5) | BIT(6));
+		if (ret)
+			return ret;
+		udelay(10);
+
+		ret = regmap_update_bits(dev->crg, VDH_CRG30,
+					 BIT(4) | BIT(5) | BIT(6), 0);
+		if (ret)
+			return ret;
+		usleep_range(100, 200);
+	}
+
 	vdm_write(dev, VDM_INT_MASK, 0xffffffff);
 	vdm_write(dev, VDM_INT_STATE, 0xffffffff);
 

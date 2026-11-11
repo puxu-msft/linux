@@ -110,6 +110,8 @@ struct histb_vdec_gen {
 	const struct histb_vdec_chip	*chip;
 	unsigned int			max_width;
 	unsigned int			max_height;
+	/* 新 context 起始的 OUTPUT 宽度；为 0 时取 @max_width。 */
+	unsigned int			default_width;
 	unsigned int			max_cap_buffers;
 	unsigned int			min_queued_buffers;
 	/* A capture queue deeper than the slot table is refused or clamped. */
@@ -164,6 +166,7 @@ struct histb_vdec_variant {
 
 extern const struct histb_vdec_variant histb_vdec_v2_mv100_variant;
 extern const struct histb_vdec_variant histb_vdec_v2_cv200_variant;
+extern const struct histb_vdec_variant histb_vdec_v2_mv300_variant;
 extern const struct histb_vdec_variant histb_vdec_v5_mv200h_variant;
 
 /* Registration and teardown of the media node; called by a backend's probe. */

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 /*
- * HiSilicon Hi3798MV100 / Hi3716CV200 stateless decoder backend.
+ * HiSilicon Hi3798MV100 / Hi3716CV200 / Hi3798MV300 无状态解码后端。
  *
  * This generation decodes out of the VDM message pool: the protocol sources
  * pack the parsed syntax into fixed message slots, the VDM is programmed and
@@ -16,6 +16,7 @@
 #include <linux/dma-mapping.h>
 #include <linux/interrupt.h>
 #include <linux/io.h>
+#include <linux/mfd/syscon.h>
 #include <linux/mutex.h>
 #include <linux/of_device.h>
 #include <linux/of_reserved_mem.h>
@@ -96,6 +97,24 @@ static const struct histb_vdec_chip histb_vdec_v2_chip_cv200 = {
 	.model = "HI3716CV200 VDH",
 	.fmts = histb_vdec_fmt_list_cv200,
 	.num_fmts = ARRAY_SIZE(histb_vdec_fmt_list_cv200),
+};
+
+/*
+ * Hi3798MV300 运行 VDH V5R2C1 这一代（VDH_DIR := HiVDHV5R2C1，固件标签为 HiVDHFMWV500R001）。它保留了 VDM/SCD 寄存器窗口和本后端编程的消息块，所以沿用 Hi3798MV100 的格式列表；目前在它上面逐字节正确解码的协议是 H.264 与 HEVC Main，VP9 与 10-bit 输出尚未接通。
+ */
+static const struct histb_vdec_chip histb_vdec_v2_chip_mv300 = {
+	.model = "HI3798MV300 VDH",
+	.fmts = histb_vdec_fmt_list,
+	.num_fmts = ARRAY_SIZE(histb_vdec_fmt_list),
+};
+
+/*
+ * 本后端的一个型号：core 所依据的代描述，加上后端自身需要知道的该型号信息。
+ */
+struct histb_vdec_v2_part {
+	struct histb_vdec_gen	gen;
+	bool			raster;	/* 见 histb_vdec_dev::raster */
+	bool			crg_gates; /* VDH 门控在 CRG30：需要 hisilicon,crg */
 };
 
 static struct histb_vdec_dev *histb_vdec_dev_of(struct histb_vdec_ctx *ctx)
@@ -222,6 +241,62 @@ void histb_vdec_frames_free(struct histb_vdec_ctx *ctx)
 	}
 }
 
+static void histb_vdec_copy_chroma(u8 *d, const u8 *s, unsigned int len,
+				   bool swap_uv)
+{
+	unsigned int i;
+
+	if (!swap_uv) {
+		memcpy(d, s, len);
+		return;
+	}
+	for (i = 0; i + 1 < len; i += 2) {
+		d[i] = s[i + 1];
+		d[i + 1] = s[i];
+	}
+}
+
+/* V2/V3：亮度 tile 为 256 字节 × 16 行，色度 tile 为 256 字节 × 8 行。 */
+static void histb_vdec_copy_tiled(u8 *out, unsigned int bpl, const u8 *src,
+				  unsigned int uv, unsigned int stride,
+				  unsigned int w, unsigned int h, bool swap_uv)
+{
+	unsigned int x, y, cy;
+
+	for (y = 0; y < h; y++) {
+		const u8 *srow = src + (y / 16) * stride * 16 + (y % 16) * 256;
+		u8 *drow = out + (size_t)y * bpl;
+
+		for (x = 0; x < w; x += 256)
+			memcpy(drow + x, srow + (x / 256) * 4096,
+			       min(256u, w - x));
+	}
+	for (cy = 0; cy < h / 2; cy++) {
+		const u8 *srow = src + uv + (cy / 8) * stride * 8 +
+				 (cy % 8) * 256;
+		u8 *drow = out + (size_t)bpl * h + (size_t)cy * bpl;
+
+		for (x = 0; x < w; x += 256)
+			histb_vdec_copy_chroma(drow + x, srow + (x / 256) * 2048,
+					       min(256u, w - x), swap_uv);
+	}
+}
+
+/* V5R2C1：两个平面都是每 @stride 字节一行画面。 */
+static void histb_vdec_copy_raster(u8 *out, unsigned int bpl, const u8 *src,
+				   unsigned int uv, unsigned int stride,
+				   unsigned int w, unsigned int h, bool swap_uv)
+{
+	unsigned int y, cy;
+
+	for (y = 0; y < h; y++)
+		memcpy(out + (size_t)y * bpl, src + (size_t)y * stride, w);
+	for (cy = 0; cy < h / 2; cy++)
+		histb_vdec_copy_chroma(out + (size_t)bpl * h + (size_t)cy * bpl,
+				       src + uv + (size_t)cy * stride, w,
+				       swap_uv);
+}
+
 static void histb_vdec_frame_to_linear(struct histb_vdec_ctx *ctx,
 				       struct vb2_v4l2_buffer *dst)
 {
@@ -240,7 +315,7 @@ static void histb_vdec_frame_to_linear(struct histb_vdec_ctx *ctx,
 	 * pair and an NV21 frame takes it as is.
 	 */
 	bool swap_uv = pix->pixelformat == V4L2_PIX_FMT_NV12;
-	unsigned int uv, x, y, cy;
+	unsigned int uv;
 	const u8 *src;
 	u8 *out;
 
@@ -258,36 +333,13 @@ static void histb_vdec_frame_to_linear(struct histb_vdec_ctx *ctx,
 	if (dbuf && dma_buf_begin_cpu_access(dbuf, DMA_TO_DEVICE))
 		goto no_frame;
 
-	for (y = 0; y < h; y++) {
-		const u8 *srow = src + (y / 16) * frame->stride * 16 +
-				 (y % 16) * 256;
-		u8 *drow = out + (size_t)y * bpl;
+	if (histb_vdec_dev_of(ctx)->raster)
+		histb_vdec_copy_raster(out, bpl, src, uv, frame->stride, w, h,
+				       swap_uv);
+	else
+		histb_vdec_copy_tiled(out, bpl, src, uv, frame->stride, w, h,
+				      swap_uv);
 
-		for (x = 0; x < w; x += 256)
-			memcpy(drow + x, srow + (x / 256) * 4096,
-			       min(256u, w - x));
-	}
-	for (cy = 0; cy < h / 2; cy++) {
-		const u8 *srow = src + uv + (cy / 8) * frame->stride * 8 +
-				 (cy % 8) * 256;
-		u8 *drow = out + (size_t)bpl * h + (size_t)cy * bpl;
-
-		for (x = 0; x < w; x += 256) {
-			const u8 *s = srow + (x / 256) * 2048;
-			u8 *d = drow + x;
-			unsigned int chunk = min(256u, w - x);
-			unsigned int i;
-
-			if (!swap_uv) {
-				memcpy(d, s, chunk);
-				continue;
-			}
-			for (i = 0; i + 1 < chunk; i += 2) {
-				d[i] = s[i + 1];
-				d[i + 1] = s[i];
-			}
-		}
-	}
 	if (dbuf)
 		dma_buf_end_cpu_access(dbuf, DMA_TO_DEVICE);
 
@@ -816,6 +868,8 @@ static void histb_vdec_v2_memdev_put(void *data)
 int histb_vdec_v2_probe(struct platform_device *pdev,
 			const struct histb_vdec_gen *gen)
 {
+	const struct histb_vdec_v2_part *part =
+		container_of_const(gen, struct histb_vdec_v2_part, gen);
 	struct histb_vdec_dev *dev;
 	struct platform_device *mem;
 	int ret;
@@ -826,6 +880,7 @@ int histb_vdec_v2_probe(struct platform_device *pdev,
 
 	dev->dev = &pdev->dev;
 	dev->chip = gen->chip;
+	dev->raster = part->raster;
 	dev->common.priv = dev;
 	platform_set_drvdata(pdev, dev);
 
@@ -854,6 +909,19 @@ int histb_vdec_v2_probe(struct platform_device *pdev,
 	dev->rst = devm_reset_control_array_get_exclusive(&pdev->dev);
 	if (IS_ERR(dev->rst))
 		return PTR_ERR(dev->rst);
+
+	/*
+	 * VDH 门控位于 CRG30 的型号（Hi3798MV300）由节点给出 CRG syscon，histb_vdec_hw_init() 在首次访问 VDM 寄存器之前打开这些门控。
+	 */
+	dev->crg = syscon_regmap_lookup_by_phandle_optional(pdev->dev.of_node,
+							     "hisilicon,crg");
+	if (IS_ERR(dev->crg))
+		return dev_err_probe(&pdev->dev, PTR_ERR(dev->crg),
+				     "failed to look up the CRG syscon\n");
+	/* 不开门控时整个 VDM 窗口都读回 0。 */
+	if (part->crg_gates && !dev->crg)
+		return dev_err_probe(&pdev->dev, -EINVAL,
+				     "hisilicon,crg is required on this part\n");
 
 	ret = platform_get_irq(pdev, 0);
 	if (ret < 0)
@@ -1105,15 +1173,16 @@ static const u32 *histb_vdec_v2_required_ctrls(
 					 num);
 }
 
-#define HISTB_VDEC_V2_GEN(_chip, _caps)					\
+#define HISTB_VDEC_V2_GEN(_chip, _caps, _max_w, _max_h, _min_queued)	\
 	{								\
 		.name			= "histb-vdec",			\
 		.ctx_size		= sizeof(struct histb_vdec_ctx),	\
 		.chip			= _chip,				\
-		.max_width		= HISTB_VDEC_MAX_WIDTH,		\
-		.max_height		= HISTB_VDEC_MAX_HEIGHT,		\
+		.max_width		= _max_w,				\
+		.max_height		= _max_h,				\
+		.default_width		= 1920,					\
 		.max_cap_buffers	= HISTB_VDEC_MAX_APC_SLOTS,	\
-		.min_queued_buffers	= 4,					\
+		.min_queued_buffers	= _min_queued,				\
 		.cap_clamp		= true,				\
 		.cap_formats		= _caps,				\
 		.num_cap_formats	= ARRAY_SIZE(_caps),			\
@@ -1133,13 +1202,29 @@ static const u32 *histb_vdec_v2_required_ctrls(
 		.m2m_ops		= &histb_vdec_m2m_ops,			\
 	}
 
-static const struct histb_vdec_gen histb_vdec_v2_gen_mv100 =
-	HISTB_VDEC_V2_GEN(&histb_vdec_v2_chip_mv100, histb_vdec_v2_cap_formats);
-static const struct histb_vdec_gen histb_vdec_v2_gen_cv200 =
-	HISTB_VDEC_V2_GEN(&histb_vdec_v2_chip_cv200, histb_vdec_v2_cap_formats);
+static const struct histb_vdec_v2_part histb_vdec_v2_part_mv100 = {
+	.gen = HISTB_VDEC_V2_GEN(&histb_vdec_v2_chip_mv100,
+				 histb_vdec_v2_cap_formats, 1920, 1920, 4),
+};
+static const struct histb_vdec_v2_part histb_vdec_v2_part_cv200 = {
+	.gen = HISTB_VDEC_V2_GEN(&histb_vdec_v2_chip_cv200,
+				 histb_vdec_v2_cap_formats, 1920, 1920, 4),
+};
+
+/*
+ * Hi3798MV300 的引擎最高可解 4096x2304（厂商能力表，424,673,280 像素/秒），但消息池的 band-line scratch、内部帧和 capture buffer 都随画面增大，4K 需要的 CMA 超过默认大小的区域所能容纳。2560x1440 是目前跑通过的最大几何；再往上提还需要同时增大 HISTB_VDEC_MAX_WIDTH（scratch 跟随它）、HISTB_VDEC_POOL_SIZE 和板级 CMA。
+ *
+ * capture 下限两个是单参考帧逐行码流的最低需求，不是 DPB 深度策略：深度是码流属性，没有哪个格式能携带，所以参考 N 帧的客户端得自己保持 N+1 个 buffer 轮转。下限压低在 1440p 下很要紧，那里每个 capture buffer 及其背后的内部帧各占 5.5 MB。
+ */
+static const struct histb_vdec_v2_part histb_vdec_v2_part_mv300 = {
+	.gen = HISTB_VDEC_V2_GEN(&histb_vdec_v2_chip_mv300,
+				 histb_vdec_v2_cap_formats, 2560, 1440, 2),
+	.raster = true,
+	.crg_gates = true,
+};
 
 const struct histb_vdec_variant histb_vdec_v2_mv100_variant = {
-	.gen			= &histb_vdec_v2_gen_mv100,
+	.gen			= &histb_vdec_v2_part_mv100.gen,
 	.probe			= histb_vdec_v2_probe,
 	.remove			= histb_vdec_v2_remove,
 	.runtime_suspend	= histb_vdec_runtime_suspend,
@@ -1149,7 +1234,17 @@ const struct histb_vdec_variant histb_vdec_v2_mv100_variant = {
 };
 
 const struct histb_vdec_variant histb_vdec_v2_cv200_variant = {
-	.gen			= &histb_vdec_v2_gen_cv200,
+	.gen			= &histb_vdec_v2_part_cv200.gen,
+	.probe			= histb_vdec_v2_probe,
+	.remove			= histb_vdec_v2_remove,
+	.runtime_suspend	= histb_vdec_runtime_suspend,
+	.runtime_resume		= histb_vdec_runtime_resume,
+	.system_suspend		= pm_runtime_force_suspend,
+	.system_resume		= pm_runtime_force_resume,
+};
+
+const struct histb_vdec_variant histb_vdec_v2_mv300_variant = {
+	.gen			= &histb_vdec_v2_part_mv300.gen,
 	.probe			= histb_vdec_v2_probe,
 	.remove			= histb_vdec_v2_remove,
 	.runtime_suspend	= histb_vdec_runtime_suspend,

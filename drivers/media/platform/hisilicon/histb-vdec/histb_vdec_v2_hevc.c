@@ -806,6 +806,12 @@ static void histb_hevc_program_regs(struct histb_vdec_dev *dev,
 	u32 cfg1 = FIELD_PREP(VDM_CFG1_VID_STD, HISTB_HEVC_VIDSTD_CODE) |
 		   FIELD_PREP(VDM_CFG1_DDR_STRIDE, run->tile_stride >> 6);
 
+	/*
+	 * V5R2C1 只有在 1D 路径上才写出拷出代码所期望的行优先帧。不置 DBLK_1D_EN 时它改写 64 字节宽的 tile 列，在 Hi3798MV300 上实测表现为每个 CTB 行的一列落在偏移 row * 64 处。
+	 */
+	if (dev->raster)
+		cfg1 |= VDM_CFG1_DBLK_1D_EN;
+
 	/* decoded CTU budget: the field counts CTUs minus one */
 	vdm_write(dev, VDM_CFG0, cfg0);
 	vdm_write(dev, VDM_CFG1, cfg1);

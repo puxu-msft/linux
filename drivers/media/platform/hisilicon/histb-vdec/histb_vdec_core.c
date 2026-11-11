@@ -51,6 +51,7 @@ static void histb_vdec_reset_fmts(struct histb_vdec_core_ctx *ctx,
 				  const struct histb_vdec_common *common)
 {
 	const struct histb_vdec_fmt *def = common->gen->chip->fmts[0];
+	unsigned int width = common->gen->default_width ?: common->gen->max_width;
 	struct v4l2_format *out = &ctx->out_fmt;
 	struct v4l2_format *cap = &ctx->cap_fmt;
 
@@ -65,8 +66,8 @@ static void histb_vdec_reset_fmts(struct histb_vdec_core_ctx *ctx,
 	out->fmt.pix_mp.ycbcr_enc = V4L2_YCBCR_ENC_DEFAULT;
 	out->fmt.pix_mp.quantization = V4L2_QUANTIZATION_DEFAULT;
 	out->fmt.pix_mp.xfer_func = V4L2_XFER_FUNC_DEFAULT;
-	common->gen->set_out_size(ctx, out, common->gen->max_width, 1088);
-	out->fmt.pix_mp.width = common->gen->max_width;
+	common->gen->set_out_size(ctx, out, width, 1088);
+	out->fmt.pix_mp.width = width;
 	out->fmt.pix_mp.height = 1088;
 	out->fmt.pix_mp.plane_fmt[0].sizeimage = HISTB_VDEC_DEFAULT_OUTPUT_SIZE;
 
@@ -1044,6 +1045,8 @@ static const struct of_device_id histb_vdec_of_match[] = {
 	  .data = &histb_vdec_v2_mv100_variant },
 	{ .compatible = "hisilicon,hi3716cv200-vdec",
 	  .data = &histb_vdec_v2_cv200_variant },
+	{ .compatible = "hisilicon,hi3798mv300-vdec",
+	  .data = &histb_vdec_v2_mv300_variant },
 	{ .compatible = "hisilicon,hi3798mv200-vdec",
 	  .data = &histb_vdec_v5_mv200h_variant },
 	{ }

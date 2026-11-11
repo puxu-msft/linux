@@ -836,11 +836,8 @@ static int histb_vdec_mpeg2_run(struct histb_vdec_ctx *ctx,
 	 * that protocol alone, and MPEG-2 jobs at 16 wide were accepted on the
 	 * board (which is why histb_vdec_enum_framesizes() keeps min_width = 16
 	 * for this fourcc and raises it to 32 only for
-	 * V4L2_PIX_FMT_H264_SLICE). The upper bound is the pair the format
-	 * layer advertises and clamps to, so nothing larger can be negotiated
-	 * into a capture buffer in the first place; the geometry check above
-	 * refuses it as well, this one is the cheaper statement of the same
-	 * limit.
+	 * V4L2_PIX_FMT_H264_SLICE).
+	 * 上限是后端包络，任何型号的格式层通告的尺寸都不会超出它，所以更大的尺寸从一开始就协商不进 capture buffer；上面的几何检查也会拒绝超出本型号自身宽高的尺寸，这里只是对外层上限更省事的表述。
 	 */
 	if (seq->horizontal_size < 16 || seq->vertical_size < 16 ||
 	    seq->horizontal_size > HISTB_VDEC_MAX_WIDTH ||
@@ -1043,10 +1040,8 @@ static int histb_vdec_mpeg2_run(struct histb_vdec_ctx *ctx,
 	 * band pitch, the maximum slice group number is 3 and CFG0 carries the
 	 * COEFIDX/MARKER detect bits - while the other writes a linear picture
 	 * (stride counted in 16-byte lines, chroma right behind luma) with CFG0
-	 * reduced to LD_QMATRIX. The capture format is the same tiled NV21 for
-	 * every protocol and dropping the detect bits changed nothing
-	 * measurable, so this driver follows the path the firmware actually
-	 * takes.
+	 * reduced to LD_QMATRIX.
+	 * 引擎写出的帧布局对所有协议都相同，去掉检测位也没有带来任何可测的变化，所以本驱动走固件实际走的那条路径。
 	 */
 	vdm_write(dev, VDM_CFG0,
 		  FIELD_PREP(VDM_CFG0_MBAMT, mb_total - 1) |

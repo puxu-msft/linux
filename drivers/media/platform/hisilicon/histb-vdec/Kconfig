@@ -4,6 +4,7 @@ config VIDEO_HISTB_VDEC
 	depends on ARCH_HISI || COMPILE_TEST
 	depends on V4L_MEM2MEM_DRIVERS
 	depends on VIDEO_DEV
+	select MFD_SYSCON
 	select VIDEOBUF2_DMA_CONTIG
 	select V4L2_MEM2MEM_DEV
 	select V4L2_H264
@@ -14,17 +15,13 @@ config VIDEO_HISTB_VDEC
 	  request controls, and the hardware decodes H.264, HEVC, MPEG-2,
 	  MPEG-4 and H.263 into NV21 frames.
 
-	  Two hardware generations are covered. The v2 backend serves the
-	  Hi3716CV200 part (HiVDHV200R004) and the Hi3798MV100 part
-	  (HiVDHV300R001): both pack fully parsed syntax into a downstream
-	  message pool and write 16x16-tiled frames, and the V2 part has no
-	  HEVC path, so HEVC is offered only on Hi3798MV100. The v5 backend
-	  drives the HiVDHV5R6C02 block of hi3798mv200h, which takes a command
+	  Two hardware generations are covered.
+	  v2 后端服务于 Hi3716CV200（HiVDHV200R004）、Hi3798MV100（HiVDHV300R001）与 Hi3798MV300（HiVDHV5R2C1）：三者都把完整解析的语法打包进下游消息池，前两者写 16x16 分块的帧，Hi3798MV300 按行优先写帧；V2 型号没有 HEVC 通路，所以 Hi3716CV200 上不提供 HEVC。
+	  The v5 backend drives the HiVDHV5R6C02 block of hi3798mv200h, which takes a command
 	  image and writes NV21 in 16-row bands.
 
-	  The backend suffix is the hardware generation it starts from, taken
-	  the same way in both video blocks: v2 covers VDH V2/V3, v5 covers VDH
-	  V5R6. It is not the vendor's vdec_vX.Y layer number, which counts
+	  后端后缀取的是它起步的硬件代，两个视频 block 里取法相同：v2 覆盖 VDH V2/V3 以及沿用其消息池的 V5R2C1 block，v5 覆盖 VDH V5R6。
+	  It is not the vendor's vdec_vX.Y layer number, which counts
 	  these parts the other way round (vdec_v1.0 for the v2 backends,
 	  vdec_v2.1 for the v5 ones).
 

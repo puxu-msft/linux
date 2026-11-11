@@ -33,6 +33,7 @@
 
 #include <linux/bitops.h>
 #include <linux/dma-mapping.h>
+#include <linux/unaligned.h>
 #include <media/v4l2-h264.h>
 #include <media/videobuf2-dma-contig.h>
 
@@ -213,17 +214,69 @@ static bool histb_h264_has_b_slice(const struct histb_h264_run *run)
  * PMV slot allocator: capture buffer index -> PMV slot id. Slot ids are stored
  * +1 so that a zeroed pmv_map[] means "unallocated"; ids wrap around the
  * 20-slot pool.
+ *
+ * 槽在首次使用时才分配，而不是整组分配：只有码流实际存储的帧才需要槽，所以单参考的 1440p 会话只占两个槽（0.9 MB），而不是整个 9.2 MB 的池。返回槽 id 或 -ENOMEM。
  */
-static u8 histb_h264_pmv_alloc(struct histb_vdec_ctx *ctx, unsigned int index)
+static int histb_h264_pmv_alloc(struct histb_vdec_ctx *ctx, unsigned int index)
 {
+	struct histb_vdec_dev *dev = histb_vdec_h264_dev(ctx);
+	struct histb_vdec_h264_ctx *h264 = ctx->priv;
 	u8 id = ctx->pmv_map[index];
+	unsigned int slot;
 
 	if (!id) {
 		id = ctx->pmv_next++ % HISTB_VDEC_MAX_PMV_SLOTS + 1;
 		ctx->pmv_map[index] = id;
 	}
 
-	return id - 1;
+	slot = id - 1;
+	if (!h264->pmv_va[slot]) {
+		h264->pmv_va[slot] = dma_alloc_wc(dev->memdev, h264->pmv_slot_size,
+						  &h264->pmv_dma[slot],
+						  GFP_KERNEL);
+		if (!h264->pmv_va[slot]) {
+			ctx->pmv_map[index] = 0;
+			ctx->pmv_next--;
+			return -ENOMEM;
+		}
+	}
+
+	return slot;
+}
+
+/*
+ * 返回 buf[pos..end) 中下一个 00 00 @last 三字节序列的位置。OUTPUT 平面以 write-combining（normal non-cacheable）方式映射，逐字节扫描每字节约 150 ns，在 1080p60 下占去了每帧预算的大头；改用整字加载加零字节检测，每次加载跳过八个字节。没有匹配时返回 @end。
+ */
+static u32 histb_h264_scan_triple(const u8 *buf, u32 end, u32 pos, u8 last)
+{
+	u32 i = pos;
+
+	while (i + 8 <= end) {
+		u64 v = get_unaligned_le64(buf + i), z, pair;
+		u32 j;
+
+		/*
+		 * 窗口的第 k 个字节是 v 的第 8k..8k+7 位。这里求逐字节精确的零标志（常用的 has-zero 借位技巧会把零字节后面那个字节也报成零）：清掉每个字节的 bit 7 后加 0x7f，零字节在两种视图里的 bit 7 都为 0。不会有进位跨过字节边界。
+		 */
+		z = ~(((v & 0x7f7f7f7f7f7f7f7fULL) +
+		       0x7f7f7f7f7f7f7f7fULL) | v) & 0x8080808080808080ULL;
+		pair = z & (z >> 8);
+		while (pair) {
+			j = __ffs64(pair) >> 3;
+			if (i + j + 2 < end && buf[i + j + 2] == last)
+				return i + j;
+			pair &= pair - 1;
+		}
+		if ((z & (1ULL << 63)) && i + 9 < end && !buf[i + 8] &&
+		    buf[i + 9] == last)
+			return i + 7;
+		i += 8;
+	}
+	for (; i + 2 < end; i++)
+		if (!buf[i] && !buf[i + 1] && buf[i + 2] == last)
+			return i;
+
+	return end;
 }
 
 /*
@@ -237,21 +290,22 @@ static unsigned int histb_h264_find_slice_nals(const u8 *buf, u32 size,
 					       u32 *starts, unsigned int max)
 {
 	unsigned int n = 0;
-	u32 i;
+	u32 i = 0;
 
-	for (i = 0; i + 3 < size; i++) {
+	while (i + 3 < size) {
 		u8 nal_type;
 
-		if (buf[i] || buf[i + 1] || buf[i + 2] != 0x01)
-			continue;
+		i = histb_h264_scan_triple(buf, size, i, 0x01);
+		if (i + 3 >= size)
+			break;
 
 		nal_type = buf[i + 3] & 0x1f;
-		if (nal_type != 1 && nal_type != 5)
-			continue;
-
-		if (n < max)
-			starts[n] = (i + 3) * 8;
-		n++;
+		if (nal_type == 1 || nal_type == 5) {
+			if (n < max)
+				starts[n] = (i + 3) * 8;
+			n++;
+		}
+		i += 3;
 	}
 
 	return n;
@@ -571,12 +625,12 @@ static bool histb_h264_slice_lists(const struct histb_h264_run *run,
 	return false;
 }
 
-static void histb_h264_assemble_slice(struct histb_vdec_dev *dev,
-				      struct histb_vdec_ctx *ctx,
-				      const struct histb_h264_run *run,
-				      const struct histb_vdec_h264_ctx *h264,
-				      unsigned int index,
-				      u32 nal_bit, u32 next_bit)
+static int histb_h264_assemble_slice(struct histb_vdec_dev *dev,
+				     struct histb_vdec_ctx *ctx,
+				     const struct histb_h264_run *run,
+				     const struct histb_vdec_h264_ctx *h264,
+				     unsigned int index,
+				     u32 nal_bit, u32 next_bit)
 {
 	const struct v4l2_ctrl_h264_slice_params *slice = &run->slices[index];
 	const struct v4l2_ctrl_h264_pps *pps = run->pps;
@@ -735,9 +789,14 @@ static void histb_h264_assemble_slice(struct histb_vdec_dev *dev,
 	 * driver cannot name are refused by run() instead of delivered.
 	 */
 	if (is_b && count0 + count1 > 0 &&
-	    run->dpb2apc[col[0].index] != HISTB_H264_APC_NONE)
-		slot[8] = lower_32_bits(h264->pmv_dma[histb_h264_pmv_alloc(ctx,
-					run->dpb2apc[col[0].index])]);
+	    run->dpb2apc[col[0].index] != HISTB_H264_APC_NONE) {
+		int col_slot = histb_h264_pmv_alloc(ctx,
+						    run->dpb2apc[col[0].index]);
+
+		if (col_slot < 0)
+			return col_slot;
+		slot[8] = lower_32_bits(h264->pmv_dma[col_slot]);
+	}
 
 	/*
 	 * Weighting mode: the firmware moves its per-slice weighting-mode byte
@@ -793,6 +852,8 @@ static void histb_h264_assemble_slice(struct histb_vdec_dev *dev,
 		if (is_b)
 			histb_h264_pack_weights(slot, run->weights, count1, true);
 	}
+
+	return 0;
 }
 
 static void histb_h264_program_regs(struct histb_vdec_dev *dev,
@@ -880,8 +941,8 @@ static int histb_vdec_h264_try_ctrl(struct v4l2_ctrl *ctrl)
 	sps = ctrl->p_new.p_h264_sps;
 
 	/*
-	 * The VDM reconstructs NV21 16x16 tiles: 8-bit 4:2:0 only. The chroma
-	 * format and bit depth fields only exist for the high profiles
+	 * VDM 只重建 8 位 NV21 4:2:0 画面。
+	 * The chroma format and bit depth fields only exist for the high profiles
 	 * (V4L2_H264_SPS_HAS_CHROMA_FORMAT); baseline and main streams are
 	 * 4:2:0 8-bit by definition.
 	 *
@@ -918,14 +979,7 @@ static int histb_vdec_h264_start(struct histb_vdec_ctx *ctx)
 }
 
 /*
- * Make sure the PMV pool slots hold the active frame. The vendor slot is 32
- * bytes per macroblock, at least one 1080p-frame slot; growing drops the slot
- * map, which is harmless at a resolution change.
- *
- * The pool is one dma_alloc_wc() per slot: 20 slots at the 1080p floor is a 5.0
- * MB (order-11, 8 MB aligned) request, and the board refuses that against its
- * 16 MB CMA region even with 9.9 MB free, which came back as -ENOMEM on every
- * job.
+ * 释放所有已分配的 PMV 槽并清除几何信息。厂商的槽是每宏块 32 字节，至少一个 1080p 帧的大小；分辨率变化时整个池都要释放，因为槽大小随之改变。
  */
 static void histb_h264_pmv_free(struct histb_vdec_dev *dev,
 				struct histb_vdec_h264_ctx *h264)
@@ -979,7 +1033,6 @@ static int histb_h264_pmv_grow(struct histb_vdec_ctx *ctx,
 						    direct_8x8);
 	unsigned int len = ALIGN(width_mbs * height_mbs * per_mb, 128);
 	unsigned int slot = ALIGN(width_mbs * height_mbs * 32, 128);
-	int i;
 
 	slot = max3(slot, len, HISTB_H264_PMV_SLOT_MIN);
 	if (h264->pmv_slot_size) {
@@ -1016,17 +1069,6 @@ static int histb_h264_pmv_grow(struct histb_vdec_ctx *ctx,
 	}
 
 	histb_h264_pmv_free(dev, h264);
-
-	for (i = 0; i < HISTB_VDEC_MAX_PMV_SLOTS; i++) {
-		h264->pmv_va[i] = dma_alloc_wc(dev->memdev, slot,
-					       &h264->pmv_dma[i], GFP_KERNEL);
-		if (!h264->pmv_va[i])
-			break;
-	}
-	if (i < HISTB_VDEC_MAX_PMV_SLOTS) {
-		histb_h264_pmv_free(dev, h264);
-		return -ENOMEM;
-	}
 	h264->pmv_slot_size = slot;
 	h264->pmv_width_mbs = width_mbs;
 	h264->pmv_height_mbs = height_mbs;
@@ -1080,20 +1122,14 @@ static int histb_h264_pack_rbsp(struct histb_vdec_ctx *ctx,
 	struct histb_vdec_h264_ctx *h264 = ctx->priv;
 	unsigned int first = run->slice_starts[0] / 8;
 	unsigned int end = *payload_bits / 8;
-	unsigned int esc_next = first;
-	unsigned int out = 0, idx = 0, zeros = 0;
+	unsigned int out = 0, idx = 0;
 	unsigned int i;
 	u8 *dst;
 
 	if (!run->src_va || first >= end)
 		return 0;
 
-	for (i = first; i + 2 < end; i++) {
-		if (!run->src_va[i] && !run->src_va[i + 1] &&
-		    run->src_va[i + 2] == 0x03)
-			break;
-	}
-	if (i + 2 >= end)
+	if (histb_h264_scan_triple(run->src_va, end, first, 0x03) >= end)
 		return 0;
 
 	if (h264->rbsp_size < end - first) {
@@ -1110,21 +1146,31 @@ static int histb_h264_pack_rbsp(struct histb_vdec_ctx *ctx,
 	}
 	dst = h264->rbsp_va;
 
-	for (i = first; i < end; i++) {
-		u8 byte = run->src_va[i];
+	i = first;
+	while (i < end) {
+		u32 slice_at = idx < run->num_slices ?
+			run->slice_starts[idx] / 8 : end;
+		u32 esc;
 
-		if (i == esc_next) {
-			esc_next = idx + 1 < run->num_slices ?
-				run->slice_starts[idx + 1] / 8 : end;
+		if (i == slice_at) {
 			run->slice_starts[idx++] = out * 8;
-			zeros = 0;
-		}
-		if (zeros >= 2 && byte == 0x03) {
-			zeros = 0;
 			continue;
 		}
-		dst[out++] = byte;
-		zeros = byte ? 0 : zeros + 1;
+
+		esc = histb_h264_scan_triple(run->src_va,
+					      slice_at < end ? slice_at : end,
+					      i, 0x03);
+		if (esc > i) {
+			memcpy(dst + out, run->src_va + i, esc - i);
+			out += esc - i;
+			i = esc;
+			continue;
+		}
+
+		/* 00 00 03 -> 00 00（丢弃防竞争字节） */
+		dst[out++] = 0;
+		dst[out++] = 0;
+		i += 3;
 	}
 
 	*payload_bits = out * 8;
@@ -1505,10 +1551,11 @@ static int histb_vdec_h264_run(struct histb_vdec_ctx *ctx,
 	v4l2_h264_build_p_ref_list(&builder, run->reflist_p);
 	v4l2_h264_build_b_ref_lists(&builder, run->reflist_b0, run->reflist_b1);
 
+	ret = histb_h264_pmv_alloc(ctx, dst->vb2_buf.index);
+	if (ret < 0)
+		return ret;
 	pic = histb_vdec_pic_slot(&dev->pool);
-	histb_h264_assemble_pic(dev, h264, run,
-				histb_h264_pmv_alloc(ctx, dst->vb2_buf.index),
-				pic);
+	histb_h264_assemble_pic(dev, h264, run, ret, pic);
 
 	for (i = 0; i < n_slices; i++) {
 		u32 nal_bit = run->slice_starts[i];
@@ -1528,8 +1575,10 @@ static int histb_vdec_h264_run(struct histb_vdec_ctx *ctx,
 		    ALIGN(nal_bit + run->slices[i].header_bit_size, 8) >= next_bit)
 			return -EINVAL;
 
-		histb_h264_assemble_slice(dev, ctx, run, h264, i, nal_bit,
-					  next_bit);
+		ret = histb_h264_assemble_slice(dev, ctx, run, h264, i, nal_bit,
+						next_bit);
+		if (ret)
+			return ret;
 	}
 
 	/*

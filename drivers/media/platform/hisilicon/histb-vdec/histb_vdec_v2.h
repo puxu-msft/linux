@@ -1,15 +1,14 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
- * HiSilicon VDH v2 stateless video decoder backend, for the Hi3716CV200
- * (HiVDHV200R004) and Hi3798MV100 (HiVDHV300R001) parts.
+ * HiSilicon VDH v2 无状态视频解码后端，适用于 Hi3716CV200（HiVDHV200R004）、Hi3798MV100（HiVDHV300R001）与 Hi3798MV300（HiVDHV5R2C1，固件标签 HiVDHFMWV500R001）。
  *
  * The hardware decoder consumes fully parsed syntax: the userspace submits
  * per-frame parsing results through V4L2 stateless controls, and the driver
  * packs them into the hardware's downstream message pool, programs the VDM
  * registers and rings the doorbell. Frame storage uses a table+index model:
  * capture buffers are registered by index and referenced by id from the message
- * pool. The engine writes 16x16-tiled NV21 frames; CAPTURE is linear and
- * each dpb index keeps such a tile frame internally (see histb_vdec_frame).
+ * pool.
+ * 引擎把 NV21 帧写进每个 dpb index 各自的内部帧（见 histb_vdec_frame），V2/V3 上为 256x16 分块、V5R2C1 上为行优先，job 完成时再拷出到线性的 CAPTURE buffer。
  *
  * The register layouts, message slot encodings and buffer geometries recorded
  * below were derived from the vendor decoder firmware and then checked against
@@ -43,7 +42,10 @@ struct regmap;
 #define HISTB_VDEC_MAX_DPB_SLOTS	32
 #define HISTB_VDEC_MAX_APC_SLOTS	16
 #define HISTB_VDEC_MAX_PMV_SLOTS	20
-#define HISTB_VDEC_MAX_WIDTH		1920
+/*
+ * 本后端任一型号能接受的最大画面：Hi3716CV200 与 Hi3798MV100 为 1920x1920，Hi3798MV300 为 2560x1440。band-line scratch 与消息池按这个包络分配；格式层对外通告并钳位到的是各型号自己的宽高（histb_vdec_gen::max_width）。
+ */
+#define HISTB_VDEC_MAX_WIDTH		2560
 #define HISTB_VDEC_MAX_HEIGHT		1920
 
 /* Watchdog, matching the fixed timeout the vendor firmware arms here. */
@@ -62,9 +64,8 @@ struct regmap;
 #define HISTB_VDEC_TILE_INFO_SIZE	(64 * 4 * 128)
 #define HISTB_VDEC_PPFD_SIZE		(64 * 4 * 800)
 
-/* Band-line scratch buffers, sized by the vendor layout: 64 * 4 * width bytes
- * each at 1920 columns. Which of these a protocol actually references is fixed
- * per protocol (see the codec sources).
+/* band-line scratch 缓冲区按厂商布局定尺寸：每块 64 * 4 * width 字节，因此跟随所支持的最大宽度。
+ * Which of these a protocol actually references is fixed per protocol (see the codec sources).
  */
 #define HISTB_VDEC_SCRATCH_SIZE		(64 * 4 * HISTB_VDEC_MAX_WIDTH)
 enum histb_vdec_scratch {
@@ -105,10 +106,8 @@ struct histb_vdec_msgpool {
 };
 
 /*
- * Mirror of the luma-stride rule the vendor firmware applies to the tiled write
- * path: a stride that is already a multiple of 256 is kept, otherwise round up
- * to the next 256-byte tile column count and skip to an odd one. 320 -> 768,
- * 640 -> 768, 192 -> 256, 512 -> 512, 1920 -> 2304.
+ * 照搬厂商固件对 1D 写路径施加的亮度 stride 规则：已是 256 倍数的 stride 保持不变，否则向上取整到下一个 256 字节 tile 列数，再跳到奇数列数。
+ * 320 -> 768, 640 -> 768, 192 -> 256, 512 -> 512, 1920 -> 2304.
  */
 static inline unsigned int histb_vdec_tile_stride(unsigned int width)
 {
@@ -132,12 +131,10 @@ static inline unsigned int histb_vdec_hevc_stride(unsigned int width)
 }
 
 /*
- * Frame-buffer geometry of the 1D (tiled) write path, measured on the board
- * and matched to the geometry the firmware programs for H.264. The VDM writes
- * tiles of 256 bytes by 16 picture rows: inside a band the line pitch is the
- * tile width, VDM_YSTRIDE_1D carries the pitch *between* bands, and the chroma
- * tiles start behind the whole luma band array plus a per-picture 1D area. The
- * band count rounds up to an even number because field coding reserves a pair.
+ * 1D 写路径的帧缓冲几何，在板上实测，并与固件为 H.264 编程的几何一致。VDM_YSTRIDE_1D 给出的是 16 行 band *之间* 的间距，色度 band 从整个亮度 band 阵列再加一个逐画面 head-info 区（每个对齐行 16 字节）之后开始。
+ * The band count rounds up to an even number because field coding reserves a pair.
+ *
+ * band 内部各代不同。V2/V3 写 256 字节 × 16 画面行的 tile，所以那里的行距就是 tile 宽度。V5R2C1 按行优先写同样的帧，以 tile stride 为行距：在 Hi3798MV300 上以 1920x1088 实测，H.264（行距 2304 字节）与 HEVC（行距 2048 字节）的帧读回来都是 NV21 光栅图，亮度与色度之间隔着 17408 字节的 head-info 区，与软件解码逐字节一致。
  */
 static inline unsigned int histb_vdec_band_bytes(unsigned int tile_stride)
 {
@@ -234,7 +231,14 @@ struct histb_vdec_dev {
 	struct histb_vdec_msgpool pool;
 	bool			job_running;
 
+	/*
+	 * Hi3798MV300 把 VDH/DSP 时钟门控与 VDH/SCD/MFD 软复位放在 CRG30，而不是放在已建模的 clock provider 里；门控是 clock 的型号上为 NULL。
+	 */
 	struct regmap		*crg;
+	/*
+	 * V5R2C1 的 1D 写路径：帧是行优先的（见 histb_vdec_band_bytes()），HEVC 只有在置位 VDM_CFG1_DBLK_1D_EN 时才走这条路径。
+	 */
+	bool			raster;
 };
 
 /*
@@ -391,8 +395,8 @@ static inline u32 histb_vdec_trail_zero_bits(const u8 *va, u32 end_bit)
 /* Nominal OUTPUT (bitstream) plane size. */
 #define HISTB_VDEC_OUTPUT_SIZE_DEFAULT	(3 * 1024 * 1024)
 
-/* Message pool allocation size. */
-#define HISTB_VDEC_POOL_SIZE		(6 * 1024 * 1024)
+/* 消息池分配大小：要容纳随宽度缩放的 scratch 块。 */
+#define HISTB_VDEC_POOL_SIZE		(8 * 1024 * 1024)
 
 /*
  * Layout of the per-protocol table area, as offsets from

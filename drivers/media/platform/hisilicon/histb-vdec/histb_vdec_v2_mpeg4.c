@@ -455,16 +455,9 @@ static int histb_vdec_mpeg4_vol(struct histb_vdec_mpeg4_vol *vol, const u8 *buf,
 	height = histb_vdec_mpeg4_bs_get(&bs, 13);
 	histb_vdec_mpeg4_bs_skip(&bs, 1);
 	/*
-	 * video_object_layer_width/height (14496-2 6.2.1) are the grid every
-	 * later picture is measured on, and they are 13-bit fields: 0 has no
-	 * macroblock grid at all (histb_vdec_mpeg4_grid() would derive a total
-	 * of 0 from them, which the packet parse width ilog2(total - 1) and the
-	 * engine's macroblock count mb_total - 1 cannot express), and a size
-	 * beyond HISTB_VDEC_MAX_WIDTH/MAX_HEIGHT is one the format layer
-	 * neither advertises nor can clamp into a capture buffer, so no CAPTURE
-	 * geometry this job could be programmed against exists. Refused per VOL
-	 * rather than per picture: caching such a grid would mislabel every
-	 * later picture's descriptor range.
+	 * video_object_layer_width/height（14496-2 6.2.1）是之后每个画面所依据的网格，它们是 13 位字段：0 根本没有宏块网格（histb_vdec_mpeg4_grid() 会由它们推出总数 0，而包解析宽度 ilog2(total - 1) 和引擎的宏块计数 mb_total - 1 都无法表达它）；超出 HISTB_VDEC_MAX_WIDTH/MAX_HEIGHT（任何型号的格式层通告都不会超出的后端包络）的尺寸无法钳位进 capture buffer，所以不存在可供这个 job 编程的 CAPTURE 几何（在包络之内、但超出本型号自身宽高的尺寸，会在画面运行时按 capture 几何拒绝）。
+	 * Refused per VOL rather than per picture: caching such a grid would
+	 * mislabel every later picture's descriptor range.
 	 */
 	if (!width || !height || width > HISTB_VDEC_MAX_WIDTH ||
 	    height > HISTB_VDEC_MAX_HEIGHT)
@@ -509,11 +502,9 @@ static int histb_vdec_mpeg4_vol(struct histb_vdec_mpeg4_vol *vol, const u8 *buf,
 	/*
 	 * not_8_bit (14496-2 6.2.1): set, it opens the quant_precision,
 	 * vertical FDC length and horizontal FDC length fields and moves the
-	 * sample depth away from 8. Every consumer here is written for the
-	 * 8-bit, precision-5 shape: the quantiser travels in the descriptor's
-	 * 5-bit field, the matrix words carry one byte per coefficient, and the
-	 * capture format is the 8-bit tiled NV21 the board read back
-	 * byte-exactly. The firmware's own VOL walk refuses the same set.
+	 * sample depth away from 8.
+	 * 这里的每个使用者都按 8 位、precision 5 的形态编写：量化参数放在描述符的 5 位字段里，矩阵字每个系数占一个字节，capture 格式是板上逐字节读回一致的 8 位 NV21。
+	 * The firmware's own VOL walk refuses the same set.
 	 * Accepting it would need both a depth-carrying capture format and
 	 * measured matrix packing for that depth.
 	 */

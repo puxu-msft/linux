@@ -22,7 +22,9 @@ description: |-
   also drops the subsystem reset. Hi3716CV200 has the same block, at the same
   addresses and with the same register offsets, and runs the older generation
   of the core (HiVDHV200R004 against HiVDHV300R001), whose only difference that
-  reaches this binding is that it has no HEVC path. The V5R6 block of
+  reaches this binding is that it has no HEVC path.
+  hi3798mv300 的 HiVDHV5R2C1 block 保留了 v2 寄存器窗口、SCD block 与两路复位请求，但它的 VDH 与 DSP 时钟门控位于 CRG30、紧挨这两路复位，且没有 clock provider 建模它们，所以节点给出 CRG syscon 而不是 clock。
+  The V5R6 block of
   hi3798mv200 is one 64 KiB window holding the decode core, the stream
   distributor and the bitplane unpacker, and resets and clocks itself through
   its own wrapper rather than through the clock and reset generator.
@@ -33,6 +35,7 @@ properties:
       - hisilicon,hi3716cv200-vdec
       - hisilicon,hi3798mv100-vdec
       - hisilicon,hi3798mv200-vdec
+      - hisilicon,hi3798mv300-vdec
 
   reg:
     minItems: 1
@@ -65,8 +68,9 @@ properties:
     description: |
       The V300 generation takes two reset requests in the clock and reset
       generator, both of which the vendor firmware releases before the register
-      window answers reads - the subsystem-wide one and the VDM's own one. The
-      V5R6 generation takes none of them: its core's own wrapper carries the
+      window answers reads - the subsystem-wide one and the VDM's own one.
+      Hi3798MV300 同样取这两路，即 CRG30 的 bit 4 与 bit 6。
+      The V5R6 generation takes none of them: its core's own wrapper carries the
       reset request and acknowledge.
 
   reset-names:
@@ -76,6 +80,11 @@ properties:
       enum:
         - global
         - vdm
+
+  hisilicon,crg:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description:
+      指向 CRG syscon 的 phandle。Hi3798MV300 把 VDH 与 DSP 时钟门控（bit 0 与 1）以及 VDH、SCD、MFD 软复位（bit 4 到 6）放在 CRG30（0x078）；驱动在首次访问寄存器之前打开门控并脉冲复位。
 
   memory-region:
     maxItems: 1
@@ -120,12 +129,41 @@ allOf:
             - const: global
             - const: vdm
         interrupt-names: false
+        hisilicon,crg: false
       required:
         - reg-names
         - clocks
         - clock-names
         - resets
         - reset-names
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: hisilicon,hi3798mv300-vdec
+    then:
+      properties:
+        reg:
+          maxItems: 2
+          minItems: 2
+        reg-names:
+          items:
+            - const: vdm
+            - const: scd
+        clocks: false
+        clock-names: false
+        resets:
+          minItems: 2
+          maxItems: 2
+        reset-names:
+          items:
+            - const: global
+            - const: vdm
+      required:
+        - reg-names
+        - resets
+        - reset-names
+        - hisilicon,crg
   - if:
       properties:
         compatible:
@@ -142,6 +180,7 @@ allOf:
         resets: false
         reset-names: false
         memory-region: false
+        hisilicon,crg: false
       required:
         - interrupt-names
 
@@ -160,6 +199,20 @@ examples:
         clock-names = "vdec";
         resets = <&crg 0x78 4>, <&crg 0x78 6>;
         reset-names = "global", "vdm";
+    };
+
+  - |
+    #include <dt-bindings/interrupt-controller/arm-gic.h>
+    #include <dt-bindings/interrupt-controller/irq.h>
+
+    video-decoder@8c30000 {
+        compatible = "hisilicon,hi3798mv300-vdec";
+        reg = <0x8c30000 0x1100>, <0x8c3c000 0x1000>;
+        reg-names = "vdm", "scd";
+        interrupts = <GIC_SPI 95 IRQ_TYPE_LEVEL_HIGH>;
+        resets = <&crg 0x78 4>, <&crg 0x78 6>;
+        reset-names = "global", "vdm";
+        hisilicon,crg = <&crg>;
     };
 
   - |
