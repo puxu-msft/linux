@@ -428,7 +428,7 @@ device_initcall(register_arm64_panic_block);
 static int __init check_mmu_enabled_at_boot(void)
 {
 	if (!efi_enabled(EFI_BOOT) && mmu_enabled_at_boot)
-		panic("Non-EFI boot detected with MMU and caches enabled");
+		pr_warn("Non-EFI boot detected with MMU and caches enabled; continuing (vendor fastboot chain)\n");
 	return 0;
 }
 device_initcall_sync(check_mmu_enabled_at_boot);
