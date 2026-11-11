@@ -10,6 +10,7 @@
 #include <linux/io.h>
 #include <linux/module.h>
 #include <linux/of.h>
+#include <linux/of_address.h>
 #include <linux/phy/phy.h>
 #include <linux/platform_device.h>
 #include <linux/reset.h>
@@ -26,6 +27,8 @@
 #define PHY_TYPE_1	1
 /* Hi3798MV200: no test port, so clocks and resets are all the phy needs */
 #define PHY_TYPE_2	2
+/* Hi3798MV300：PHY 寄存器直接映射到内存地址空间，不经 test port */
+#define PHY_TYPE_MMIO	3
 
 #define PHY_TEST_DATA		GENMASK(7, 0)
 #define PHY_TEST_ADDR_OFFSET	8
@@ -47,6 +50,7 @@
 struct hisi_inno_phy_port {
 	struct reset_control *utmi_rst;
 	struct hisi_inno_phy_priv *priv;
+	void __iomem *base;
 };
 
 struct hisi_inno_phy_priv {
@@ -64,6 +68,11 @@ static void hisi_inno_phy_write_reg(struct hisi_inno_phy_priv *priv,
 	void __iomem *reg = priv->mmio;
 	u32 val;
 	u32 value;
+
+	if (priv->type == PHY_TYPE_MMIO) {
+		writel(data, priv->ports[port].base + addr * 4);
+		return;
+	}
 
 	if (priv->type == PHY_TYPE_0)
 		val = (data & PHY_TEST_DATA) |
@@ -87,9 +96,26 @@ static void hisi_inno_phy_write_reg(struct hisi_inno_phy_priv *priv,
 	writel(val, reg);
 }
 
+/*
+ * Hi3798MV300 每个端口还要多写五个寄存器：只打开 PHY 时钟时，每个端口都会复位失败（"port 2 reset error -110"）。写入值取自原厂 bootloader 的 USB2 初始化例程（chip ID 0x37980210 那个分支），每组写入后的延时也照搬。
+ */
+struct hisi_inno_phy_setup_step {
+	u32 addr;
+	u32 data;
+	u32 delay_us;
+};
+
+static const struct hisi_inno_phy_setup_step hisi_inno_phy_mv300_setup[] = {
+	{ 0x02, 0x6c, 2000 },
+	{ 0x00, 0x18, 2000 },
+	{ 0x04, 0xd7, 20 },
+	{ 0x1d, 0x1e, 20 },
+	{ 0x1f, 0x6e, 20 },
+};
+
 static void hisi_inno_phy_setup(struct hisi_inno_phy_priv *priv)
 {
-	int i;
+	int i, j;
 
 	/*
 	 * Hi3798MV200 has no test port: the window base is the first register
@@ -104,6 +130,19 @@ static void hisi_inno_phy_setup(struct hisi_inno_phy_priv *priv)
 	for (i = 0; i < priv->num_ports; i++)
 		hisi_inno_phy_write_reg(priv, i, 0x06, PHY_CLK_ENABLE);
 	msleep(PHY_CLK_STABLE_TIME);
+
+	if (priv->type != PHY_TYPE_MMIO)
+		return;
+
+	for (j = 0; j < ARRAY_SIZE(hisi_inno_phy_mv300_setup); j++) {
+		const struct hisi_inno_phy_setup_step *step =
+			&hisi_inno_phy_mv300_setup[j];
+
+		for (i = 0; i < priv->num_ports; i++)
+			hisi_inno_phy_write_reg(priv, i, step->addr,
+						step->data);
+		usleep_range(step->delay_us, step->delay_us * 2);
+	}
 }
 
 static int hisi_inno_phy_init(struct phy *phy)
@@ -154,38 +193,52 @@ static int hisi_inno_phy_probe(struct platform_device *pdev)
 	struct hisi_inno_phy_priv *priv;
 	struct phy_provider *provider;
 	int i = 0;
-	int ret;
 
 	priv = devm_kzalloc(dev, sizeof(*priv), GFP_KERNEL);
 	if (!priv)
 		return -ENOMEM;
 
-	priv->mmio = devm_platform_ioremap_resource(pdev, 0);
-	if (IS_ERR(priv->mmio)) {
-		ret = PTR_ERR(priv->mmio);
-		return ret;
-	}
-
 	priv->ref_clk = devm_clk_get(dev, NULL);
 	if (IS_ERR(priv->ref_clk))
 		return PTR_ERR(priv->ref_clk);
 
-	priv->por_rst = devm_reset_control_get_exclusive(dev, NULL);
+	priv->por_rst = devm_reset_control_array_get_exclusive(dev);
 	if (IS_ERR(priv->por_rst))
 		return PTR_ERR(priv->por_rst);
 
 	priv->type = (uintptr_t) of_device_get_match_data(dev);
+	/*
+	 * MMIO 变体改为逐个映射端口子节点；父窗口覆盖同一段字节，在这里申请它会让子节点的 ioremap 以 -EBUSY 失败。
+	 */
+	if (priv->type != PHY_TYPE_MMIO) {
+		priv->mmio = devm_platform_ioremap_resource(pdev, 0);
+		if (IS_ERR(priv->mmio))
+			return PTR_ERR(priv->mmio);
+	}
 
 	for_each_child_of_node_scoped(np, child) {
 		struct reset_control *rst;
 		struct phy *phy;
+		void __iomem *base = NULL;
 
 		rst = of_reset_control_get_exclusive(child, NULL);
 		if (IS_ERR(rst))
 			return PTR_ERR(rst);
 
+		if (priv->type == PHY_TYPE_MMIO) {
+			base = devm_of_iomap(dev, child, 0, NULL);
+			if (IS_ERR(base))
+				return PTR_ERR(base);
+			if (!base) {
+				dev_err(dev, "%pOFn has no mappable reg\n",
+					child);
+				return -EINVAL;
+			}
+		}
+
 		priv->ports[i].utmi_rst = rst;
 		priv->ports[i].priv = priv;
+		priv->ports[i].base = base;
 
 		phy = devm_phy_create(dev, child, &hisi_inno_phy_ops);
 		if (IS_ERR(phy))
@@ -216,6 +269,8 @@ static const struct of_device_id hisi_inno_phy_of_match[] = {
 	  .data = (void *) PHY_TYPE_1 },
 	{ .compatible = "hisilicon,hi3798mv200-usb2-phy",
 	  .data = (void *) PHY_TYPE_2 },
+	{ .compatible = "hisilicon,hi3798mv300-usb2-phy",
+	  .data = (void *) PHY_TYPE_MMIO },
 	{ },
 };
 MODULE_DEVICE_TABLE(of, hisi_inno_phy_of_match);
