@@ -53,12 +53,10 @@
 #define HI3798_TSENSOR_BIAS		40
 
 /*
- * Anything outside this is a misread rather than a real temperature. Reporting
- * it would be worse than reporting nothing: the zone's critical trip powers
- * the board off, and a single spurious sample should not do that.
+ * 误读必须拒收而不是上报：zone 的 critical trip 会让板子关机，一次虚假读数不应触发它。即使是全 1 采样（码值 1023），拟合结果也不超过 143 degC，对换算结果做范围检查永远抓不到真正要紧的那种读数，所以改为检查采样本身。码值钉在 10 位范围的任一端，是传感器失效或没有时钟（或总线读回全 1）的表现；同一个稳定窗口内取的八个采样若相差超过 64 个码值（每码约 0.2 degC，约合 13 degC），就不是同一个温度。低于拟合下端 -40 degC 的结果同样拒收。
  */
+#define HI3798_TSENSOR_SPREAD_MAX	64
 #define HI3798_TEMP_MIN_MC		(-40000)
-#define HI3798_TEMP_MAX_MC		(150000)
 
 struct hi3798_thermal {
 	void __iomem *regs;
@@ -68,8 +66,8 @@ struct hi3798_thermal {
 static int hi3798_thermal_get_temp(struct thermal_zone_device *tz, int *temp)
 {
 	struct hi3798_thermal *data = thermal_zone_device_priv(tz);
-	unsigned int sum = 0;
-	int i, millicelsius;
+	unsigned int sum = 0, lo = HI3798_TSENSOR_SAMPLE_MASK, hi = 0;
+	int i, j, millicelsius;
 
 	mutex_lock(&data->lock);
 
@@ -79,13 +77,23 @@ static int hi3798_thermal_get_temp(struct thermal_zone_device *tz, int *temp)
 	for (i = 0; i < HI3798_TSENSOR_WORDS; i++) {
 		u32 val = readl(data->regs + HI3798_TSENSOR_DATA + i * 4);
 
-		sum += val & HI3798_TSENSOR_SAMPLE_MASK;
-		sum += (val >> 16) & HI3798_TSENSOR_SAMPLE_MASK;
+		for (j = 0; j < 2; j++) {
+			unsigned int s = (val >> (16 * j)) &
+					 HI3798_TSENSOR_SAMPLE_MASK;
+
+			sum += s;
+			lo = min(lo, s);
+			hi = max(hi, s);
+		}
 	}
 
 	writel(HI3798_TSENSOR_DISABLE, data->regs + HI3798_TSENSOR_CTRL);
 
 	mutex_unlock(&data->lock);
+
+	if (lo == 0 || hi == HI3798_TSENSOR_SAMPLE_MASK ||
+	    hi - lo > HI3798_TSENSOR_SPREAD_MAX)
+		return -EAGAIN;
 
 	sum /= HI3798_TSENSOR_SAMPLES;
 
@@ -93,8 +101,7 @@ static int hi3798_thermal_get_temp(struct thermal_zone_device *tz, int *temp)
 	millicelsius = millicelsius / HI3798_TSENSOR_DIV - HI3798_TSENSOR_BIAS;
 	millicelsius *= 1000;
 
-	if (millicelsius < HI3798_TEMP_MIN_MC ||
-	    millicelsius > HI3798_TEMP_MAX_MC)
+	if (millicelsius < HI3798_TEMP_MIN_MC)
 		return -EAGAIN;
 
 	*temp = millicelsius;
@@ -130,8 +137,7 @@ static int hi3798_thermal_probe(struct platform_device *pdev)
 				     "failed to register thermal zone\n");
 
 	/*
-	 * Take one reading now. A sensor that cannot produce a plausible
-	 * number is better found here than at the first trip evaluation.
+	 * 注册 zone 时已经读过一次传感器并评估了 trip；这一次只是把第一个温度（或传感器给不出温度的失败）记进日志。
 	 */
 	ret = hi3798_thermal_get_temp(tzd, &temp);
 	if (ret)

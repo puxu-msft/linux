@@ -256,7 +256,7 @@ config HI3798_THERMAL
 	tristate "HiSilicon Hi3798MV200/MV300 temperature sensor"
 	depends on ARCH_HISI || COMPILE_TEST
 	depends on HAS_IOMEM
-	depends on OF
+	depends on THERMAL_OF
 	help
 	  Temperature sensor in the PMC block of the Hi3798MV200 and
 	  Hi3798MV300 set-top box SoCs. Unrelated to HISI_THERMAL, which
