@@ -806,6 +806,7 @@ static int histb_hdmi_ddc_xfer(struct i2c_adapter *adapter, struct i2c_msg *msgs
 	bool pointer = false;
 	u8 offset = 0, seg = 0;
 	unsigned int i = 0;
+	int total = num;
 	int ret;
 
 	if (num < 1 || num > 3)
@@ -863,7 +864,8 @@ static int histb_hdmi_ddc_xfer(struct i2c_adapter *adapter, struct i2c_msg *msgs
 			goto release;
 	}
 
-	ret = num;
+	/* i2c_transfer() 的调用者按全部消息计数，segment 写入也算一条。 */
+	ret = total;
 
 release:
 	histb_hdmi_ddc_arb(hdmi, false);
