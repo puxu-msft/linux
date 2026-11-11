@@ -28,6 +28,7 @@ obj-$(CONFIG_RC_MAP) += \
 			rc-budget-ci-old.o \
 			rc-cinergy-1400.o \
 			rc-cinergy.o \
+			rc-cm201.o \
 			rc-ct-90405.o \
 			rc-d680-dmb.o \
 			rc-delock-61959.o \
