@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
+obj-$(CONFIG_VIDEO_HISTB_VDEC) += histb-vdec.o
 
 histb-vdec-y += histb_vdec_core.o
 histb-vdec-y += histb_vdec_v2_drv.o

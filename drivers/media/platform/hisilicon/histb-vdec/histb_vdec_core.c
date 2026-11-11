@@ -1064,3 +1064,4 @@ module_platform_driver(histb_vdec_driver);
 MODULE_AUTHOR("David Yang <mmyangfl@gmail.com>");
 MODULE_DESCRIPTION("HiSilicon HiSTB stateless video decoder driver");
 MODULE_LICENSE("GPL");
+MODULE_IMPORT_NS("DMA_BUF");
