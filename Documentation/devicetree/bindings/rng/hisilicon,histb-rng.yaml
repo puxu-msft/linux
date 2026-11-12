@@ -10,24 +10,23 @@ maintainers:
   - David Yang <mmyangfl@gmail.com>
 
 description: |
-  The TRNG block of HiSilicon STB SoCs. It exposes three registers -- a control
-  word that starts the post processor and sets its depth, a data word, and a
-  status word whose low bits count how many words are ready. The block has no
-  gate of its own in the CRG: on hi3798mv100 it shares the SHA engine's clock
-  gate and soft reset (PERI CRG register +0xc4, bits 0 and 4), which the boot
-  loader leaves enabled, so reading the block needs no clocks or resets
-  property.
+  The TRNG block of HiSilicon STB SoCs.
+  它有三个寄存器：控制字、数据字，以及记录就绪字数的状态字。布局有两种。在 hi3798mv100（"hisilicon,histb-rng"）上，控制字启动后处理器并设置其深度，状态字的低位保存计数；该 block 与 SHA 引擎共用时钟门控和软复位（PERI CRG 寄存器 +0xc4 的 bit 0 与 bit 4），boot loader 会让它们保持开启。hi3798cv200 这一代（"hisilicon,hi3798cv200-rng"，也包括 hi3798mv200 与 hi3798mv300）在控制字 bit 3 增加了 DRBG 使能，计数放在状态字 bit 15:8，低字节承载振荡器状态标志；它的窗口没有自己的时钟或复位。两种布局都不需要 clocks 或 resets 属性。
 
 properties:
   compatible:
-    const: hisilicon,histb-rng
+    oneOf:
+      - const: hisilicon,histb-rng
+      - const: hisilicon,hi3798cv200-rng
+      - items:
+          - const: hisilicon,hi3798mv300-rng
+          - const: hisilicon,hi3798cv200-rng
 
   reg:
     maxItems: 1
     description:
-      The three registers, so the entry starts at the control word. On
-      hi3798mv100 the control word sits at the base of the enclosing 4 KiB TRNG
-      window at 0xf8005000.
+      The three registers, so the entry starts at the control word.
+      在 hi3798mv100 上，控制字位于外层 4 KiB TRNG 窗口（0xf8005000）的起始处；在 hi3798mv300 上位于 0xf8005200。
 
 required:
   - compatible

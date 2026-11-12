@@ -10,19 +10,31 @@
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/platform_device.h>
+#include <linux/property.h>
 
 #define RNG_CTRL		0x0
 #define  RNG_SOURCE			GENMASK(1, 0)
+#define  DRBG_ENABLE			BIT(3)		/* hi3798cv200 布局 */
 #define  DROP_ENABLE			BIT(5)
 #define  POST_PROCESS_ENABLE		BIT(7)
 #define  POST_PROCESS_DEPTH		GENMASK(15, 8)
 #define RNG_NUMBER		0x4
 #define RNG_STAT		0x8
 #define  DATA_COUNT			GENMASK(2, 0)	/* max 4 */
+#define  FIFO_DATA_COUNT		GENMASK(15, 8)	/* hi3798cv200 布局，最大 32 */
+
+/*
+ * hi3798cv200 这一代（厂商称 "TRNG v200"：cv200、mv200、mv300、mv310）保留三个寄存器，但把就绪计数移到 STAT[15:8]（其低字节为振荡器状态标志），并把 CTRL 的 bit 3、4、6 改作 DRBG、pre-process 与 mix 的使能位。
+ */
+struct histb_rng_soc {
+	u32 count_mask;
+	bool drbg;	/* 经 DRBG 输出；没有 post-process depth 可调 */
+};
 
 struct histb_rng_priv {
 	struct hwrng rng;
 	void __iomem *base;
+	const struct histb_rng_soc *soc;
 };
 
 /*
@@ -30,12 +42,13 @@ struct histb_rng_priv {
  * depth = 1 -> ~1ms
  * depth = 255 -> ~16ms
  */
-static int histb_rng_wait(void __iomem *base)
+static int histb_rng_wait(struct histb_rng_priv *priv)
 {
 	u32 val;
 
-	return readl_relaxed_poll_timeout(base + RNG_STAT, val,
-					  val & DATA_COUNT, 1000, 30 * 1000);
+	return readl_relaxed_poll_timeout(priv->base + RNG_STAT, val,
+					  val & priv->soc->count_mask,
+					  1000, 30 * 1000);
 }
 
 static void histb_rng_init(void __iomem *base, unsigned int depth)
@@ -56,16 +69,28 @@ static void histb_rng_init(void __iomem *base, unsigned int depth)
 	writel_relaxed(val, base + RNG_CTRL);
 }
 
+/*
+ * 振荡源 2 经 DRBG 输出，pre/post processing、drop 与 mix 全部关闭：这是厂商内核的 drv_trng_randnum 在这一代上设置的配置。
+ */
+static void histb_rng_drbg_init(void __iomem *base)
+{
+	u32 val = readl_relaxed(base + RNG_CTRL);
+
+	val &= ~(GENMASK(15, 4) | RNG_SOURCE);
+	val |= DRBG_ENABLE | 2;
+	writel_relaxed(val, base + RNG_CTRL);
+}
+
 static int histb_rng_read(struct hwrng *rng, void *data, size_t max, bool wait)
 {
 	struct histb_rng_priv *priv = container_of(rng, typeof(*priv), rng);
 	void __iomem *base = priv->base;
 
 	for (int i = 0; i < max; i += sizeof(u32)) {
-		if (!(readl_relaxed(base + RNG_STAT) & DATA_COUNT)) {
+		if (!(readl_relaxed(base + RNG_STAT) & priv->soc->count_mask)) {
 			if (!wait)
 				return i;
-			if (histb_rng_wait(base)) {
+			if (histb_rng_wait(priv)) {
 				pr_err("failed to generate random number, generated %d\n",
 				       i);
 				return i ? i : -ETIMEDOUT;
@@ -113,7 +138,19 @@ static struct attribute *histb_rng_attrs[] = {
 	NULL,
 };
 
-ATTRIBUTE_GROUPS(histb_rng);
+static umode_t histb_rng_attr_is_visible(struct kobject *kobj,
+					 struct attribute *attr, int n)
+{
+	struct histb_rng_priv *priv = dev_get_drvdata(kobj_to_dev(kobj));
+
+	return priv->soc->drbg ? 0 : attr->mode;
+}
+
+static const struct attribute_group histb_rng_group = {
+	.attrs = histb_rng_attrs,
+	.is_visible = histb_rng_attr_is_visible,
+};
+__ATTRIBUTE_GROUPS(histb_rng);
 
 static int histb_rng_probe(struct platform_device *pdev)
 {
@@ -130,13 +167,18 @@ static int histb_rng_probe(struct platform_device *pdev)
 	if (IS_ERR(base))
 		return PTR_ERR(base);
 
-	histb_rng_init(base, 144);
-	if (histb_rng_wait(base)) {
+	priv->base = base;
+	priv->soc = device_get_match_data(dev);
+
+	if (priv->soc->drbg)
+		histb_rng_drbg_init(base);
+	else
+		histb_rng_init(base, 144);
+	if (histb_rng_wait(priv)) {
 		dev_err(dev, "cannot bring up device\n");
 		return -ENODEV;
 	}
 
-	priv->base = base;
 	priv->rng.name = pdev->name;
 	priv->rng.read = histb_rng_read;
 	ret = devm_hwrng_register(dev, &priv->rng);
@@ -150,8 +192,18 @@ static int histb_rng_probe(struct platform_device *pdev)
 	return 0;
 }
 
+static const struct histb_rng_soc histb_rng_soc = {
+	.count_mask = DATA_COUNT,
+};
+
+static const struct histb_rng_soc hi3798cv200_rng_soc = {
+	.count_mask = FIFO_DATA_COUNT,
+	.drbg = true,
+};
+
 static const struct of_device_id histb_rng_of_match[] = {
-	{ .compatible = "hisilicon,histb-rng", },
+	{ .compatible = "hisilicon,histb-rng", .data = &histb_rng_soc },
+	{ .compatible = "hisilicon,hi3798cv200-rng", .data = &hi3798cv200_rng_soc },
 	{ }
 };
 MODULE_DEVICE_TABLE(of, histb_rng_of_match);
