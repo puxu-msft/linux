@@ -10,6 +10,7 @@
 #include <dt-bindings/clock/hisilicon,hi3798mv200-sysctrl.h>
 #include <linux/bitfield.h>
 #include <linux/clk-provider.h>
+#include <linux/iopoll.h>
 #include <linux/module.h>
 #include <linux/of_device.h>
 #include <linux/platform_device.h>
@@ -133,8 +134,12 @@ static struct hisi_mux_clock hi3798mv200_mux_clks[] = {
 		0, 0x58, 8, 2, 0, mux_table_2bit_pattern1, },
 	{ HI3798MV200_MDE3_BUS_CLK, "clk_mde3_bus", mde3_bus_mux_p, ARRAY_SIZE(mde3_bus_mux_p),
 		0, 0x58, 10, 1, 0, mux_table_1bit, },
+	/*
+	 * 变频只落到 CPU PLL，从不换到别的源：厂商内核从不写这个选择字段（[2:0]），只回读它；没有 NO_REPARENT 时，clock core 会切到恰好与请求频率相等的那个固定父时钟。
+	 */
 	{ HI3798MV200_CPU_CLK, "clk_cpu", cpu_mux_p, ARRAY_SIZE(cpu_mux_p),
-		CLK_SET_RATE_PARENT, 0x48, 0, 3, CLK_MUX_ROUND_CLOSEST, cpu_mux_table },
+		CLK_SET_RATE_PARENT | CLK_SET_RATE_NO_REPARENT,
+		0x48, 0, 3, CLK_MUX_ROUND_CLOSEST, cpu_mux_table },
 	{ HI3798MV200_EMMC_CLK_SEL, "mmc_mux", mmc_mux_p, ARRAY_SIZE(mmc_mux_p),
 		0, 0xa0, 8, 3, CLK_MUX_ROUND_CLOSEST, mmc_mux_table, },
 	{ HI3798MV200_COMBPHY_REFCLK_SEL, "combphy_mux", comphy_mux_p,
@@ -960,7 +965,7 @@ static struct clk *hi3798mv200_clk_register_hd_pix(struct device *dev,
 }
 
 static const struct hisi_pll_clock hi3798mv200_plls[] = {
-	{ HI3798MV200_APLL_CLK, "apll", "clk_osc", CLK_IS_CRITICAL, 0x0 },
+	/* apll 即 CPU PLL，有自己的 ops：见 hi3798mv200_register_cpu_pll()。 */
 	/*
 	 * bpll is not marked critical.  It feeds the PCIe/ComboPHY 100 MHz
 	 * reference, which a boot loader may leave unprogrammed on a board that
@@ -990,6 +995,178 @@ static const struct hisi_pll_clock hi3798mv200_plls[] = {
 	{ HI3798MV200_QPLL_CLK, "qpll", "clk_osc", CLK_IS_CRITICAL, 0x38 },
 };
 
+/*
+ * CPU PLL 通过调谐单元变频，即厂商 4.4 内核里 mpu_clk_set_rate() 的序列（HiSTB SDK 的 clock_mpu.c，CM201-2 自带的厂商内核里也一样）：把新的反馈分频写入 CRG105，步长 1，打开调谐模式，在调谐使能上给一个上升沿，然后等待。像通用 hisi_pll 那样改写 PLL_CFG1 里的分频，不是厂商改这个时钟的方式。步长为 1 时 PLL 逐步走到目标值，而不是跳变。
+ *
+ * rate = parent * fbdiv / (postdiv1 * postdiv2 * refdiv)
+ */
+#define HI3798MV200_CPU_PLL_CFG0	0x000	/* postdiv1 [26:24], postdiv2 [30:28] */
+#define HI3798MV200_CPU_PLL_CFG1	0x004	/* refdiv [17:12], fbdiv [11:0] */
+#define HI3798MV200_CPU_TUNE_INT	0x1a4	/* CRG105 */
+#define HI3798MV200_CPU_TUNE_FRAC	0x1a8	/* CRG106 */
+#define HI3798MV200_CPU_TUNE_STEP_INT	0x1ac	/* CRG107 */
+#define HI3798MV200_CPU_TUNE_STEP_FRAC	0x1b0	/* CRG108 */
+#define HI3798MV200_CPU_TUNE_CTRL	0x1b4	/* CRG109 */
+#define HI3798MV200_CPU_TUNE_STAT	0x294	/* CRG165 */
+
+#define HI3798MV200_CPU_TUNE_MODE	BIT(2)
+#define HI3798MV200_CPU_TUNE_EN		BIT(3)
+#define HI3798MV200_CPU_TUNE_BUSY	BIT(13)
+#define HI3798MV200_CPU_FBDIV		GENMASK(11, 0)
+
+/*
+ * CPU 供电是一路由 PWM 微调的 buck，目前还没有 mainline 驱动设置它，所以电压停在 bootloader 为它同时设定的 1.2 GHz 所选的值：在这个电压下降频是安全的，升频则不然。
+ */
+#define HI3798MV200_CPU_RATE_MIN	400000000UL
+#define HI3798MV200_CPU_RATE_MAX	1200000000UL
+
+struct hi3798mv200_cpu_pll {
+	struct clk_hw hw;
+	void __iomem *base;
+};
+
+#define to_cpu_pll(_hw) container_of(_hw, struct hi3798mv200_cpu_pll, hw)
+
+static unsigned int hi3798mv200_cpu_pll_div(struct hi3798mv200_cpu_pll *pll)
+{
+	u32 cfg0 = readl(pll->base + HI3798MV200_CPU_PLL_CFG0);
+	u32 cfg1 = readl(pll->base + HI3798MV200_CPU_PLL_CFG1);
+
+	return FIELD_GET(GENMASK(26, 24), cfg0) * FIELD_GET(GENMASK(30, 28), cfg0) *
+	       FIELD_GET(GENMASK(17, 12), cfg1);
+}
+
+static unsigned long hi3798mv200_cpu_pll_recalc_rate(struct clk_hw *hw,
+						     unsigned long parent_rate)
+{
+	struct hi3798mv200_cpu_pll *pll = to_cpu_pll(hw);
+	unsigned int div = hi3798mv200_cpu_pll_div(pll);
+	u32 fbdiv;
+
+	if (!div)
+		return 0;
+
+	/*
+	 * 调谐过之后，实际生效的是 CRG165 里的实时分频；首次调谐之前它读出 0（CM201-2 的 fastboot 只编程 PLL_CFG1、从不调谐），此时生效的是 PLL_CFG1。厂商的 get_rate 也是这样做的。
+	 */
+	fbdiv = FIELD_GET(HI3798MV200_CPU_FBDIV,
+			  readl(pll->base + HI3798MV200_CPU_TUNE_STAT));
+	if (!fbdiv)
+		fbdiv = FIELD_GET(HI3798MV200_CPU_FBDIV,
+				  readl(pll->base + HI3798MV200_CPU_PLL_CFG1));
+
+	return DIV_ROUND_CLOSEST_ULL((u64)parent_rate * fbdiv, div);
+}
+
+static unsigned long hi3798mv200_cpu_pll_pick(struct hi3798mv200_cpu_pll *pll,
+					      unsigned long rate,
+					      unsigned long parent_rate,
+					      u32 *fbdiv_out)
+{
+	unsigned int div = hi3798mv200_cpu_pll_div(pll);
+	u32 fbdiv;
+
+	if (!div || !parent_rate)
+		return 0;
+
+	rate = clamp(rate, HI3798MV200_CPU_RATE_MIN, HI3798MV200_CPU_RATE_MAX);
+	fbdiv = DIV_ROUND_CLOSEST_ULL((u64)rate * div, parent_rate);
+	fbdiv = clamp_t(u32, fbdiv, 1, HI3798MV200_CPU_FBDIV);
+	if (fbdiv_out)
+		*fbdiv_out = fbdiv;
+
+	return DIV_ROUND_CLOSEST_ULL((u64)parent_rate * fbdiv, div);
+}
+
+static int hi3798mv200_cpu_pll_determine_rate(struct clk_hw *hw,
+					      struct clk_rate_request *req)
+{
+	unsigned long rate = hi3798mv200_cpu_pll_pick(to_cpu_pll(hw), req->rate,
+						      req->best_parent_rate, NULL);
+
+	if (!rate)
+		return -EINVAL;
+	req->rate = rate;
+	return 0;
+}
+
+static void hi3798mv200_cpu_pll_field(struct hi3798mv200_cpu_pll *pll,
+				      unsigned int reg, u32 mask, u32 val)
+{
+	u32 v = readl(pll->base + reg);
+
+	writel((v & ~mask) | (val & mask), pll->base + reg);
+}
+
+static int hi3798mv200_cpu_pll_set_rate(struct clk_hw *hw, unsigned long rate,
+					unsigned long parent_rate)
+{
+	struct hi3798mv200_cpu_pll *pll = to_cpu_pll(hw);
+	void __iomem *ctrl_reg = pll->base + HI3798MV200_CPU_TUNE_CTRL;
+	u32 fbdiv, ctrl, stat;
+	int ret;
+
+	if (!hi3798mv200_cpu_pll_pick(pll, rate, parent_rate, &fbdiv))
+		return -EINVAL;
+
+	/* 与厂商一样只改字段本身：整数字段是低 12 位，小数字段是低 24 位，其余位保持原值。 */
+	hi3798mv200_cpu_pll_field(pll, HI3798MV200_CPU_TUNE_INT, GENMASK(11, 0), fbdiv);
+	hi3798mv200_cpu_pll_field(pll, HI3798MV200_CPU_TUNE_FRAC, GENMASK(23, 0), 0);
+	hi3798mv200_cpu_pll_field(pll, HI3798MV200_CPU_TUNE_STEP_INT, GENMASK(11, 0), 1);
+	hi3798mv200_cpu_pll_field(pll, HI3798MV200_CPU_TUNE_STEP_FRAC, GENMASK(23, 0), 0);
+
+	ctrl = readl(ctrl_reg) | HI3798MV200_CPU_TUNE_MODE;
+	writel(ctrl, ctrl_reg);
+	writel(ctrl & ~HI3798MV200_CPU_TUNE_EN, ctrl_reg);
+	writel(ctrl | HI3798MV200_CPU_TUNE_EN, ctrl_reg);
+
+	/*
+	 * busy 位在逐步调谐走完之前就会清零（hi3798mv300-mainline 移植在 Hi3798MV300 上实测），所以要等实时分频本身到位。
+	 */
+	ret = readl_poll_timeout_atomic(pll->base + HI3798MV200_CPU_TUNE_STAT, stat,
+					!(stat & HI3798MV200_CPU_TUNE_BUSY) &&
+					FIELD_GET(HI3798MV200_CPU_FBDIV, stat) == fbdiv,
+					10, 100000);
+	/* clk core 不看 set_rate 的返回值：超时只留这条告警，之后上报的频率取自 recalc_rate 读回的实值。 */
+	if (ret)
+		pr_warn("hi3798mv200: CPU PLL did not reach fbdiv %u (CRG165 %#x)\n",
+			fbdiv, stat);
+	return ret;
+}
+
+static const struct clk_ops hi3798mv200_cpu_pll_ops = {
+	.recalc_rate = hi3798mv200_cpu_pll_recalc_rate,
+	.determine_rate = hi3798mv200_cpu_pll_determine_rate,
+	.set_rate = hi3798mv200_cpu_pll_set_rate,
+};
+
+static int hi3798mv200_register_cpu_pll(struct device *dev,
+					struct hisi_clock_data *data)
+{
+	struct hi3798mv200_cpu_pll *pll;
+	struct clk_init_data init = { };
+	const char *parent = "clk_osc";
+	int ret;
+
+	pll = devm_kzalloc(dev, sizeof(*pll), GFP_KERNEL);
+	if (!pll)
+		return -ENOMEM;
+
+	init.name = "apll";
+	init.ops = &hi3798mv200_cpu_pll_ops;
+	init.flags = CLK_IS_CRITICAL;
+	init.parent_names = &parent;
+	init.num_parents = 1;
+	pll->base = data->base;
+	pll->hw.init = &init;
+
+	ret = devm_clk_hw_register(dev, &pll->hw);
+	if (ret)
+		return ret;
+	data->clk_data.clks[HI3798MV200_APLL_CLK] = pll->hw.clk;
+	return 0;
+}
+
 static struct hisi_clock_data *hi3798mv200_clk_register(
 				struct platform_device *pdev)
 {
@@ -1013,6 +1190,10 @@ static struct hisi_clock_data *hi3798mv200_clk_register(
 				    hi3798mv200_plls,
 				    ARRAY_SIZE(hi3798mv200_plls),
 				    clk_data);
+	if (ret)
+		return ERR_PTR(ret);
+
+	ret = hi3798mv200_register_cpu_pll(&pdev->dev, clk_data);
 	if (ret)
 		return ERR_PTR(ret);
 
