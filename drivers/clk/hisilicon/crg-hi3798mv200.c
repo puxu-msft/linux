@@ -360,6 +360,10 @@ static const struct hisi_gate_clock hi3798mv200_gate_clks[] = {
 	{ HI3798MV200_GPU_PP1_CLK, "clk_gpu_pp1", "200m",
 		0, 0xd4, 9, 0 },
 	/*
+	 * TianLai 片内音频 DAC。CRG69 bit 0 是 adac_cken，bit 4 是它的软复位（hi3798mv200/hi_reg_crg.h），软复位由复位控制器以 <&crg 0x114 4> 提供。没有消费者读 DAC 的频率，寄存器文件也没写它的时钟来源，所以门控不挂父时钟。
+	 */
+	{ HI3798MV200_ADAC_CLK, "clk_adac", NULL, 0, 0x114, 0, 0 },
+	/*
 	 * AIAO audio.  CRG70 bit 0 gates the block's working clock, bit 4 is its
 	 * soft reset and reaches the block only while it is clocked, and bit 22
 	 * picks that clock between 100 and 50 MHz.  Bit 22 is left as the boot
