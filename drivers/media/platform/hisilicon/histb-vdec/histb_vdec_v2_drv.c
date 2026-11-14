@@ -26,6 +26,7 @@
 #include <linux/reset.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
+#include <linux/unaligned.h>
 #include <linux/workqueue.h>
 #include <media/media-device.h>
 #include <media/media-request.h>
@@ -115,6 +116,8 @@ struct histb_vdec_v2_part {
 	struct histb_vdec_gen	gen;
 	bool			raster;	/* 见 histb_vdec_dev::raster */
 	bool			crg_gates; /* VDH 门控在 CRG30：需要 hisilicon,crg */
+	bool			h264_chain_null_end; /* 见 histb_vdec_dev 同名字段 */
+	bool			hevc_seg_stop_bit; /* 见 histb_vdec_dev 同名字段 */
 };
 
 static struct histb_vdec_dev *histb_vdec_dev_of(struct histb_vdec_ctx *ctx)
@@ -203,13 +206,20 @@ histb_vdec_frame_get(struct histb_vdec_ctx *ctx, unsigned int index)
 		return frame;
 
 	if (frame->dma)
-		dma_free_wc(dev->memdev, frame->size, frame->va, frame->dma);
+		dma_free_noncoherent(dev->memdev, frame->size, frame->va,
+				     frame->dma, DMA_BIDIRECTIONAL);
 	memset(frame, 0, sizeof(*frame));
-	frame->va = dma_alloc_wc(dev->memdev, size, &frame->dma, GFP_KERNEL);
+	/*
+	 * 内部帧走可缓存映射（见 histb_vdec_frame）。dma_alloc_noncoherent() 用 CPU 缓存写零清空这块内存，这里清一次缓存把这些脏行写回；此后 CPU 只读不写，缓存里只会有干净行，每个 job 在读之前按 DMA_FROM_DEVICE 失效即可（histb_vdec_frame_to_linear()）。每个 job 把帧交回引擎前不再做 for_device，是对 Documentation/core-api/dma-api.rst“交给设备前 for_device”约定的有意省略：arm64 与 ARM32 的 for_device 只做 clean，而这些帧在缓存里没有脏行可写回；将来若加 CPU 写（例如出错时清帧），必须在交回引擎前补 dma_sync_single_for_device()。
+	 */
+	frame->va = dma_alloc_noncoherent(dev->memdev, size, &frame->dma,
+					  DMA_BIDIRECTIONAL, GFP_KERNEL);
 	if (!frame->va) {
 		memset(frame, 0, sizeof(*frame));
 		return NULL;
 	}
+	dma_sync_single_for_device(dev->memdev, frame->dma, size,
+				   DMA_BIDIRECTIONAL);
 	frame->size = size;
 	frame->stride = stride;
 	frame->lines = lines;
@@ -236,9 +246,45 @@ void histb_vdec_frames_free(struct histb_vdec_ctx *ctx)
 
 		if (!frame->dma)
 			continue;
-		dma_free_wc(dev->memdev, frame->size, frame->va, frame->dma);
+		dma_free_noncoherent(dev->memdev, frame->size, frame->va,
+				     frame->dma, DMA_BIDIRECTIONAL);
 		memset(frame, 0, sizeof(*frame));
 	}
+}
+
+/*
+ * 返回 buf[pos..end) 中下一个 00 00 @last 三字节序列的位置，H.264 与 HEVC 的起始码扫描和防竞争字节扫描共用。OUTPUT 平面以 write-combining（normal non-cacheable）方式映射，逐字节扫描每字节约 150 ns，在 1080p60 下占去了每帧预算的大头；改用整字加载加零字节检测，每次加载跳过八个字节。没有匹配时返回 @end。
+ */
+u32 histb_vdec_scan_triple(const u8 *buf, u32 end, u32 pos, u8 last)
+{
+	u32 i = pos;
+
+	while (i + 8 <= end) {
+		u64 v = get_unaligned_le64(buf + i), z, pair;
+		u32 j;
+
+		/*
+		 * 窗口的第 k 个字节是 v 的第 8k..8k+7 位。这里求逐字节精确的零标志（常用的 has-zero 借位技巧会把零字节后面那个字节也报成零）：清掉每个字节的 bit 7 后加 0x7f，零字节在两种视图里的 bit 7 都为 0。不会有进位跨过字节边界。
+		 */
+		z = ~(((v & 0x7f7f7f7f7f7f7f7fULL) +
+		       0x7f7f7f7f7f7f7f7fULL) | v) & 0x8080808080808080ULL;
+		pair = z & (z >> 8);
+		while (pair) {
+			j = __ffs64(pair) >> 3;
+			if (i + j + 2 < end && buf[i + j + 2] == last)
+				return i + j;
+			pair &= pair - 1;
+		}
+		if ((z & (1ULL << 63)) && i + 9 < end && !buf[i + 8] &&
+		    buf[i + 9] == last)
+			return i + 7;
+		i += 8;
+	}
+	for (; i + 2 < end; i++)
+		if (!buf[i] && !buf[i + 1] && buf[i + 2] == last)
+			return i;
+
+	return end;
 }
 
 static void histb_vdec_copy_chroma(u8 *d, const u8 *s, unsigned int len,
@@ -333,6 +379,9 @@ static void histb_vdec_frame_to_linear(struct histb_vdec_ctx *ctx,
 	if (dbuf && dma_buf_begin_cpu_access(dbuf, DMA_TO_DEVICE))
 		goto no_frame;
 
+	/* 引擎刚写完这一帧：先丢掉缓存里（含预取进来的）旧行再读。 */
+	dma_sync_single_for_cpu(histb_vdec_dev_of(ctx)->memdev, frame->dma,
+				frame->size, DMA_FROM_DEVICE);
 	if (histb_vdec_dev_of(ctx)->raster)
 		histb_vdec_copy_raster(out, bpl, src, uv, frame->stride, w, h,
 				       swap_uv);
@@ -401,9 +450,7 @@ static unsigned int histb_vdec_count_slices(u32 state)
 	unsigned int num = FIELD_GET(VDM_STATE_SLICE_NUM, state);
 
 	/*
-	 * The upstream pool carries one 4-word report per decoded slice; the
-	 * per-slice status fields are not interpreted yet, the count only feeds
-	 * the debug output.
+	 * 上行消息池里每个解出的 slice 有一条 4 字报告。厂商 VDMHAL_V5R2C1_MakeDecReport 把字 1、字 2 当作该 slice 的起、止宏块（CTB）号取走（tmp/media/vfmw_v5/vdm_hal.S，读汇编）。字 0 是状态字，各位含义未知；Hi3798MV300 上实测，带 DEC_ERR 的三类帧里出错 slice 的字 0 为 98230000、80430000、14230000，干净的 H.264/HEVC slice 为 14020000/00020000。这里的计数供调试输出与覆盖检查使用。
 	 */
 	return min_t(unsigned int, num, HISTB_VDEC_MAX_UP_SLICES);
 }
@@ -420,7 +467,8 @@ static void histb_vdec_dump_up(struct histb_vdec_dev *dev, unsigned int slices,
 			up[4 * i], up[4 * i + 1], up[4 * i + 2],
 			up[4 * i + 3]);
 	if (failed && slices)
-		dev_err(dev->dev, "failed frame: %u slice reports\n", slices);
+		dev_err_ratelimited(dev->dev, "failed frame: %u slice reports\n",
+				    slices);
 }
 
 static void histb_vdec_report_failure(struct histb_vdec_dev *dev, u32 state,
@@ -503,9 +551,9 @@ irqreturn_t histb_vdec_irq_handler(int irq, void *priv)
 		if (!bad && max_end != dev->mb_total - 1)
 			bad = true;
 		if (bad) {
-			dev_err(dev->dev,
-				"frame decoded only %u of %u macroblocks\n",
-				max_end + 1, dev->mb_total);
+			dev_err_ratelimited(dev->dev,
+					    "frame decoded only %u of %u macroblocks\n",
+					    max_end + 1, dev->mb_total);
 			short_cov = true;
 		}
 	}
@@ -682,11 +730,9 @@ static void histb_vdec_device_run(void *priv)
 		/*
 		 * The empty payload this path ends up delivering is the only
 		 * signal that separates a refusal from a picture the engine
-		 * flagged. Measured on the board, V4L2_BUF_FLAG_ERROR is set on
-		 * every capture buffer of these streams - the pictures that
-		 * decoded byte-exactly included - so the flag cannot tell the
-		 * two apart, while a client that reads the flag alone would
-		 * display the previous contents of the buffer as new output.
+		 * flagged: both carry V4L2_BUF_FLAG_ERROR, and a client that
+		 * reads the flag alone would display the previous contents of
+		 * the buffer as new output.
 		 */
 		goto err_job;
 	}
@@ -881,6 +927,8 @@ int histb_vdec_v2_probe(struct platform_device *pdev,
 	dev->dev = &pdev->dev;
 	dev->chip = gen->chip;
 	dev->raster = part->raster;
+	dev->h264_chain_null_end = part->h264_chain_null_end;
+	dev->hevc_seg_stop_bit = part->hevc_seg_stop_bit;
 	dev->common.priv = dev;
 	platform_set_drvdata(pdev, dev);
 
@@ -1221,6 +1269,8 @@ static const struct histb_vdec_v2_part histb_vdec_v2_part_mv300 = {
 				 histb_vdec_v2_cap_formats, 2560, 1440, 2),
 	.raster = true,
 	.crg_gates = true,
+	.h264_chain_null_end = true,
+	.hevc_seg_stop_bit = true,
 };
 
 const struct histb_vdec_variant histb_vdec_v2_mv100_variant = {

@@ -33,7 +33,6 @@
 
 #include <linux/bitops.h>
 #include <linux/dma-mapping.h>
-#include <linux/unaligned.h>
 #include <media/v4l2-h264.h>
 #include <media/videobuf2-dma-contig.h>
 
@@ -245,41 +244,6 @@ static int histb_h264_pmv_alloc(struct histb_vdec_ctx *ctx, unsigned int index)
 }
 
 /*
- * 返回 buf[pos..end) 中下一个 00 00 @last 三字节序列的位置。OUTPUT 平面以 write-combining（normal non-cacheable）方式映射，逐字节扫描每字节约 150 ns，在 1080p60 下占去了每帧预算的大头；改用整字加载加零字节检测，每次加载跳过八个字节。没有匹配时返回 @end。
- */
-static u32 histb_h264_scan_triple(const u8 *buf, u32 end, u32 pos, u8 last)
-{
-	u32 i = pos;
-
-	while (i + 8 <= end) {
-		u64 v = get_unaligned_le64(buf + i), z, pair;
-		u32 j;
-
-		/*
-		 * 窗口的第 k 个字节是 v 的第 8k..8k+7 位。这里求逐字节精确的零标志（常用的 has-zero 借位技巧会把零字节后面那个字节也报成零）：清掉每个字节的 bit 7 后加 0x7f，零字节在两种视图里的 bit 7 都为 0。不会有进位跨过字节边界。
-		 */
-		z = ~(((v & 0x7f7f7f7f7f7f7f7fULL) +
-		       0x7f7f7f7f7f7f7f7fULL) | v) & 0x8080808080808080ULL;
-		pair = z & (z >> 8);
-		while (pair) {
-			j = __ffs64(pair) >> 3;
-			if (i + j + 2 < end && buf[i + j + 2] == last)
-				return i + j;
-			pair &= pair - 1;
-		}
-		if ((z & (1ULL << 63)) && i + 9 < end && !buf[i + 8] &&
-		    buf[i + 9] == last)
-			return i + 7;
-		i += 8;
-	}
-	for (; i + 2 < end; i++)
-		if (!buf[i] && !buf[i + 1] && buf[i + 2] == last)
-			return i;
-
-	return end;
-}
-
-/*
  * Start-code scan over the OUTPUT plane. Returns the bit position of every
  * slice NAL unit (nal_unit_type 1 or 5, the only slice NALs the message ABI can
  * describe; data partitions 2..4 are not supported). A 4-byte start code
@@ -295,7 +259,7 @@ static unsigned int histb_h264_find_slice_nals(const u8 *buf, u32 size,
 	while (i + 3 < size) {
 		u8 nal_type;
 
-		i = histb_h264_scan_triple(buf, size, i, 0x01);
+		i = histb_vdec_scan_triple(buf, size, i, 0x01);
 		if (i + 3 >= size)
 			break;
 
@@ -841,11 +805,14 @@ static int histb_h264_assemble_slice(struct histb_vdec_dev *dev,
 	 * counter bounds the chain, so a run ends when the chain reaches a slot
 	 * with an empty segment; run() therefore clears the slot after the last
 	 * one.
+	 *
+	 * 上面一段说的是 V2/V3 引擎；V5R2C1 的链以空链接结束：厂商 H264HAL_V5R2C1_StartDec 给最后一个 slice 传入的后继地址是 0，随后还用 H264HAL_V5R2C1_CutSliceChain 把该槽的 D63 再清一次零（tmp/media/vfmw_v5/vdm_hal_h264.S，读汇编）。这一代引擎会顺着 D63 走进清空的槽、把它当成又一个 slice 来解：在 Hi3798MV300 上实测，单 slice 的 1080p 帧报 2 条 slice 报告，第二条为 98230000 0003ffff 0003ffff（起止宏块都是 0x3ffff），VDM_STATE 带 DEC_ERR，每帧都因此走复位、交出 V4L2_BUF_FLAG_ERROR；最后一个 slice 的 D63 写 0 后只剩 1 条报告（末宏块 8159 = 8160 - 1），DEC_ERR 消失，像素仍逐字节一致。
 	 */
 	slot[44] = index < last ? run->slices[index + 1].first_mb_in_slice - 1 :
 				  run->mbamt - 1;
-	slot[63] = lower_32_bits(histb_vdec_slice_slot_dma(&dev->pool,
-							   index + 1));
+	if (index < last || !dev->h264_chain_null_end)
+		slot[63] = lower_32_bits(histb_vdec_slice_slot_dma(&dev->pool,
+								   index + 1));
 
 	if (weighted) {
 		histb_h264_pack_weights(slot, run->weights, count0, false);
@@ -1129,7 +1096,7 @@ static int histb_h264_pack_rbsp(struct histb_vdec_ctx *ctx,
 	if (!run->src_va || first >= end)
 		return 0;
 
-	if (histb_h264_scan_triple(run->src_va, end, first, 0x03) >= end)
+	if (histb_vdec_scan_triple(run->src_va, end, first, 0x03) >= end)
 		return 0;
 
 	if (h264->rbsp_size < end - first) {
@@ -1157,9 +1124,9 @@ static int histb_h264_pack_rbsp(struct histb_vdec_ctx *ctx,
 			continue;
 		}
 
-		esc = histb_h264_scan_triple(run->src_va,
-					      slice_at < end ? slice_at : end,
-					      i, 0x03);
+		esc = histb_vdec_scan_triple(run->src_va,
+					     slice_at < end ? slice_at : end,
+					     i, 0x03);
 		if (esc > i) {
 			memcpy(dst + out, run->src_va + i, esc - i);
 			out += esc - i;
@@ -1584,6 +1551,8 @@ static int histb_vdec_h264_run(struct histb_vdec_ctx *ctx,
 	/*
 	 * The last real slot links to this one, so it has to present as an
 	 * empty segment even when an earlier job left a longer chain here.
+	 *
+	 * 打开 h264_chain_null_end 的型号（MV300）上最后一个槽的 D63 为 0，不会走到这里，这次清槽只是无害的冗余。
 	 */
 	memset(histb_vdec_slice_slot(&dev->pool, n_slices), 0,
 	       HISTB_VDEC_SLOT_BYTES);

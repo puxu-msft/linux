@@ -239,6 +239,14 @@ struct histb_vdec_dev {
 	 * V5R2C1 的 1D 写路径：帧是行优先的（见 histb_vdec_band_bytes()），HEVC 只有在置位 VDM_CFG1_DBLK_1D_EN 时才走这条路径。
 	 */
 	bool			raster;
+	/*
+	 * 仅 H.264：V5R2C1 的 slice 链以最后一个 slice 的 D63 = 0 结束，不能指向一个清空的后继槽（见 histb_h264_assemble_slice()）。HEVC 在所有型号上本来就以 0 结束链，不读这个开关。
+	 */
+	bool			h264_chain_null_end;
+	/*
+	 * V5R2C1 的 HEVC 段长要包含 rbsp_stop_one_bit，只去掉其后的对齐零位（见 histb_hevc_assemble_slice()）。
+	 */
+	bool			hevc_seg_stop_bit;
 };
 
 /*
@@ -246,6 +254,8 @@ struct histb_vdec_dev {
  * linear format, so every dpb index owns a tile buffer here and the job's
  * completion detiles it into the client's buffer. References are read from
  * these buffers too, which is why they have to outlive the job.
+ *
+ * 内部帧用可缓存映射（dma_alloc_noncoherent()）：每个 job 完成时 CPU 要把整帧读一遍，而这颗 SoC 的 DMA 不一致，dma_alloc_wc() 给的是 Normal-NC 映射，A53 在上面读得极慢。Hi3798MV300 实测：1080p 一帧的拷贝 29.9 ms → 3.0~3.4 ms（另加 0.3~0.5 ms 失效缓存），2560x1440 53 ms → 4.3~4.7 ms；H.264 1080p60 解码吞吐 26.7 → 92 fps。
  */
 struct histb_vdec_frame {
 	void		*va;
@@ -319,6 +329,7 @@ void histb_vdec_buf_geom(struct histb_vdec_ctx *ctx, unsigned int *stride,
 dma_addr_t histb_vdec_frame_dma(struct histb_vdec_ctx *ctx,
 				struct vb2_buffer *vb);
 void histb_vdec_frames_free(struct histb_vdec_ctx *ctx);
+u32 histb_vdec_scan_triple(const u8 *buf, u32 end, u32 pos, u8 last);
 /* Bitstream start, honouring the plane's data_offset. */
 void *histb_vdec_src_va(struct vb2_buffer *vb);
 dma_addr_t histb_vdec_src_dma(struct vb2_buffer *vb);

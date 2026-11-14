@@ -231,20 +231,22 @@ static unsigned int histb_hevc_find_slice_nals(const u8 *buf, u32 size,
 					       u32 *starts, unsigned int max)
 {
 	unsigned int n = 0;
-	u32 i;
+	u32 i = 0;
 
-	for (i = 0; i + 3 < size; i++) {
-		u8 nal_type = (buf[i + 3] >> 1) & 0x3f;
+	while (i + 3 < size) {
+		u8 nal_type;
 
-		if (buf[i] || buf[i + 1] || buf[i + 2] != 0x01)
-			continue;
+		i = histb_vdec_scan_triple(buf, size, i, 0x01);
+		if (i + 3 >= size)
+			break;
 
-		if (nal_type > 9 && (nal_type < 16 || nal_type > 23))
-			continue;
-
-		if (n < max)
-			starts[n] = (i + 3) * 8;
-		n++;
+		nal_type = (buf[i + 3] >> 1) & 0x3f;
+		if (nal_type <= 9 || (nal_type >= 16 && nal_type <= 23)) {
+			if (n < max)
+				starts[n] = (i + 3) * 8;
+			n++;
+		}
+		i += 3;
 	}
 
 	return n;
@@ -637,13 +639,15 @@ static int histb_hevc_assemble_slice(struct histb_vdec_dev *dev,
 	 * with the untrimmed length r2 reaches 5/12 byte-exact frames, bs1
 	 * 10/12 and 512x240 0/12, all 12/12 once the trailing bits are
 	 * trimmed.
+	 *
+	 * V5R2C1 上段长还要算进 rbsp_stop_one_bit，只去掉其后的对齐零位：CABAC 在 end_of_slice_segment_flag 处终止时，算术解码器最后读入的那一位就是这个停止位。Hi3798MV300 实测两条 1080p 码流（CTB 32，2040 个 CTB）：连停止位一起去掉时每帧都报 DEC_ERR，slice 报告字 0 为 80430000、止 CTB 为 2038（少一个），像素仍逐字节一致；保留停止位后字 0 为 00020000、止 CTB 2039，DEC_ERR 消失。H.264 CAVLC 恰好相反（停止位不属于 slice 数据，算进去就报 DEC_ERR，同机实测），见 histb_h264_assemble_slice()。
 	 */
 	{
 		u32 trail = histb_vdec_trail_zero_bits(run->stream_va,
 						       data_bit + valid_bits) + 1;
 
 		if (valid_bits > trail)
-			valid_bits -= trail;
+			valid_bits -= dev->hevc_seg_stop_bit ? trail - 1 : trail;
 	}
 	/*
 	 * Nothing is left to decode once the trailing byte-alignment bits are
@@ -918,12 +922,7 @@ static int histb_hevc_pack_rbsp(struct histb_vdec_ctx *ctx,
 	if (!run->stream_va || first >= end)
 		return 0;
 
-	for (i = first; i + 2 < end; i++) {
-		if (!run->stream_va[i] && !run->stream_va[i + 1] &&
-		    run->stream_va[i + 2] == 0x03)
-			break;
-	}
-	if (i + 2 >= end)
+	if (histb_vdec_scan_triple(run->stream_va, end, first, 0x03) >= end)
 		return 0;
 
 	if (hevc->rbsp_size < end - first) {
@@ -940,16 +939,33 @@ static int histb_hevc_pack_rbsp(struct histb_vdec_ctx *ctx,
 	}
 	dst = hevc->rbsp_va;
 
-	slice_starts[0] = 0;
-	for (i = first; i < end; i++) {
-		while (idx + 1 < n_slices && slice_starts[idx + 1] / 8 == i) {
-			idx++;
-			slice_starts[idx] = out * 8;
-		}
-		if (i >= first + 2 && run->stream_va[i] == 0x03 &&
-		    !run->stream_va[i - 1] && !run->stream_va[i - 2])
+	/*
+	 * 两次防竞争字节之间整段 memcpy，与 histb_h264_pack_rbsp() 同一做法：OUTPUT 平面是 Normal-NC 映射，逐字节读每字节约 150 ns。Hi3798MV300 实测 HEVC 1080p，起始码扫描与这里都改成整字扫描后 I 帧组装时间 19~21 ms → 6~7 ms，解码吞吐 40 → 82 fps（P 帧 65 → 108 fps）。每段扫描止于下一个 slice 的 NAL 头字节，那之前是 00 00 01 起始码，不会有三字节组跨过它。
+	 */
+	i = first;
+	while (i < end) {
+		u32 slice_at = idx < n_slices ? slice_starts[idx] / 8 : end;
+		u32 esc;
+
+		if (i == slice_at) {
+			slice_starts[idx++] = out * 8;
 			continue;
-		dst[out++] = run->stream_va[i];
+		}
+
+		esc = histb_vdec_scan_triple(run->stream_va,
+					     slice_at < end ? slice_at : end,
+					     i, 0x03);
+		if (esc > i) {
+			memcpy(dst + out, run->stream_va + i, esc - i);
+			out += esc - i;
+			i = esc;
+			continue;
+		}
+
+		/* 00 00 03 -> 00 00（丢弃防竞争字节） */
+		dst[out++] = 0;
+		dst[out++] = 0;
+		i += 3;
 	}
 
 	*payload_bits = out * 8;
