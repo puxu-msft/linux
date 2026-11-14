@@ -142,7 +142,11 @@ static int hix5hd2_ir_config(struct hix5hd2_ir_priv *priv)
 		}
 	}
 
-	/* Now only support raw mode, with symbol start from low to high */
+	/*
+	 * Now only support raw mode, with symbol start from low to high
+	 *
+	 * 下一行按运算优先级实际写进 IR_CONFIG 的符号最大宽度是 0（& 先于 << 结合，0x3e80 与左移后的掩码相与为 0），不是 IR_CFG_SYMBOL_MAXWIDTH。CM201-2 有意保留上游原状：改成 0x3e80 的效果还没有按键 A/B 证据（docs/TASKS.md 红外一项），在那之前不要顺手“修好”。
+	 */
 	rate = DIV_ROUND_CLOSEST(priv->rate, 1000000);
 	val = IR_CFG_SYMBOL_MAXWIDTH & IR_CFG_WIDTH_MASK << IR_CFG_WIDTH_SHIFT;
 	val |= IR_CFG_SYMBOL_FMT & IR_CFG_FORMAT_MASK << IR_CFG_FORMAT_SHIFT;
@@ -152,6 +156,8 @@ static int hix5hd2_ir_config(struct hix5hd2_ir_priv *priv)
 	val |= (rate - 1) & IR_CFG_FREQ_MASK << IR_CFG_FREQ_SHIFT;
 	writel_relaxed(val, priv->base + IR_CONFIG);
 
+	/* 解除屏蔽前清掉 open 之前积下的状态 */
+	writel_relaxed(~0U, priv->base + IR_INTC);
 	writel_relaxed(0x00, priv->base + IR_INTM);
 	/* write arbitrary value to start  */
 	writel_relaxed(0x01, priv->base + IR_START);
@@ -190,6 +196,14 @@ static irqreturn_t hix5hd2_ir_rx_interrupt(int irq, void *data)
 	struct hix5hd2_ir_priv *priv = data;
 
 	irq_sr = readl_relaxed(priv->base + IR_INTS);
+	if (!(irq_sr & (INTMS_OVERFLOW | INTMS_SYMBRCV | INTMS_TIMEOUT))) {
+		/*
+		 * 不是 raw 模式的三类事件（比如块还处在引导程序留下的解码模式）：清掉这些不认识的位，并如实报 IRQ_NONE，让内核的伪中断检测在线路一直被拉着时把它关掉，而不是在这里无限重入。raw 事件的三个清除位不写，读 IR_INTS 之后才锁存的符号留给下一次中断处理。
+		 */
+		writel_relaxed(~(INT_CLR_OVERFLOW | INT_CLR_TIMEOUT | INT_CLR_RCV),
+			       priv->base + IR_INTC);
+		return IRQ_NONE;
+	}
 	if (irq_sr & INTMS_OVERFLOW) {
 		/*
 		 * we must read IR_DATAL first, then we can clean up
@@ -303,6 +317,13 @@ static int hix5hd2_ir_probe(struct platform_device *pdev)
 	if (ret)
 		goto err;
 	priv->rate = clk_get_rate(priv->clock);
+
+	/*
+	 * 接管引导程序留下的状态：CM201-2 的 fastboot 把块配成硬件解码模式（2026-11-15 在 U-Boot 里读到 IR_CONFIG 0x3e801f0b）、中断不屏蔽（IR_INTM 0）。下面 rc_register_device 注册输入设备时，键盘 handler 立刻打开它，hix5hd2_ir_config 在 devm_request_irq 之前就已运行；补丁前有两条路让 request_irq 一打开这条电平中断就困住 CPU0：config 解除屏蔽时没清掉块里锁存的解码模式状态位（推断：fastboot 用红外做待机唤醒，开着期间收到的红外留下的），原来的处理函数既不认识也不清这些位、却报 IRQ_HANDLED；或者 config 因 IR_BUSY 超时提前返回，块停在解码模式而 IR_INTM 仍是 fastboot 留下的 0。同日实测 RCU stall 后 48 s 软锁死，pstore 停在 hix5hd2_ir_probe → request_threaded_irq，连续十几分钟每次启动都如此。这里先关块、屏蔽并清掉全部中断，config 超时时中断也保持屏蔽；config 正常完成时先清中断再解除屏蔽。IR_ENABLE 读回 0 不代表块是关的（运行中块在 raw 模式、读回仍为 0），不能用它判断开关状态。
+	 */
+	writel_relaxed(0, priv->base + IR_ENABLE);
+	writel_relaxed(~0U, priv->base + IR_INTM);
+	writel_relaxed(~0U, priv->base + IR_INTC);
 
 	rdev->allowed_protocols = RC_PROTO_BIT_ALL_IR_DECODER;
 	rdev->priv = priv;
