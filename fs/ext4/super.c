@@ -5129,6 +5129,13 @@ static const char *ext4_has_journal_option(struct super_block *sb)
  */
 #define EXT4_MAX_PAGECACHE_ORDER(sb)		\
 		umin(MAX_PAGECACHE_ORDER, (11 + (sb)->s_blocksize_bits - PAGE_SHIFT))
+/*
+ * 页缓存 folio 阶数上限的启动参数（ext4.max_folio_order=N，-1 表示上游缺省）。经 mmap 对大文件做小更新时，缺页会把整个 folio 标脏，回写时整块落盘：CM201-2 的 eMMC 上 4 字节 mmap 更新平均写 497 KiB，write() 只写约 10 KiB（2026-11-15 实测）。journald、用 mmap 的 SQLite/LMDB 一类程序都是这样写的；把上限压低就把这种写放大压回块级，代价是顺序读写的页缓存粒度变小。值在挂载时生效，夹在该文件系统的最小阶数与上游上限之间。
+ */
+static int ext4_max_folio_order_param = -1;
+module_param_named(max_folio_order, ext4_max_folio_order_param, int, 0444);
+MODULE_PARM_DESC(max_folio_order, "Upper bound of the page cache folio order for regular files (-1: built-in default)");
+
 static void ext4_set_max_mapping_order(struct super_block *sb)
 {
 	struct ext4_sb_info *sbi = EXT4_SB(sb);
@@ -5137,6 +5144,10 @@ static void ext4_set_max_mapping_order(struct super_block *sb)
 		sbi->s_max_folio_order = sbi->s_min_folio_order;
 	else
 		sbi->s_max_folio_order = EXT4_MAX_PAGECACHE_ORDER(sb);
+	if (ext4_max_folio_order_param >= 0)
+		sbi->s_max_folio_order = clamp_t(int, ext4_max_folio_order_param,
+						 sbi->s_min_folio_order,
+						 sbi->s_max_folio_order);
 }
 
 static int ext4_check_large_folio(struct super_block *sb)
