@@ -138,6 +138,8 @@ static int histb_aiao_card_probe(struct platform_device *pdev)
 
 	card = &priv->card;
 	card->dev = dev;
+	/* SND 编成模块时 snd_card_init 要求声卡记下所属模块（否则 WARN），卸载声卡前也靠它持有模块引用。 */
+	card->owner = THIS_MODULE;
 	card->driver_name = "histb-aiao";
 	card->dai_link = priv->link;
 
