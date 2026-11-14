@@ -266,7 +266,16 @@ static const struct id_table ic_id_table[] = {
 	  .cfg_name = "rtl_bt/rtl8822cu_config",
 	  .hw_info  = "rtl8822cu" },
 
-	/* 8822B */
+	/* 8822BS，UART 接口 */
+	{ IC_INFO(RTL_ROM_LMP_8822B, 0xb, 0x7, HCI_UART),
+	  .config_needed = true,
+	  .has_rom_version = true,
+	  .has_msft_ext = true,
+	  .fw_name  = "rtl_bt/rtl8822bs_fw",
+	  .cfg_name = "rtl_bt/rtl8822bs_config",
+	  .hw_info  = "rtl8822bs" },
+
+	/* 8822BU，USB 接口 */
 	{ IC_INFO(RTL_ROM_LMP_8822B, 0xb, 0x7, HCI_USB),
 	  .config_needed = true,
 	  .has_rom_version = true,
@@ -1350,6 +1359,13 @@ void btrtl_set_quirks(struct hci_dev *hdev, struct btrtl_device_info *btrtl_dev)
 		 */
 		hci_set_quirk(hdev, HCI_QUIRK_BROKEN_LOCAL_EXT_FEATURES_PAGE_2);
 		break;
+	case RTL_ROM_LMP_8822B:
+		/* 8822BS（走 UART 的 hci_rev 0xb）与 8723CS 有同样的 local ext features 第 2 页问题；8822C/8822E 与它共用这个 lmp_subver，但不受影响。 */
+		if (btrtl_dev->ic_info->hci_rev == 0xb &&
+		    btrtl_dev->ic_info->hci_bus == HCI_UART)
+			hci_set_quirk(hdev,
+				      HCI_QUIRK_BROKEN_LOCAL_EXT_FEATURES_PAGE_2);
+		break;
 	default:
 		break;
 	}
@@ -1546,6 +1562,8 @@ MODULE_FIRMWARE("rtl_bt/rtl8821cs_fw.bin");
 MODULE_FIRMWARE("rtl_bt/rtl8821cs_config.bin");
 MODULE_FIRMWARE("rtl_bt/rtl8822b_fw.bin");
 MODULE_FIRMWARE("rtl_bt/rtl8822b_config.bin");
+MODULE_FIRMWARE("rtl_bt/rtl8822bs_fw.bin");
+MODULE_FIRMWARE("rtl_bt/rtl8822bs_config.bin");
 MODULE_FIRMWARE("rtl_bt/rtl8822cs_fw.bin");
 MODULE_FIRMWARE("rtl_bt/rtl8822cs_config.bin");
 MODULE_FIRMWARE("rtl_bt/rtl8822cu_fw.bin");
