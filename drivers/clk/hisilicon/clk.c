@@ -29,6 +29,7 @@ struct hisi_clock_data *hisi_clk_alloc(struct platform_device *pdev,
 	struct hisi_clock_data *clk_data;
 	struct resource *res;
 	struct clk **clk_table;
+	int i;
 
 	clk_data = devm_kmalloc(&pdev->dev, sizeof(*clk_data), GFP_KERNEL);
 	if (!clk_data)
@@ -47,6 +48,12 @@ struct hisi_clock_data *hisi_clk_alloc(struct platform_device *pdev,
 				       GFP_KERNEL);
 	if (!clk_table)
 		return NULL;
+
+	/*
+	 * 驱动没有注册的 id 也要给消费者一个明确的错误：of_clk_src_onecell_get 原样返回槽位，devm_kmalloc_array 又不清零，不初始化的话拿到的是野指针。
+	 */
+	for (i = 0; i < nr_clks; i++)
+		clk_table[i] = ERR_PTR(-ENOENT);
 
 	clk_data->clk_data.clks = clk_table;
 	clk_data->clk_data.clk_num = nr_clks;
