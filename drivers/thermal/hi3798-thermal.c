@@ -28,8 +28,11 @@
 #include <linux/platform_device.h>
 #include <linux/thermal.h>
 
-#define HI3798_TSENSOR_CTRL		0x28
-#define HI3798_TSENSOR_DATA		0x30
+/*
+ * 寄存器窗口从 PMC+0x28 开始（DT reg = <0x8a23028 0x18>），不覆盖 PMC+0x18..0x20 的 PMC6–PMC8 调压寄存器，那几个字由 histb-regulator 各自映射。
+ */
+#define HI3798_TSENSOR_CTRL		0x00	/* PMC+0x28 */
+#define HI3798_TSENSOR_DATA		0x08	/* PMC+0x30..+0x3c */
 
 /* Vendor magic. Bit 0 looks like the enable; the rest is undocumented. */
 #define HI3798_TSENSOR_ENABLE		0x6005
