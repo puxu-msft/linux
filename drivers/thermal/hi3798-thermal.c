@@ -44,10 +44,14 @@
 #define HI3798_TSENSOR_SAMPLE_MASK	0x3ff
 
 /*
- * Settling time before the samples are valid. The vendor driver uses a flat
- * mdelay(16); this runs from the thermal core's work queue, so it can sleep.
+ * 每次读数前使能的时长，沿用厂商驱动的 mdelay(16)；这里在 thermal 核心的工作队列里运行，可以睡眠。使能期间约每 12 ms 换进一个新采样（见 HI3798_TSENSOR_PRIME_MS），所以每次读数大约只换进一个，八个采样是最近八次读数各自换进的值：常规 1 s 轮询下跨约 8 s，passive 100 ms 轮询下跨约 0.8 s。上报温度因此是这段时间的平均，升温时最多滞后约一个窗口。
  */
 #define HI3798_TSENSOR_SETTLE_US	16000
+
+/*
+ * 八个采样是一个移位缓冲区，使能期间大约每 12 ms 换进一个新采样；关掉再开不清空它。冷启动时缓冲区里是上电残留（CM201-2 2026-11-15 实测码值 0x000、0x00a、0x168），16 ms 的稳定时间只换进一两个新采样，离散检查要连续失败好几次才会过。probe 先使能这么久把八个采样全部换新：实测 50 ms 时仍有残留，200 ms 时八个全部一致。热重启后缓冲区里本来就是有效值，所以之前只在热重启上测试时没暴露。
+ */
+#define HI3798_TSENSOR_PRIME_MS		200
 
 /* Linear fit: millicelsius = ((avg - 125) * 165 / 806 - 40) * 1000 */
 #define HI3798_TSENSOR_OFFSET		125
@@ -56,7 +60,7 @@
 #define HI3798_TSENSOR_BIAS		40
 
 /*
- * 误读必须拒收而不是上报：zone 的 critical trip 会让板子关机，一次虚假读数不应触发它。即使是全 1 采样（码值 1023），拟合结果也不超过 143 degC，对换算结果做范围检查永远抓不到真正要紧的那种读数，所以改为检查采样本身。码值钉在 10 位范围的任一端，是传感器失效或没有时钟（或总线读回全 1）的表现；同一个稳定窗口内取的八个采样若相差超过 64 个码值（每码约 0.2 degC，约合 13 degC），就不是同一个温度。低于拟合下端 -40 degC 的结果同样拒收。
+ * 误读必须拒收而不是上报：zone 的 critical trip 会让板子关机，一次虚假读数不应触发它。即使是全 1 采样（码值 1023），拟合结果也不超过 143 degC，对换算结果做范围检查永远抓不到真正要紧的那种读数，所以改为检查采样本身。码值钉在 10 位范围的任一端，是传感器失效或没有时钟（或总线读回全 1）的表现；八个采样（最近八次读数换进的值）若相差超过 64 个码值（每码约 0.2 degC，约合 13 degC），视为无效：冷启动残留或传感器失效时如此，一个窗口内升温超过约 13 degC 时也会如此，后者由 thermal 核心按 250 ms 重试，每次至少换进一个新采样，约 2 s 内收敛。低于拟合下端 -40 degC 的结果同样拒收。
  */
 #define HI3798_TSENSOR_SPREAD_MAX	64
 #define HI3798_TEMP_MIN_MC		(-40000)
@@ -134,17 +138,23 @@ static int hi3798_thermal_probe(struct platform_device *pdev)
 	mutex_init(&data->lock);
 	platform_set_drvdata(pdev, data);
 
+	writel(HI3798_TSENSOR_ENABLE, data->regs + HI3798_TSENSOR_CTRL);
+	msleep(HI3798_TSENSOR_PRIME_MS);
+	writel(HI3798_TSENSOR_DISABLE, data->regs + HI3798_TSENSOR_CTRL);
+
 	tzd = devm_thermal_of_zone_register(dev, 0, data, &hi3798_thermal_ops);
 	if (IS_ERR(tzd))
 		return dev_err_probe(dev, PTR_ERR(tzd),
 				     "failed to register thermal zone\n");
 
 	/*
-	 * 注册 zone 时已经读过一次传感器并评估了 trip；这一次只是把第一个温度（或传感器给不出温度的失败）记进日志。
+	 * 注册 zone 时已经读过一次传感器并评估了 trip；这一次只是把第一个温度记进日志。读不出有效值也保留 zone：之后每次轮询都会再读，缓冲区换满新采样就恢复；probe 失败则整次启动都没有温度监控与降频。
 	 */
 	ret = hi3798_thermal_get_temp(tzd, &temp);
-	if (ret)
-		return dev_err_probe(dev, ret, "sensor returned no valid reading\n");
+	if (ret) {
+		dev_warn(dev, "tsensor registered, first reading invalid (%d)\n", ret);
+		return 0;
+	}
 
 	dev_info(dev, "tsensor registered, %d.%03d degC\n",
 		 temp / 1000, abs(temp % 1000));
@@ -163,6 +173,8 @@ static struct platform_driver hi3798_thermal_driver = {
 	.driver = {
 		.name = "hi3798-thermal",
 		.of_match_table = hi3798_thermal_of_match,
+		/* probe 里要等 HI3798_TSENSOR_PRIME_MS，异步探测免得拖慢启动 */
+		.probe_type = PROBE_PREFER_ASYNCHRONOUS,
 	},
 };
 module_platform_driver(hi3798_thermal_driver);
