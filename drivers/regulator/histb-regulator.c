@@ -68,21 +68,26 @@ histb_regulator_set_voltage(struct regulator_dev *rdev, int min_uV, int max_uV,
 			    unsigned int *selector)
 {
 	struct histb_regulator *priv = rdev_get_drvdata(rdev);
-	unsigned int duty;
+	unsigned int duty, period;
 	u32 val;
+
+	/*
+	 * 沿用硬件里已有的 PWM 周期：引导程序按它校准过调压电路（CM201-2 的 fastboot 给 PMC6 写的是 221，即厂商 device_volt_scale 的 period 220），换周期会改变 PWM 频率；只有周期字段无效时才用驱动缺省值。
+	 */
+	period = FIELD_GET(HISTB_PERIOD, readl_relaxed(priv->base));
+	period = period > 1 ? period - 1 : HISTB_PWM_PERIOD;
 
 	if (min_uV >= priv->max_uV)
 		duty = 0;
 	else if (min_uV <= priv->min_uV)
-		duty = HISTB_PWM_PERIOD;
+		duty = period;
 	else
 		/* rounding down keeps the output at or above the request */
-		duty = DIV_ROUND_DOWN_ULL((u64)(priv->max_uV - min_uV) *
-					  HISTB_PWM_PERIOD,
+		duty = DIV_ROUND_DOWN_ULL((u64)(priv->max_uV - min_uV) * period,
 					  priv->max_uV - priv->min_uV);
 
 	val = FIELD_PREP(HISTB_DUTY, duty + 1) |
-	      FIELD_PREP(HISTB_PERIOD, HISTB_PWM_PERIOD + 1);
+	      FIELD_PREP(HISTB_PERIOD, period + 1);
 	writel_relaxed(val, priv->base);
 
 	return 0;
