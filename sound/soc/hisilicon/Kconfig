@@ -23,12 +23,9 @@ config SND_SOC_HISTB_AIAO_I2S
 config SND_SOC_HISTB_ADAC
 	tristate "HiSTB TianLai internal audio DAC"
 	depends on ARCH_HISI || COMPILE_TEST
+	select REGMAP_MMIO
 	help
-	  Say Y here if you want the on-chip analog output stage of HiSilicon
-	  STB SoCs such as the Hi3716CV200. It is an I2S consumer with no
-	  selectable data source: the vendor port map wires it to AIAO transmit
-	  port 2, and it has no capture side in the V500 generation this part
-	  builds with.
+	  需要 HiSilicon STB SoC 的片内模拟输出级时选 Y：Hi3716CV200 的 V500 一代，以及 Hi3798MV300 的 V700 一代（其 line driver 由自带的 charge pump 供电）。它是 I2S 消费者，没有可选的数据源：厂商端口映射在 Hi3716CV200 上把它接到 AIAO 发送口 2，在 Hi3798MV300 上接到发送口 1；它没有 capture 侧。
 
 config SND_SOC_HISTB_AIAO_CARD
 	tristate "HiSTB AIAO Sound Card"

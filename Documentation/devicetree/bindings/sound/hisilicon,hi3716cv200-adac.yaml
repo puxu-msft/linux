@@ -4,27 +4,27 @@
 $id: http://devicetree.org/schemas/sound/hisilicon,hi3716cv200-adac.yaml#
 $schema: http://devicetree.org/meta-schemas/core.yaml#
 
-title: HiSilicon Hi3716CV200 internal audio DAC
+title: HiSilicon HiSTB TianLai internal audio DAC
 
 maintainers:
   - David Yang <mmyangfl@gmail.com>
 
 description: |
-  The analog output stage of the Hi3716CV200, reached through two 32-bit
-  registers next to the CRG. It is a consumer of the AIAO transmit port's
-  serial stream rather than a source of its own, so it carries no DMA or
-  interrupt of its own and is wired to that port by the sound card node.
+  Hi3716CV200（TianLai V500）与 Hi3798MV300（TianLai V700）的模拟输出级，通过外设控制器（PERICTRL）里的 32 位寄存器访问：Hi3716CV200 上是一个两字的窗口，Hi3798MV300 上是两个各两字的窗口（PERICTRL 0x110 与 0x160）。It is a consumer of the AIAO transmit port's serial stream rather than a source of its own, so it carries no DMA or interrupt of its own and is wired to that port by the sound card node.
 
-  The driver's only state is the power and mute bit the vendor's own audio HAL
-  toggles at stream start and stop, which is why it claims the gate clock and
-  the reset line: a write to the block does not land while either is off.
+  它占用门控时钟与复位线，因为两者任一关闭时对该模块的写入都不会生效。V500 上厂商 HAL 只在流开始与结束时切换电源与静音；V700 另外要为 charge pump 与 line driver 跑一次上电序列，之后输出保持上电。
 
 properties:
   compatible:
-    const: hisilicon,hi3716cv200-adac
+    enum:
+      - hisilicon,hi3716cv200-adac
+      - hisilicon,hi3798mv300-adac
 
   reg:
-    maxItems: 1
+    minItems: 1
+    items:
+      - description: 数字控制字（音量、静音、采样率、数据位宽）
+      - description: 模拟控制字（电源、pop 电路、charge pump）
 
   clocks:
     maxItems: 1
@@ -46,6 +46,20 @@ required:
   - resets
   - '#sound-dai-cells'
 
+allOf:
+  - if:
+      properties:
+        compatible:
+          const: hisilicon,hi3798mv300-adac
+    then:
+      properties:
+        reg:
+          minItems: 2
+    else:
+      properties:
+        reg:
+          maxItems: 1
+
 additionalProperties: false
 
 examples:
@@ -56,6 +70,16 @@ examples:
         compatible = "hisilicon,hi3716cv200-adac";
         reg = <0xf8a20110 0x8>;
         clocks = <&crg HI3716CV200_ADAC_CLK>;
+        resets = <&crg 0x114 4>;
+        #sound-dai-cells = <0>;
+    };
+  - |
+    #include <dt-bindings/clock/hisilicon,hi3798mv200-crg.h>
+
+    audio-codec@110 {
+        compatible = "hisilicon,hi3798mv300-adac";
+        reg = <0x110 0x8>, <0x160 0x8>;
+        clocks = <&crg HI3798MV200_ADAC_CLK>;
         resets = <&crg 0x114 4>;
         #sound-dai-cells = <0>;
     };
