@@ -170,6 +170,7 @@ struct histb_aiao_port {
  * transmit port 2 -- the vendor mapping is DAC0 -> AIAO_PORT_TX2 in
  * aiao_v1_1/ao/drv_ao_op.c:33-50, and ADAC0/ADAC1 have no source-select bit of
  * their own, so that one is hard-wired -- and its own generator is index 2.
+ * 以上端口号属于 S40 的芯片（hi3798mv100、hi3716cv200）；S28 的芯片在下文另有自己的表。
  */
 #define AIAO_HDMI_TX_PORT		3
 #define AIAO_HDMI_RX_PORT		0
@@ -917,18 +918,12 @@ static const struct histb_aiao_port_spec hi3798mv100_ports[] = {
 };
 
 /*
- * hi3798mv200 reports three transmit ports and one receive port (its
- * HW_CAPABILITY word reads 0x03070001) and has no internal DAC. The vendor
- * names the transmit port behind its transmitter: SndOpGetPort() maps
- * OUTPUTPORT_HDMI0 + I2S through the chip platform, this part is S28, and that
- * yields AIAO_PORT_TX2 = 0x12, so AIAO_TX(2) is the register block
- * (aiao_v1_1/ao/drv_ao_op.c:64-85 with AUTIL_GetChipPlatform() at
- * common/src/audio_util.c:1118, restated as a hard-coded AIAO_PORT_TX2 in
- * common/src/drv_aiao_veri.c). Unverified on hardware.
+ * hi3798mv200 与 hi3798mv300 都报告三个发送口、一个接收口（两者的 HW_CAPABILITY 都读到 0x03070001）。厂商通过 SndOpGetPort() 确定发送口，它按芯片平台区分（两者都是 S28，见 common/src/audio_util.c:1114-1119），对 OUTPUTPORT_HDMI0 + I2S 给出 AIAO_PORT_TX2 = 0x12，对片内 TianLai DAC 即 OUTPUTPORT_DAC0 给出 AIAO_PORT_TX1 = 0x11（aiao_v1_1/ao/drv_ao_op.c:30-88；原厂 hi3798mv300 内核的 SndOpGetPort 返回的也是这两个值）。唯一的接收口抽头的是 HDMI 线路，所以 DAC 线路没有抽头。
  */
 static const struct histb_aiao_port_spec hi3798mv200_ports[] = {
 	[HISTB_AIAO_HDMI_TX] = { 2, 2, HISTB_AIAO_HDMI_RX, false },
 	[HISTB_AIAO_HDMI_RX] = { 0, 2, HISTB_AIAO_HDMI_TX, true },
+	[HISTB_AIAO_DAC_TX] = { 1, 1, HISTB_AIAO_NO_PARTNER, false },
 };
 
 static const struct histb_aiao_variant hi3798mv100_aiao = {
