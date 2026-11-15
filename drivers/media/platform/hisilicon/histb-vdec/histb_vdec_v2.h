@@ -225,6 +225,10 @@ struct histb_vdec_dev {
 	 * not report them; the slice reports are checked against it.
 	 */
 	u32			mb_total;
+	/*
+	 * 本 job 的 DEC_ERR 可能只是 CABAC 段尾的计数偏差（见 histb_vdec_tail_slack_only()）：非 0 时是图像的宏块/CTB 总数，slice 报告必须首尾相接地覆盖它；0 表示不放行。由 H.264（CABAC）与 HEVC 的 run() 在打开 cabac_seg_stop_bit 的型号上设置，每个 job 开始前清零。
+	 */
+	u32			tail_slack_total;
 
 	/* protects the message pool and the VDM against concurrent jobs */
 	struct mutex		hw_lock;
@@ -244,9 +248,15 @@ struct histb_vdec_dev {
 	 */
 	bool			h264_chain_null_end;
 	/*
-	 * V5R2C1 的 HEVC 段长要包含 rbsp_stop_one_bit，只去掉其后的对齐零位（见 histb_hevc_assemble_slice()）。
+	 * V5R2C1 上 CABAC slice（HEVC 全部、H.264 的 entropy_coding_mode_flag=1）的段长要包含 rbsp_stop_one_bit，只去掉其后的对齐零位；CAVLC 仍连停止位一起去掉。厂商 H.264 语法层 CalcStreamBits 对 CABAC 的 PPS 把尾部长度减 1（留下停止位）、把头长向上取整到字节（厂商 vfmw v5.0 Hi3798MV200 h264.S，读汇编），HEVC 段长的实测在 histb_hevc_assemble_slice()，H.264 的在 histb_h264_assemble_slice()。
+	 *
+	 * 打开它的型号还会在 CABAC 段尾停止位恰好落在字节最低位时报出不影响像素的 DEC_ERR，由 tail_slack_total 与 histb_vdec_tail_slack_only() 放行。
 	 */
-	bool			hevc_seg_stop_bit;
+	bool			cabac_seg_stop_bit;
+	/*
+	 * 量化矩阵按厂商 vfmw v5.0 语法层（V5R2C1 这一代）的布局写进图像消息，并接受任意矩阵：H.264 每张表逐行写、每行偶数列在前奇数列在后（histb_h264_pack_scaling()），HEVC 按列写并带 DC 字、CFG0 置 VDM_CFG0_LD_QMATRIX（histb_hevc_pack_scaling()）。不打开的型号沿用原来的光栅序布局与 histb_h264_scaling_supported() 的 H.264 判据（每表一个值、三张帧内 4x4 表相同），HEVC 量化矩阵照旧拒收。
+	 */
+	bool			qmatrix_vfmw5;
 	/*
 	 * 运动信息写回：V5R2C1 要置 VDM_CFG1_MV_OUT_EN，引擎才把当前帧的运动信息写进图像消息给它的 PMV 槽（H.264 为 D7，HEVC 为 D6），以它为 collocated 图像的后续帧（H.264 B slice 的空间与时间 direct、HEVC 的 TMVP）读的就是这个槽；不置位时引擎根本不写，槽一直是分配时的零。H.264 与 HEVC 的 histb_*_program_regs() 都读这个开关。
 	 *

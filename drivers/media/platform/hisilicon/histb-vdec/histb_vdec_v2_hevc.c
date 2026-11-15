@@ -251,19 +251,67 @@ static unsigned int histb_hevc_find_slice_nals(const u8 *buf, u32 size,
 	return n;
 }
 
+/* 一个消息字：s[a]、s[b]、s[c]、s[d] 依次放进字节 0..3 */
+static u32 histb_hevc_qm_word(const u8 *s, unsigned int a, unsigned int b,
+			      unsigned int c, unsigned int d)
+{
+	return s[a] | s[b] << 8 | s[c] << 16 | (u32)s[d] << 24;
+}
+
 /*
  * Scaling lists, picture words D64..D319. The vendor copies a 256-word image
- * word for word; the layout this driver assumes is the linear image of the V4L2
- * control (4x4, 8x8, 16x16, 32x32 lists and the DC coefficients in struct
- * order, zero padded). That packing is unverified against the hardware: on the
- * board the submitted matrices are not consulted at all for a picture that
- * claims them, so captures cannot confirm or correct this layout; see the
- * scaling-list refusal in histb_vdec_hevc_run for the measurement.
+ * word for word.
+ *
+ * qmatrix_vfmw5 的型号（V5R2C1）按厂商 vfmw v5.0 语法层 HEVC_WritePicMsg 与 HEVC_WriteQmatrix_4x4/8x8/16x16/32x32 的布局写（Hi3798MV200 hevc.S，读汇编并逐字节符号执行核对）：W0..W95 是 8x8 列表 0..5，W96..W191 是 16x16 列表 0..5，W192..W223 是 32x32 列表 0..1（H.265 matrixId 0 与 3），每表 16 字；W224..W247 是 4x4 列表 0..5，每表 4 字；W248 装 16x16 的 DC 0..3，W249 装 16x16 的 DC 4..5 与 32x32 的 DC 0..1，W250..W255 写 0。每张表按列（x 从 0 起）输出，同一列的系数按 y 装进字的字节 0..3：4x4 每列一字，行序 0、2、1、3；8x8 每列两字，先偶数行 0、2、4、6 再奇数行 1、3、5、7；16x16 与 32x32（8x8 个系数）每列两字，行 0..3 与 4..7 顺排。uAPI 各表为光栅序（y*N+x），与厂商 ctx->qmatrix 的字节序相同。Hi3798MV300 实测（x265 --scaling-list default 与自定义非对称表两条 30 帧 1080p 码流，CFG0 置 LD_QMATRIX）：原样 memcpy 控件时亮度 PSNR 20.2/22.7 dB，按这里的布局全部逐字节一致。
+ *
+ * 其它型号沿用控件的线性镜像（未经硬件确认；那些型号拒收带量化矩阵的图像，见 histb_vdec_hevc_run()）。
  */
 static void histb_hevc_pack_scaling(u32 *dst,
-				    const struct v4l2_ctrl_hevc_scaling_matrix *m)
+				    const struct v4l2_ctrl_hevc_scaling_matrix *m,
+				    bool vfmw5)
 {
-	memcpy(dst, m, sizeof(*m));
+	const u8 *dc16 = m->scaling_list_dc_coef_16x16;
+	const u8 *dc32 = m->scaling_list_dc_coef_32x32;
+	unsigned int i, x;
+
+	if (!vfmw5) {
+		memcpy(dst, m, sizeof(*m));
+		return;
+	}
+
+	for (i = 0; i < 6; i++) {
+		const u8 *s = m->scaling_list_8x8[i];
+
+		for (x = 0; x < 8; x++) {
+			dst[16 * i + 2 * x] =
+				histb_hevc_qm_word(s, x, 16 + x, 32 + x, 48 + x);
+			dst[16 * i + 2 * x + 1] =
+				histb_hevc_qm_word(s, 8 + x, 24 + x, 40 + x, 56 + x);
+		}
+	}
+
+	/* 6 个 16x16 与 2 个 32x32 列表排布相同且首尾相接（W96..W223） */
+	for (i = 0; i < 8; i++) {
+		const u8 *s = i < 6 ? m->scaling_list_16x16[i] :
+				      m->scaling_list_32x32[i - 6];
+
+		for (x = 0; x < 8; x++) {
+			dst[96 + 16 * i + 2 * x] =
+				histb_hevc_qm_word(s, x, 8 + x, 16 + x, 24 + x);
+			dst[96 + 16 * i + 2 * x + 1] =
+				histb_hevc_qm_word(s, 32 + x, 40 + x, 48 + x, 56 + x);
+		}
+	}
+
+	for (i = 0; i < 6; i++)
+		for (x = 0; x < 4; x++)
+			dst[224 + 4 * i + x] =
+				histb_hevc_qm_word(m->scaling_list_4x4[i],
+						   x, 8 + x, 4 + x, 12 + x);
+
+	dst[248] = histb_hevc_qm_word(dc16, 0, 1, 2, 3);
+	dst[249] = dc16[4] | dc16[5] << 8 | dc32[0] << 16 | (u32)dc32[1] << 24;
+	memset(&dst[250], 0, 6 * sizeof(*dst));
 }
 
 static void histb_hevc_assemble_pic(struct histb_vdec_dev *dev,
@@ -392,7 +440,7 @@ static void histb_hevc_assemble_pic(struct histb_vdec_dev *dev,
 	 * flag and does not fill the control gets its zeroed default, which is
 	 * what the uAPI prescribes (the control always exists in the handler).
 	 */
-	histb_hevc_pack_scaling(&pic[64], run->scaling);
+	histb_hevc_pack_scaling(&pic[64], run->scaling, dev->qmatrix_vfmw5);
 }
 
 static int histb_hevc_pack_weights(u32 *slot,
@@ -492,6 +540,8 @@ static int histb_hevc_assemble_slice(struct histb_vdec_dev *dev,
 	bool weighted;
 	s32 col_dpb = -1;
 	u32 data_bit, valid_bits, qp;
+	u32 indep_addr = 0;
+	unsigned int k;
 
 	memset(slot, 0, HISTB_VDEC_SLOT_BYTES);
 
@@ -646,7 +696,7 @@ static int histb_hevc_assemble_slice(struct histb_vdec_dev *dev,
 						       data_bit + valid_bits) + 1;
 
 		if (valid_bits > trail)
-			valid_bits -= dev->hevc_seg_stop_bit ? trail - 1 : trail;
+			valid_bits -= dev->cabac_seg_stop_bit ? trail - 1 : trail;
 	}
 	/*
 	 * Nothing is left to decode once the trailing byte-alignment bits are
@@ -689,7 +739,19 @@ static int histb_hevc_assemble_slice(struct histb_vdec_dev *dev,
 		}
 	}
 
-	slot[6] = (qp << 19) |
+	/*
+	 * D6 的低位是本 slice 段所属独立 slice 段的起始 CTB（厂商 HEVC_DEC_SLICE_PARAM_S.IndependentSliceSegmentAddr，V300 与 V5R2C1 两代的 SetSliceMsg 都把它或进 D6，读汇编），所以不分型号都写；依赖 slice 段沿用前面最近的独立段（按 H.265 语义推出，没有上机覆盖）。引擎靠它判断相邻 CTB 是否在同一 slice（帧内预测与上下文的可用性）。Hi3798MV300 实测（x265 WPP + 每帧 4 个 slice 的 30 帧 1080p 码流）：不写时第 2 个 slice 起整帧错（亮度 PSNR 约 14 dB），写上后 30/30 逐字节一致；单 slice 时它是 0，与原来相同。
+	 */
+	for (k = index + 1; k-- > 0;) {
+		if (!(run->slices[k].flags &
+		      V4L2_HEVC_SLICE_PARAMS_FLAG_DEPENDENT_SLICE_SEGMENT)) {
+			indep_addr = run->slices[k].slice_segment_addr;
+			break;
+		}
+	}
+
+	slot[6] = (indep_addr & GENMASK(17, 0)) |
+		  (qp << 19) |
 		  ((slice->flags & V4L2_HEVC_SLICE_PARAMS_FLAG_CABAC_INIT) ?
 		   BIT(18) : 0) |
 		  (is_low_delay ? BIT(27) : 0) |
@@ -817,6 +879,13 @@ static void histb_hevc_program_regs(struct histb_vdec_dev *dev,
 	/* 运动信息写回，供 TMVP 读 collocated 图像的 PMV 槽（见 histb_vdec_dev.mv_out） */
 	if (dev->mv_out)
 		cfg1 |= VDM_CFG1_MV_OUT_EN;
+
+	/*
+	 * 厂商 HEVCHAL_V5R2C1_CfgVdmReg 把 CFG0 bit 30 设成 SPS 的 scaling_list_enabled_flag（读汇编）。不置位时引擎不装载消息里的量化矩阵、沿用它内部留着的那份：Hi3798MV300 实测，按正确布局写好矩阵但不置位，先解的缺省矩阵码流整帧错（PSNR 13.1 dB），紧接着解的自定义矩阵码流却逐字节一致，因为引擎里还是上一轮实验装进去的同一张表。
+	 */
+	if (dev->qmatrix_vfmw5 &&
+	    (run->sps->flags & V4L2_HEVC_SPS_FLAG_SCALING_LIST_ENABLED))
+		cfg0 |= VDM_CFG0_LD_QMATRIX;
 
 	/* decoded CTU budget: the field counts CTUs minus one */
 	vdm_write(dev, VDM_CFG0, cfg0);
@@ -1082,8 +1151,11 @@ static int histb_vdec_hevc_run(struct histb_vdec_ctx *ctx,
 	 * only disposition that does not deliver bad pixels. Every stream
 	 * measured on the board so far declares scaling_list_enabled clear, so
 	 * this refuses nothing that decodes correctly today.
+	 *
+	 * 上面的测量出自 Hi3798MV100 的 bring-up。推断它是没置 CFG0 的 LD_QMATRIX（bit 30）所致：引擎不装载消息里的矩阵、沿用内部旧表。依据有两条：Hi3798MV300 上同样不置位时引擎沿用上一次装进去的表（见 histb_hevc_program_regs()），V300 的厂商 HEVCHAL_V300R001_CfgVdmReg 也把 scaling_list_enabled_flag 写进 CFG0 bit 30（读汇编）；MV100 上没有复验。qmatrix_vfmw5 的型号置位并按厂商布局装表后，缺省表与自定义非对称表两条码流都逐字节一致，所以那里接受。
 	 */
-	if (run.sps->flags & V4L2_HEVC_SPS_FLAG_SCALING_LIST_ENABLED)
+	if (!dev->qmatrix_vfmw5 &&
+	    (run.sps->flags & V4L2_HEVC_SPS_FLAG_SCALING_LIST_ENABLED))
 		return -EINVAL;
 
 	/*
@@ -1438,10 +1510,9 @@ static int histb_vdec_hevc_run(struct histb_vdec_ctx *ctx,
 		 * slice addresses in increasing raster order, and this never
 		 * fired on anything measured so far: the scored corpus carries
 		 * one slice per picture, so the multi-slice chains that
-		 * exercise it are H.264's. TODO: one HEVC picture submitted as
-		 * two increasing slices and scored byte-exact would show that
-		 * the range arithmetic holds at the boundary between the two
-		 * slots.
+		 * exercise it are H.264's.
+		 *
+		 * 上面说的语料是 Hi3798MV100 bring-up 时的。Hi3798MV300 上每帧 4 个 slice（x265 WPP）的 30 帧码流逐字节一致，各 slice 报告的起止 CTB 首尾相接（0..479、480..1019、1020..1499、1500..2039），D43/D44 的区间算法在 slice 交界处成立。
 		 */
 		if (i && run.slices[i].slice_segment_addr <=
 		    run.slices[i - 1].slice_segment_addr)
@@ -1465,6 +1536,8 @@ static int histb_vdec_hevc_run(struct histb_vdec_ctx *ctx,
 	}
 
 	histb_hevc_program_regs(dev, &run);
+	if (dev->cabac_seg_stop_bit)
+		dev->tail_slack_total = run.ctu_count;
 	histb_vdec_hw_kick(dev, HISTB_VIDSTD_HEVC);
 
 	return 0;

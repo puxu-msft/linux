@@ -117,7 +117,8 @@ struct histb_vdec_v2_part {
 	bool			raster;	/* 见 histb_vdec_dev::raster */
 	bool			crg_gates; /* VDH 门控在 CRG30：需要 hisilicon,crg */
 	bool			h264_chain_null_end; /* 见 histb_vdec_dev 同名字段 */
-	bool			hevc_seg_stop_bit; /* 见 histb_vdec_dev 同名字段 */
+	bool			cabac_seg_stop_bit; /* 见 histb_vdec_dev 同名字段 */
+	bool			qmatrix_vfmw5; /* 见 histb_vdec_dev 同名字段 */
 	bool			mv_out; /* 见 histb_vdec_dev 同名字段 */
 };
 
@@ -451,7 +452,7 @@ static unsigned int histb_vdec_count_slices(u32 state)
 	unsigned int num = FIELD_GET(VDM_STATE_SLICE_NUM, state);
 
 	/*
-	 * 上行消息池里每个解出的 slice 有一条 4 字报告。厂商 VDMHAL_V5R2C1_MakeDecReport 把字 1、字 2 当作该 slice 的起、止宏块（CTB）号取走（tmp/media/vfmw_v5/vdm_hal.S，读汇编）。字 0 是状态字，各位含义未知；Hi3798MV300 上实测，带 DEC_ERR 的三类帧里出错 slice 的字 0 为 98230000、80430000、14230000，干净的 H.264/HEVC slice 为 14020000/00020000。这里的计数供调试输出与覆盖检查使用。
+	 * 上行消息池里每个解出的 slice 有一条 4 字报告。厂商 VDMHAL_V5R2C1_MakeDecReport 把字 1、字 2 当作该 slice 的起、止宏块（CTB）号取走（tmp/media/vfmw_v5/vdm_hal.S，读汇编）。字 0 是状态字，厂商只取第 0 条报告字 0 的 bit 31 存成 Error_Flag（vdm_hal.S 的 MakeDecReport，vdm_drv.h 注释为 logic decode err flag），其余各位含义未知。Hi3798MV300 上实测，带 DEC_ERR 的帧里出错 slice 的字 0：链走进空槽 98230000、HEVC 段长去掉停止位 80430000、CABAC 段尾多出不足 1 字节 14230000/14210000/00210000（后一类由 histb_vdec_tail_slack_only() 放行）；干净的 H.264/HEVC slice 为 14020000/00020000（非末 slice 14000000/00000000）。这里的计数供调试输出与覆盖检查使用。
 	 */
 	return min_t(unsigned int, num, HISTB_VDEC_MAX_UP_SLICES);
 }
@@ -470,6 +471,34 @@ static void histb_vdec_dump_up(struct histb_vdec_dev *dev, unsigned int slices,
 	if (failed && slices)
 		dev_err_ratelimited(dev->dev, "failed frame: %u slice reports\n",
 				    slices);
+}
+
+/*
+ * 打开 cabac_seg_stop_bit 的型号上，CABAC slice 的段尾停止位恰好是一个字节的最低位时，引擎常常把段长算短若干位（停在停止位之前的那个 1 上），于是报 DEC_ERR，而像素完全正确。Hi3798MV300 实测（x264 High CABAC 1080p 三条码流 90 帧，段长按厂商规则保留停止位）：停止位不在字节最低位的 35 帧全部干净；在最低位的 55 帧里 46 帧报 DEC_ERR，逐帧把段长缩短 1~7 位扫一遍，每帧恰有一个缩短量能消掉它，46 帧里正好等于停止位到它前面最近一个 1 的距离（例：末字节 10000001 要缩 7 位，11000001 要缩 6 位），另有 9 帧不缩才干净，取决于算术解码的状态，从字节上算不出来。HEVC 也见到同一签名：每帧 4 个 slice 的码流里一个 I 帧的前 3 个 slice 都报，其中只有 1 个的停止位在字节最低位，像素同样逐字节一致。这种帧的 slice 报告字 0 是 0x14230000（H.264 末 slice）、0x14210000/0x00210000（非末 slice），宏块全覆盖。
+ *
+ * 只放行这一种：DEC_ERR、每条 slice 报告字 0 的 bit 31（厂商 MakeDecReport 存成 Error_Flag 的那一位）为 0，且各 slice 的起止宏块首尾相接、恰好覆盖整幅图像。同机实测其余各类 DEC_ERR 的字 0 都带 bit 31：段长少报 1 位 94430000，H.264 CABAC 码流中段改 48 字节 0xff 94230000、末字节附近改 1 位 94030000，HEVC 4 slice 码流中段改坏 80210028/80230003、末字节附近改 1 位 80410008，链走进空槽 98230000，HEVC 段长去掉停止位 80430000；改坏的帧也都覆盖不全（少 1 到 2183 个宏块/CTB）。位级负对照：全 I 帧的 H.264 CABAC 与 HEVC 各 30 帧，每帧翻转停止位之前第 1~16 位中的一位、共 240 帧，解错的帧（H.264 45 帧、HEVC 58 帧）除 HEVC 1 帧外都带 ERROR，那 1 帧引擎根本没报 DEC_ERR（发行模块同样不带），放行规则没有放过任何解错的帧。放行的帧照旧复位引擎，只是不再交出 V4L2_BUF_FLAG_ERROR、不打印失败日志。
+ */
+static bool histb_vdec_tail_slack_only(struct histb_vdec_dev *dev,
+				       unsigned int slices)
+{
+	const u32 *up = histb_vdec_up_msgs(&dev->pool);
+	u32 next = 0;
+	unsigned int i;
+
+	if (!dev->tail_slack_total || !slices ||
+	    slices >= HISTB_VDEC_MAX_UP_SLICES)
+		return false;
+
+	for (i = 0; i < slices; i++) {
+		if (up[4 * i] & BIT(31))
+			return false;
+		if (up[4 * i + 1] != next || up[4 * i + 2] < next ||
+		    up[4 * i + 2] >= dev->tail_slack_total)
+			return false;
+		next = up[4 * i + 2] + 1;
+	}
+
+	return next == dev->tail_slack_total;
 }
 
 static void histb_vdec_report_failure(struct histb_vdec_dev *dev, u32 state,
@@ -506,7 +535,7 @@ irqreturn_t histb_vdec_irq_handler(int irq, void *priv)
 	struct histb_vdec_dev *dev = priv;
 	struct histb_vdec_job job;
 	unsigned int slices;
-	bool short_cov, deliver_err;
+	bool short_cov, deliver_err, slack_only;
 	u32 state;
 
 	/*
@@ -524,7 +553,10 @@ irqreturn_t histb_vdec_irq_handler(int irq, void *priv)
 	slices = histb_vdec_count_slices(state);
 	dev_dbg(dev->dev, "frame done: %u slices%s\n", slices,
 		(state & VDM_STATE_DEC_ERR) ? ", decode error" : "");
-	histb_vdec_dump_up(dev, slices, state & VDM_STATE_DEC_ERR);
+	slack_only = (state & VDM_STATE_DEC_ERR) &&
+		     histb_vdec_tail_slack_only(dev, slices);
+	histb_vdec_dump_up(dev, slices,
+			   (state & VDM_STATE_DEC_ERR) && !slack_only);
 
 	/*
 	 * One 4-word report per slice; word 2 is the last macroblock the slice
@@ -569,7 +601,8 @@ irqreturn_t histb_vdec_irq_handler(int irq, void *priv)
 	 * next job, whatever opened it.
 	 */
 	if ((state & VDM_STATE_DEC_ERR) || short_cov) {
-		if (!((struct histb_vdec_ctx *)job.ctx)->diag_reported) {
+		if (!slack_only &&
+		    !((struct histb_vdec_ctx *)job.ctx)->diag_reported) {
 			histb_vdec_report_failure(dev, state, slices);
 			((struct histb_vdec_ctx *)job.ctx)->diag_reported = true;
 		}
@@ -588,7 +621,7 @@ irqreturn_t histb_vdec_irq_handler(int irq, void *priv)
 	    job.ctx->desc->vidstd == HISTB_VIDSTD_MPEG2)
 		deliver_err = short_cov;
 	else
-		deliver_err = state & VDM_STATE_DEC_ERR;
+		deliver_err = (state & VDM_STATE_DEC_ERR) && !slack_only;
 
 	cancel_delayed_work(&dev->watchdog);
 	histb_vdec_job_complete(dev, &job,
@@ -704,6 +737,7 @@ static void histb_vdec_device_run(void *priv)
 	 */
 	/* The front end reports the macroblocks it submitted, if it knows. */
 	dev->mb_total = 0;
+	dev->tail_slack_total = 0;
 	ret = v4l2_ctrl_request_setup(src->vb2_buf.req_obj.req,
 				      &ctx->ctrl_hdl);
 	if (ret) {
@@ -929,7 +963,8 @@ int histb_vdec_v2_probe(struct platform_device *pdev,
 	dev->chip = gen->chip;
 	dev->raster = part->raster;
 	dev->h264_chain_null_end = part->h264_chain_null_end;
-	dev->hevc_seg_stop_bit = part->hevc_seg_stop_bit;
+	dev->cabac_seg_stop_bit = part->cabac_seg_stop_bit;
+	dev->qmatrix_vfmw5 = part->qmatrix_vfmw5;
 	dev->mv_out = part->mv_out;
 	dev->common.priv = dev;
 	platform_set_drvdata(pdev, dev);
@@ -1272,7 +1307,8 @@ static const struct histb_vdec_v2_part histb_vdec_v2_part_mv300 = {
 	.raster = true,
 	.crg_gates = true,
 	.h264_chain_null_end = true,
-	.hevc_seg_stop_bit = true,
+	.cabac_seg_stop_bit = true,
+	.qmatrix_vfmw5 = true,
 	.mv_out = true,
 };
 

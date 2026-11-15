@@ -297,17 +297,41 @@ static u32 histb_h264_scaling_word(const u8 *coeffs)
 }
 
 /*
- * Quantisation matrix, picture slot words D63..D118. Vendor packing order: each
+ * Quantisation matrix, picture slot words D64..D119. Vendor packing order: each
  * scaling list in raster order, four coefficients per word, least significant
  * byte first; six 4x4 lists followed by the two 8x8 luma lists the H.264
  * protocol defines (V4L2 indices 0 and 1). Without a picture matrix the spec
  * default of 16 per coefficient applies.
+ *
+ * qmatrix_vfmw5 的型号（V5R2C1）上表的顺序与字数不变，但每一行（uAPI 光栅序 y*N+x 的一行）内先放偶数列、再放奇数列：4x4 每行一字，字节依次为第 0、2、1、3 列；8x8 每行两字，依次为第 0、2、4、6 列与第 1、3、5、7 列。依据是厂商 vfmw v5.0 语法层 WritePicMsg（Hi3798MV200 h264.S，读汇编）：它从 SPS/PPS 的 qmatrix4x4/qmatrix8x8（Scaling_List 按 zigzag 反扫写成的光栅序字节）取字，4x4 每字交换字节 1、2，8x8 每对字重排成上述两字。Hi3798MV300 实测：x264 --cqm jvt（各表取缺省表）、自定义非对称表、再改写 PPS 让三张帧内 4x4 表与三张帧间 4x4 表各不相同的三条 30 帧 1080p 码流，按光栅序直装亮度 PSNR 只有 20.3/25.3 dB，按这里的顺序全部逐字节一致。
  */
 static void histb_h264_pack_scaling(u32 *dst,
 				    const struct v4l2_ctrl_h264_scaling_matrix *m,
-				    bool present)
+				    bool present, bool vfmw5)
 {
 	unsigned int i, j;
+
+	if (present && vfmw5) {
+		for (i = 0; i < 6; i++) {
+			for (j = 0; j < 4; j++) {
+				const u8 *r = m->scaling_list_4x4[i] + 4 * j;
+
+				*dst++ = r[0] | r[2] << 8 | r[1] << 16 |
+					 (u32)r[3] << 24;
+			}
+		}
+		for (i = 0; i < 2; i++) {
+			for (j = 0; j < 8; j++) {
+				const u8 *r = m->scaling_list_8x8[i] + 8 * j;
+
+				*dst++ = r[0] | r[2] << 8 | r[4] << 16 |
+					 (u32)r[6] << 24;
+				*dst++ = r[1] | r[3] << 8 | r[5] << 16 |
+					 (u32)r[7] << 24;
+			}
+		}
+		return;
+	}
 
 	for (i = 0; i < 6; i++) {
 		for (j = 0; j < 4; j++)
@@ -514,7 +538,8 @@ static void histb_h264_assemble_pic(struct histb_vdec_dev *dev,
 	 * the 56th at byte 476.
 	 */
 	histb_h264_pack_scaling(&pic[64], run->scaling,
-				pps->flags & V4L2_H264_PPS_FLAG_SCALING_MATRIX_PRESENT);
+				pps->flags & V4L2_H264_PPS_FLAG_SCALING_MATRIX_PRESENT,
+				dev->qmatrix_vfmw5);
 }
 
 /*
@@ -700,6 +725,8 @@ static int histb_h264_assemble_slice(struct histb_vdec_dev *dev,
 	 * so the length must be exact, not merely long enough. Under CABAC that
 	 * subtraction is wrong on this hardware: it cost the 1920x1088 frame
 	 * its last macroblock row, so the padding stays in the length there.
+	 *
+	 * 打开 cabac_seg_stop_bit 的型号（V5R2C1）上 CABAC 段长按厂商规则只去掉停止位之后的对齐零位、保留停止位。Hi3798MV300 实测（x264 High CABAC 1080p 三条码流 90 帧，下面三种段长像素都逐字节一致）：不去尾部时 81 帧报 DEC_ERR，连停止位一起去掉 85 帧，只去零位 46 帧；剩下的 46 帧都是停止位落在字节最低位的情况，由 histb_vdec_tail_slack_only() 放行。
 	 */
 	cabac = pps->flags & V4L2_H264_PPS_FLAG_ENTROPY_CODING_MODE;
 	if (cabac)
@@ -715,13 +742,15 @@ static int histb_h264_assemble_slice(struct histb_vdec_dev *dev,
 	 * the padding subtraction is wrong on this hardware: it cost the
 	 * 1920x1088 frame its last macroblock row, so the padding stays in the
 	 * length there.
+	 *
+	 * 这两段英文测量出自 Hi3798MV100 的 bring-up；V5R2C1 上 CABAC 的段长见上一段注释的中文补述（只去对齐零位、保留停止位）。
 	 */
 	next_bit = histb_h264_data_end_bit(run->src_va, next_bit);
 	valid = next_bit - data_bit;
-	if (!cabac) {
+	if (!cabac || dev->cabac_seg_stop_bit) {
 		trail = histb_vdec_trail_zero_bits(run->src_va, next_bit) + 1;
 		if (valid > trail)
-			valid -= trail;
+			valid -= cabac ? trail - 1 : trail;
 	}
 	histb_h264_pack_segment(&slot[0], data_bit, valid);
 
@@ -1344,10 +1373,13 @@ static int histb_vdec_h264_run(struct histb_vdec_ctx *ctx,
 	 * corpus declares matrices - the parameter-set walk and the reference
 	 * decoder's own header trace agree on that - so this costs no frame
 	 * that decodes byte-exactly today.
+	 *
+	 * 上面的测量与“语料里没有带矩阵的码流”都出自 Hi3798MV100 的 bring-up，不在 V5R2C1 上。qmatrix_vfmw5 的型号按厂商 v5.0 布局装表（见 histb_h264_pack_scaling()）后，--cqm jvt、自定义非对称表与三张帧内 4x4 表互不相同的码流都逐字节一致，所以那里任何矩阵都接受。
 	 */
 	if (run->pps->flags & V4L2_H264_PPS_FLAG_SCALING_MATRIX_PRESENT) {
 		if (!run->scaling ||
-		    !histb_h264_scaling_supported(run->scaling))
+		    (!dev->qmatrix_vfmw5 &&
+		     !histb_h264_scaling_supported(run->scaling)))
 			return -EINVAL;
 	}
 
@@ -1561,6 +1593,9 @@ static int histb_vdec_h264_run(struct histb_vdec_ctx *ctx,
 
 	histb_h264_program_regs(dev, run);
 	dev->mb_total = run->width_mbs * run->height_mbs;
+	if (dev->cabac_seg_stop_bit &&
+	    (run->pps->flags & V4L2_H264_PPS_FLAG_ENTROPY_CODING_MODE))
+		dev->tail_slack_total = dev->mb_total;
 	histb_vdec_hw_kick(dev, HISTB_VIDSTD_H264);
 
 	return 0;
