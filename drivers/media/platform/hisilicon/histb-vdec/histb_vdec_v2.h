@@ -247,6 +247,14 @@ struct histb_vdec_dev {
 	 * V5R2C1 的 HEVC 段长要包含 rbsp_stop_one_bit，只去掉其后的对齐零位（见 histb_hevc_assemble_slice()）。
 	 */
 	bool			hevc_seg_stop_bit;
+	/*
+	 * 运动信息写回：V5R2C1 要置 VDM_CFG1_MV_OUT_EN，引擎才把当前帧的运动信息写进图像消息给它的 PMV 槽（H.264 为 D7，HEVC 为 D6），以它为 collocated 图像的后续帧（H.264 B slice 的空间与时间 direct、HEVC 的 TMVP）读的就是这个槽；不置位时引擎根本不写，槽一直是分配时的零。H.264 与 HEVC 的 histb_*_program_regs() 都读这个开关。
+	 *
+	 * 依据（读汇编，厂商 V5R2C1 固件 tmp/media/vfmw_v5/）：H264HAL_V5R2C1_CfgVdmReg 与 HEVCHAL_V5R2C1_CfgVdmReg 每帧都用 orr w0, w0, -128 置 CFG1 字节 1 的最高位（bit 15），再经 MFDE_ConfigReg 写 CFG1；两个函数写的寄存器偏移里都没有 VDM_DNR_MBINFO_STADDR（0x90），所以这一代置这一位不需要 0x90 指向的缓冲。Hi3798MV300 上 0x90 写入后立即读回为 0，哨兵法证明不了引擎碰不碰它指向的地址，这里只以厂商不写为据。Hi3798MV100/Hi3716CV200 保持不置：V300 的 HEVCHAL_V300R001_CfgVdmReg 用 bic #32768 显式清掉这一位，这两代的 H.264 HAL 手头没有，H.264 上置不置未读、未实测。
+	 *
+	 * Hi3798MV300 实测（不置位 → 置位）：解完后各 PMV 槽非零字数 0 → 数千到数万；HEVC 开 TMVP 的 I+P 码流以 P 帧为 collocated 的帧亮度 PSNR 27.3–27.9 dB → 逐字节一致，B slice 的 collocated 取自 L1 的 30 帧码流置位后同样逐字节一致；H.264 空间 direct 与时间 direct 的 30 帧 IPBPB 码流各 14 个 B 帧全部失配 → 30 帧逐字节一致，无 B 帧的码流两种取值都一致。写回量：HEVC 按每 16x16 块 16 字节写（由非零记录推断：1080p 的非零数据写到 130556 字节为止；上界取自厂商 VDMHAL_V5R2C1_CalcFsSize 给 HEVC 的 W_mb * H_mb * 16 = 130560），H.264 按每宏块 32 字节写（1080p/1440p 的非零数据恰好写到 261120/460800 字节即槽尾为止，槽后到页尾的 1024/2048 字节保持为零），都在本驱动分配的槽内。
+	 */
+	bool			mv_out;
 };
 
 /*

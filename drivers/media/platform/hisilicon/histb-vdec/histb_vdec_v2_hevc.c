@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 /*
- * Hi3798MV100 (VDH HiVDHV300R001) stateless HEVC decoder.
+ * HiSilicon VDH v2 stateless HEVC decoder (Hi3798MV100, Hi3798MV300).
  *
- * HEVC is a V3 addition: the Hi3716CV200 part (HiVDHV200R004) has no HEVC
- * path, so this front end is registered for Hi3798MV100 only.
+ * HEVC 是 V3 引入的：Hi3716CV200（HiVDHV200R004）没有 HEVC 通路，所以这个前端注册给 Hi3798MV100（HiVDHV300R001）与 Hi3798MV300（HiVDHV5R2C1），Hi3716CV200 的格式列表里没有它（见 histb_vdec_v2_drv.c 的 histb_vdec_fmt_list_cv200）。
  *
  * One job decodes one frame: the picture slot of the message pool carries the
  * frame-level state (POC, DPB address and POC tables, CABAC context table
@@ -815,6 +814,9 @@ static void histb_hevc_program_regs(struct histb_vdec_dev *dev,
 	 */
 	if (dev->raster)
 		cfg1 |= VDM_CFG1_DBLK_1D_EN;
+	/* 运动信息写回，供 TMVP 读 collocated 图像的 PMV 槽（见 histb_vdec_dev.mv_out） */
+	if (dev->mv_out)
+		cfg1 |= VDM_CFG1_MV_OUT_EN;
 
 	/* decoded CTU budget: the field counts CTUs minus one */
 	vdm_write(dev, VDM_CFG0, cfg0);

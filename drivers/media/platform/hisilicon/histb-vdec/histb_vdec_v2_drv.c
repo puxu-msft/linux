@@ -118,6 +118,7 @@ struct histb_vdec_v2_part {
 	bool			crg_gates; /* VDH 门控在 CRG30：需要 hisilicon,crg */
 	bool			h264_chain_null_end; /* 见 histb_vdec_dev 同名字段 */
 	bool			hevc_seg_stop_bit; /* 见 histb_vdec_dev 同名字段 */
+	bool			mv_out; /* 见 histb_vdec_dev 同名字段 */
 };
 
 static struct histb_vdec_dev *histb_vdec_dev_of(struct histb_vdec_ctx *ctx)
@@ -929,6 +930,7 @@ int histb_vdec_v2_probe(struct platform_device *pdev,
 	dev->raster = part->raster;
 	dev->h264_chain_null_end = part->h264_chain_null_end;
 	dev->hevc_seg_stop_bit = part->hevc_seg_stop_bit;
+	dev->mv_out = part->mv_out;
 	dev->common.priv = dev;
 	platform_set_drvdata(pdev, dev);
 
@@ -1271,6 +1273,7 @@ static const struct histb_vdec_v2_part histb_vdec_v2_part_mv300 = {
 	.crg_gates = true,
 	.h264_chain_null_end = true,
 	.hevc_seg_stop_bit = true,
+	.mv_out = true,
 };
 
 const struct histb_vdec_variant histb_vdec_v2_mv100_variant = {

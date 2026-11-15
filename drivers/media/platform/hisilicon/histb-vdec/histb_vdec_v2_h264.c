@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 /*
- * HiSilicon VDH v2 stateless H.264 decoder (Hi3716CV200, Hi3798MV100).
+ * HiSilicon VDH v2 stateless H.264 decoder (Hi3716CV200, Hi3798MV100, Hi3798MV300).
  *
  * One job decodes one frame: the picture slot of the message pool carries the
  * frame-level state (POC, DPB address table, CABAC table pointer, quantisation
@@ -848,7 +848,9 @@ static void histb_h264_program_regs(struct histb_vdec_dev *dev,
 	vdm_write(dev, VDM_CFG1, FIELD_PREP(VDM_CFG1_VID_STD, HISTB_VIDSTD_H264) |
 		  FIELD_PREP(VDM_CFG1_DDR_STRIDE, run->tile_stride >> 6) |
 		  FIELD_PREP(VDM_CFG1_MAX_SLCGRP_NUM, 1) |
-		  VDM_CFG1_FST_SLC_GRP | VDM_CFG1_DBLK_1D_EN);
+		  VDM_CFG1_FST_SLC_GRP | VDM_CFG1_DBLK_1D_EN |
+		  /* 运动信息写回，供 B slice 的 direct 预测读 collocated 图像的 PMV 槽（见 histb_vdec_dev.mv_out） */
+		  (dev->mv_out ? VDM_CFG1_MV_OUT_EN : 0));
 	vdm_write(dev, VDM_AVM_ADDR,
 		  lower_32_bits(histb_vdec_pic_slot_dma(&dev->pool)));
 	vdm_write(dev, VDM_VAM_ADDR,
