@@ -160,8 +160,8 @@ static unsigned int histb_vdec_mpeg2_hdr_bits(const u8 *p, unsigned int pos,
  * starts on, its quantiser scale code, its intra_slice flag and how many bits
  * of header follow the start code.
  *
- * The MPEG-2 form is slice_vertical_position (8 bits when progressive_sequence
- * is set, otherwise a 3-bit extension plus 7 bits), slice_horizontal_position,
+ * The MPEG-2 form is slice_vertical_position (8 bits, or a 3-bit extension plus
+ * 7 bits when vertical_size exceeds 2800 lines), slice_horizontal_position,
  * quantiser_scale_code (1..31), intra_slice_flag and, when that is set,
  * intra_slice plus seven reserved bits, then extra_bit_slice. Field pictures,
  * slices that start mid-row and MPEG-1's extra_image_information are rejected
@@ -185,7 +185,11 @@ static int histb_vdec_mpeg2_slice_hdr(const u8 *p, unsigned int code,
 				      unsigned int *qsc, unsigned int *intra,
 				      unsigned int *hdr_bits)
 {
-	unsigned int bits = progressive ? 8 : 10;
+	/*
+	 * slice_vertical_position_extension 只在 vertical_size > 2800（宏块行数 > 175，mb_height = DIV_ROUND_UP(vertical_size, 16)）时存在（13818-2 6.2.4 slice() 的条件），与 progressive_sequence 无关；隔行序列里 slice 起始码之后紧跟的就是 quantiser_scale_code。按 progressive_sequence 判时，Hi3798MV300 上两条 1080i 隔行帧图像码流（FFmpeg mpeg2video +ildct+ilme）与一条 progressive_sequence=0 的逐行码流各有 26/30 帧被拒收（quantiser_scale_code ≥ 4 的帧高 3 位非 0），改成按高度判后 30/30 解出。各型号共用这处解析；Hi3798MV100 上隔行帧图像以前被拒收、现在会交给引擎，未复测。
+	 */
+	bool ext = mb_height > 175;
+	unsigned int bits = ext ? 10 : 8;
 	unsigned int vpos, flag;
 
 	if (mpeg1) {
@@ -208,25 +212,16 @@ static int histb_vdec_mpeg2_slice_hdr(const u8 *p, unsigned int code,
 		return 0;
 	}
 
-	if (progressive) {
+	if (!ext) {
 		vpos = histb_vdec_mpeg2_hdr_bits(p, 0, 8);
 	} else {
 		/*
-		 * slice_vertical_position_extension (13818-2 6.2.2.4) is only
-		 * ever non-zero on pictures this driver refuses on other
-		 * grounds: the field pictures of a non-progressive sequence,
-		 * which histb_vdec_mpeg2_run() rejects on picture_structure,
-		 * and the 4:2:2 variant its chroma_format gate rejects. Nothing
-		 * here could use a non-zero value either: @row becomes
-		 * start_mbn = row * mb_width and D0 budgets a single frame
-		 * grid, so a slice naming a row beyond it has no addressable
-		 * macroblock range and is refused rather than placed at a
-		 * guessed row. This arm has never been measured on a conformant
-		 * stream - the only headers built here that set it wrote the
-		 * quantiser at a wrong offset, which the reference decoder
-		 * itself rejects (qscale == 0) - so settling it needs a legal
-		 * MPEG-2 form slice header on a field picture, which the local
-		 * encoder does not produce.
+		 * slice_vertical_position_extension (13818-2 6.2.4) carries
+		 * the high bits of the row of a picture taller than 2800 lines,
+		 * larger than any geometry this driver negotiates, so a
+		 * non-zero value is refused rather than placed at a row the
+		 * frame grid does not have. This arm has not been measured on a
+		 * conformant stream.
 		 */
 		if (histb_vdec_mpeg2_hdr_bits(p, 0, 3))
 			return -EINVAL;

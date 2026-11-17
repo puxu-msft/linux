@@ -63,11 +63,14 @@
 #define HISTB_MPEG4_CFG1_VIDSTD		2
 #define HISTB_MPEG4_D0_H263_SHORT	4
 
-/* Motion-vector storage per macroblock, the size the vendor firmware allocates
- * the motion-vector buffer by (the same 32 bytes per macroblock the H.264 layer
- * uses).
+/*
+ * 每宏块的运动信息存储，照厂商 VDMHAL_V5R2C1_CalcFsSize 的通用分支（tmp/media/vfmw_v5/vdm_hal.S:416-440，与 H.264 的 histb_h264_pmv_per_mb() 同一条规则）：图像不超过 45x36 宏块时每宏块 64 字节，否则 32 字节。打开 MV_OUT_EN（mpeg4_vfmw5）后引擎按这个跨度写当前图像的 PMV 槽；CIF、4CIF、576p 都落在 64 字节那一档。写回范围未在 MPEG-4 上实测，按厂商分配。
  */
-#define HISTB_MPEG4_PMV_BYTES_PER_MB	32
+static unsigned int histb_vdec_mpeg4_pmv_per_mb(unsigned int mb_width,
+						unsigned int mb_height)
+{
+	return mb_width <= 45 && mb_height <= 36 ? 64 : 32;
+}
 
 /* MPEG-4 vop_coding_type (14496-2 table 6-2). */
 #define HISTB_MPEG4_I_VOP		0
@@ -127,19 +130,18 @@ static const u8 histb_mp4_inter_matrix[64] = {
 };
 
 /* A VOL lists a custom matrix in scan order while the descriptor table is
- * indexed by block position; this is the mapping the vendor firmware applies
- * when it loads a VOL matrix (scan entry i lands at block position
- * histb_mp4_zigzag[i]).
+ * indexed by block position: scan entry i lands at block position
+ * histb_mp4_zigzag[i]. 这是标准 zigzag 序（14496-2 图 7-2），厂商 vfmw v5.0 MPEG-4 语法层 Bs_Get_Matrix 用的也是它（scan_tables[0]，厂商 vfmw v5.0 Hi3798MV200 64 位语法层 mpeg4.S，读汇编）；此前这张表从扫描位置 35 起与标准不同，自定义量化矩阵会装错位。
  */
 static const u8 histb_mp4_zigzag[64] = {
 	 0,  1,  8, 16,  9,  2,  3, 10,
 	17, 24, 32, 25, 18, 11,  4,  5,
 	12, 19, 26, 33, 40, 48, 41, 34,
 	27, 20, 13,  6,  7, 14, 21, 28,
-	35, 42, 49, 50, 43, 36, 29, 22,
-	15, 23, 30, 37, 44, 51, 52, 45,
-	38, 31, 39, 46, 53, 54, 47, 55,
-	56, 57, 62, 63, 58, 59, 60, 61,
+	35, 42, 49, 56, 57, 50, 43, 36,
+	29, 22, 15, 23, 30, 37, 44, 51,
+	58, 59, 52, 45, 38, 31, 39, 46,
+	53, 60, 61, 54, 47, 55, 62, 63,
 };
 
 /*
@@ -221,6 +223,8 @@ struct histb_vdec_mpeg4_pic {
 
 /* One parsed slice header. */
 struct histb_vdec_mpeg4_slice {
+	/* 包头（MPEG-4 resync marker 或 H.263 GOB 起始码）起点所在的位；图像数据起头的第一包为 0 */
+	unsigned int marker_bit;
 	unsigned int data_bit;
 	unsigned int start_mbn;
 	unsigned int quant;
@@ -1330,6 +1334,7 @@ static int histb_vdec_mpeg4_slice_headers(const u8 *buf, unsigned int size,
 	int ret;
 
 	if (!pic->short_header && pic->resync_marker_disable) {
+		sls[0].marker_bit = 0;
 		sls[0].data_bit = data_bit;
 		sls[0].start_mbn = 0;
 		sls[0].quant = pic->quant;
@@ -1394,6 +1399,7 @@ static int histb_vdec_mpeg4_slice_headers(const u8 *buf, unsigned int size,
 		}
 		if (ret)
 			return ret;
+		sl.marker_bit = pos;
 		/*
 		 * The picture's first macroblock need not open with a header:
 		 * the data before the first packet header is a packet of its
@@ -1408,6 +1414,7 @@ static int histb_vdec_mpeg4_slice_headers(const u8 *buf, unsigned int size,
 		 * picture's own data start, and the chain stays contiguous.
 		 */
 		if (!n && sl.start_mbn) {
+			sls[0].marker_bit = 0;
 			sls[0].data_bit = data_bit;
 			sls[0].start_mbn = 0;
 			sls[0].quant = pic->quant;
@@ -1484,6 +1491,30 @@ histb_vdec_mpeg4_slc_slot_dma(const struct histb_vdec_msgpool *p,
 }
 
 /*
+ * MPEG-4 视频包的数据止于 next_start_code()/next_resync_marker() 的填充：一个 0 位加上补齐到字节边界的 1 位（14496-2 5.2.4、6.2.3、6.2.5.2）。@end_bit 是下一个 resync marker 或起始码所在的位（字节对齐）；@picture_end 时它是图像数据的末尾，起始码之前还可能有零字节，先去掉。返回去掉填充之后的位置；末字节不是 0 加若干个 1 的形状时原样返回。中间的视频包不去零字节：数据末 7 位全 0、填充只有一个 0 位时末字节就是 0x00，那是数据。
+ */
+static unsigned int histb_vdec_mpeg4_strip_stuffing(const u8 *buf,
+						    unsigned int data_bit,
+						    unsigned int end_bit,
+						    bool picture_end)
+{
+	unsigned int e = end_bit / 8, ones = 0;
+	u8 last;
+
+	while (picture_end && e > data_bit / 8 + 1 && !buf[e - 1])
+		e--;
+	if (e <= data_bit / 8 + 1)
+		return end_bit;
+	last = buf[e - 1];
+	while (ones < 8 && (last >> ones) & 1)
+		ones++;
+	if (ones == 8)
+		return end_bit;
+
+	return e * 8 - ones - 1;
+}
+
+/*
  * Write one slice descriptor. The segment is measured from the programmed
  * stream base: D1 carries the 16-byte granule holding the first data bit and
  * D0's bit offset counts the bits inside that granule - the vendor firmware's
@@ -1492,11 +1523,12 @@ histb_vdec_mpeg4_slc_slot_dma(const struct histb_vdec_msgpool *p,
  * uses. The descriptor starts at the first bit of the macroblock layer, after
  * the slice header, because the engine reads macroblock data and nothing else.
  *
- * The length runs to the end of the submitted span, as the vendor firmware's
- * remaining-bits count does: the engine stops a slice at its own end
- * macroblock, so a window that also covers later slices costs nothing and it is
- * what lets a picture with a missing tail still terminate. MPEG-4 slice data
- * carries no stop bit (as in MPEG-2), so nothing is trimmed off the end here.
+ * 不打开 mpeg4_vfmw5 的型号：the length runs to the end of the submitted span,
+ * as the vendor firmware's remaining-bits count does: the engine stops a slice
+ * at its own end macroblock, so a window that also covers later slices costs
+ * nothing and it is what lets a picture with a missing tail still terminate,
+ * and since MPEG-4 slice data carries no stop bit (as in MPEG-2) nothing is
+ * trimmed off the end. 打开 mpeg4_vfmw5 的型号每个视频包的段止于下一包的 resync marker，并去掉填充位（histb_vdec_mpeg4_strip_stuffing()，调用处有实测）。
  */
 static void histb_vdec_mpeg4_pack_slice(u32 *w, unsigned int end_bit,
 					const struct histb_vdec_mpeg4_slice *sl,
@@ -1721,11 +1753,13 @@ static void histb_vdec_mpeg4_pmv_free(struct histb_vdec_dev *dev,
 }
 
 static int histb_vdec_mpeg4_pmv_grow(struct histb_vdec_ctx *ctx,
-				     unsigned int mb_total)
+				     unsigned int mb_width,
+				     unsigned int mb_height)
 {
 	struct histb_vdec_dev *dev = video_get_drvdata(ctx->fh.vdev);
 	struct histb_vdec_mpeg4_ctx *m4 = ctx->priv;
-	unsigned int slot = ALIGN(mb_total * HISTB_MPEG4_PMV_BYTES_PER_MB,
+	unsigned int slot = ALIGN(mb_width * mb_height *
+				  histb_vdec_mpeg4_pmv_per_mb(mb_width, mb_height),
 				  128);
 	unsigned int i;
 
@@ -1807,7 +1841,7 @@ static int histb_vdec_mpeg4_run(struct histb_vdec_ctx *ctx,
 	struct histb_vdec_mpeg4_pic pic = {};
 	struct histb_vdec_mpeg4_slice *sls;
 	unsigned int cap_w, cap_h, bytesused, data_bit = 0, au_end_bit = 0;
-	unsigned int lines, tile_stride, end_bit, n_sl, i, cur_slot, next;
+	unsigned int lines, tile_stride, end_bit, seg_end, n_sl, i, cur_slot, next;
 	void *slot;
 	dma_addr_t src_addr, dst_addr, stream_base;
 	dma_addr_t fwd, bwd, fwd_pmv, bwd_pmv, cur_pmv;
@@ -1938,7 +1972,7 @@ static int histb_vdec_mpeg4_run(struct histb_vdec_ctx *ctx,
 	if (stream_base != src_addr)
 		return -EINVAL;
 
-	ret = histb_vdec_mpeg4_pmv_grow(ctx, pic.mb_total);
+	ret = histb_vdec_mpeg4_pmv_grow(ctx, pic.mb_width, pic.mb_height);
 	if (ret)
 		return ret;
 
@@ -1964,13 +1998,13 @@ static int histb_vdec_mpeg4_run(struct histb_vdec_ctx *ctx,
 		if (pic.short_header) {
 			/* A short-header picture takes its quantiser and its
 			 * type from the first group header, which is the only
-			 * place that syntax carries them; it has no fcode and
-			 * no MPEG-4 packet geometry.
+			 * place that syntax carries them, and no MPEG-4 packet
+			 * geometry. 打开 mpeg4_vfmw5 的型号上它的 fcode 取 1（14496-2 规定 short_video_header 的图像 vop_fcode_forward 视为 1，H.263 的运动矢量范围就是 fcode 1 的范围），slice 描述符的 fcode 字段引擎照用：Hi3798MV300 实测写 0 时 H.263 的 I 帧正确、P 帧整帧错（亮度 PSNR 20–26 dB），写 1 后 P 帧与软解只差反变换（最大差 2）。
 			 */
 			pic.quant = sls[0].quant;
 			pic.coding_type = sls[0].coding_type;
-			pic.fcode_fwd = 0;
-			pic.fcode_bwd = 0;
+			pic.fcode_fwd = dev->mpeg4_vfmw5 ? 1 : 0;
+			pic.fcode_bwd = dev->mpeg4_vfmw5 ? 1 : 0;
 		}
 
 		if (n_sl + 1 >= HISTB_VDEC_MAX_SLICE_SLOTS) {
@@ -1990,7 +2024,18 @@ static int histb_vdec_mpeg4_run(struct histb_vdec_ctx *ctx,
 			slot = histb_vdec_mpeg4_slc_slot(pool, i);
 			next = i + 1 < n_sl ?
 				histb_vdec_mpeg4_slc_slot_dma(pool, i + 1) : 0;
-			histb_vdec_mpeg4_pack_slice(slot, end_bit, &sls[i],
+			/*
+			 * V5R2C1：每个视频包的段止于下一包的 resync marker（最后一包止于图像数据末尾），并去掉 next_resync_marker()/next_start_code() 的填充位。Hi3798MV300 实测（FFmpeg mpeg4 1080p 30 帧）：段长含填充时每帧都报 DEC_ERR（报告宏块全覆盖、像素只有反变换级差异），去掉后不带 resync 的 4 条码流 0 个 ERROR 帧，只去掉末包填充而各包仍止于图像末尾时带 resync 的码流照样每帧 DEC_ERR。其它型号沿用原来的写法：各段都止于图像末尾，不去填充。
+			 */
+			seg_end = end_bit;
+			if (dev->mpeg4_vfmw5 && !pic.short_header) {
+				if (i + 1 < n_sl)
+					seg_end = sls[i + 1].marker_bit;
+				seg_end = histb_vdec_mpeg4_strip_stuffing(
+					histb_vdec_src_va(&src->vb2_buf),
+					sls[i].data_bit, seg_end, i + 1 == n_sl);
+			}
+			histb_vdec_mpeg4_pack_slice(slot, seg_end, &sls[i],
 						    &pic, sls[i].start_mbn,
 						    end_mbn, next);
 		}
@@ -2182,7 +2227,7 @@ static int histb_vdec_mpeg4_run(struct histb_vdec_ctx *ctx,
 
 	/* Register set. CFG0 reproduces the vendor firmware's MPEG-4 register
 	 * setup bit for bit: the macroblock count with LD_QMATRIX, VOP-type
-	 * detect and marker detect. CFG1 does not: the value the firmware
+	 * detect and marker detect. Without mpeg4_vfmw5, CFG1 does not: the value the firmware
 	 * writes there is the band pitch shifted right by six into the stride
 	 * field, plus VID_STD 2, DBLK_1D_EN, FST_SLC_GRP, MV_OUT_EN, a maximum
 	 * slice group number of 1 and a compress flag taken from its decode
@@ -2211,12 +2256,22 @@ static int histb_vdec_mpeg4_run(struct histb_vdec_ctx *ctx,
 	 * cleared DDR_STRIDE moved nothing, so the field is inert either way;
 	 * this file keeps vendor parity.
 	 */
-	vdm_write(dev, VDM_CFG1,
-		  FIELD_PREP(VDM_CFG1_VID_STD, HISTB_MPEG4_CFG1_VIDSTD) |
-		  FIELD_PREP(VDM_CFG1_DDR_STRIDE,
-			     histb_vdec_band_bytes(tile_stride) >> 6) |
-		  FIELD_PREP(VDM_CFG1_MAX_SLCGRP_NUM, 3) |
-		  VDM_CFG1_DBLK_1D_EN);
+	/*
+	 * 打开 mpeg4_vfmw5 的型号照厂商 MP4HAL_V5R2C1_CfgReg 写宽 ≤ 120 宏块那一支的 0x2001C002（VID_STD 2、FST_SLC_GRP、MV_OUT_EN、MAX_SLCGRP_NUM 1、DBLK_1D_EN，DDR_STRIDE 为 0；读汇编，厂商 vfmw v5.0 Hi3798MV200 64 位 HiVDHV5R2C1/vdm_hal_mpeg4.S）。宽于 120 宏块时厂商关 1D 写、改走压缩输出，这里与 H.264/HEVC 一样恒走 1D 行优先写（引擎直写 capture 要的是 NV21），宽于 1920 的 MPEG-4 未上机。Hi3798MV300 实测（FFmpeg mpeg4 1080p 30 帧 SP 与带 B-VOP 的 ASP 码流）：DDR_STRIDE 写 band 间距时亮度正确、色度整面错（U/V PSNR 6.9 dB），写 0 后色度正确；不置 MV_OUT_EN 时 B-VOP 亮度 PSNR 约 26 dB（direct 宏块读不到后向锚点的运动信息，与 H.264 B 帧、HEVC TMVP 同一根因），置位后与 P-VOP 一样只剩反变换级的差异。FST_SLC_GRP 与 MAX_SLCGRP_NUM 1 对这两条码流没有可见影响，按厂商取值。
+	 */
+	if (dev->mpeg4_vfmw5)
+		vdm_write(dev, VDM_CFG1,
+			  FIELD_PREP(VDM_CFG1_VID_STD, HISTB_MPEG4_CFG1_VIDSTD) |
+			  FIELD_PREP(VDM_CFG1_MAX_SLCGRP_NUM, 1) |
+			  VDM_CFG1_FST_SLC_GRP | VDM_CFG1_DBLK_1D_EN |
+			  (dev->mv_out ? VDM_CFG1_MV_OUT_EN : 0));
+	else
+		vdm_write(dev, VDM_CFG1,
+			  FIELD_PREP(VDM_CFG1_VID_STD, HISTB_MPEG4_CFG1_VIDSTD) |
+			  FIELD_PREP(VDM_CFG1_DDR_STRIDE,
+				     histb_vdec_band_bytes(tile_stride) >> 6) |
+			  FIELD_PREP(VDM_CFG1_MAX_SLCGRP_NUM, 3) |
+			  VDM_CFG1_DBLK_1D_EN);
 	vdm_write(dev, VDM_AVM_ADDR, pool->dma & ~15U);
 	vdm_write(dev, VDM_VAM_ADDR, histb_vdec_up_msgs_dma(pool) & ~15U);
 	vdm_write(dev, VDM_STREAM_BASE, stream_base);

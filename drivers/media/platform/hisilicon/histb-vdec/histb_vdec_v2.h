@@ -279,6 +279,10 @@ struct histb_vdec_dev {
 	 * H.264 场图像（field_pic_flag=1）与 MBAFF 帧按厂商 V5R2C1 HAL 的写法编程（histb_vdec_v2_h264.c）：图像消息 D0 高度与 CFG0 宏块数取本图像（场为半帧）、底场的当前 PMV 写半槽、参考结构码与 APC 号带场编码与奇偶、collocated PMV 按参考是否按场解出取半槽、VDM_REF_PIC_TYPE 按参考是否按场解出置位、VDM_FF_APT_EN 恒 0、末 slice 的 D44 对 MBAFF 取宏块对数；同时放开场/MBAFF 的 B slice。依据在 histb_vdec_v2_h264.c 各处注释（读厂商汇编）；Hi3798MV300 上 MBAFF、场编码与帧/场自适应码流（含 B）都与软解逐字节一致。不打开的型号保持原来的写法。
 	 */
 	bool			h264_interlace_vfmw5;
+	/*
+	 * MPEG-4 与 H.263 按厂商 V5R2C1 编程（histb_vdec_v2_mpeg4.c）：CFG1 写厂商的 0x2001C002 一组位（DDR_STRIDE 为 0、MV_OUT_EN 等）；MPEG-4 每个视频包的段长止于下一包的 resync marker，并去掉 next_resync_marker()/next_start_code() 的填充位（histb_vdec_mpeg4_strip_stuffing()）；H.263 短头图像的 fcode 取 1。不打开的型号保持 MV100 bring-up 时的写法。
+	 */
+	bool			mpeg4_vfmw5;
 };
 
 /*

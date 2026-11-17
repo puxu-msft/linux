@@ -123,6 +123,7 @@ struct histb_vdec_v2_part {
 	bool			mv_out; /* 见 histb_vdec_dev 同名字段 */
 	bool			hevc_tiles; /* 见 histb_vdec_dev 同名字段 */
 	bool			h264_interlace_vfmw5; /* 见 histb_vdec_dev 同名字段 */
+	bool			mpeg4_vfmw5; /* 见 histb_vdec_dev 同名字段 */
 };
 
 static struct histb_vdec_dev *histb_vdec_dev_of(const struct histb_vdec_ctx *ctx)
@@ -1079,6 +1080,7 @@ int histb_vdec_v2_probe(struct platform_device *pdev,
 	dev->mv_out = part->mv_out;
 	dev->hevc_tiles = part->hevc_tiles;
 	dev->h264_interlace_vfmw5 = part->h264_interlace_vfmw5;
+	dev->mpeg4_vfmw5 = part->mpeg4_vfmw5;
 	dev->common.priv = dev;
 	platform_set_drvdata(pdev, dev);
 
@@ -1444,6 +1446,7 @@ static const struct histb_vdec_v2_part histb_vdec_v2_part_mv300 = {
 	.mv_out = true,
 	.hevc_tiles = true,
 	.h264_interlace_vfmw5 = true,
+	.mpeg4_vfmw5 = true,
 };
 
 const struct histb_vdec_variant histb_vdec_v2_mv100_variant = {
