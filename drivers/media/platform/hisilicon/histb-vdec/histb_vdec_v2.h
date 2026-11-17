@@ -275,6 +275,10 @@ struct histb_vdec_dev {
 	 * HEVC tiles：每帧按厂商 V5R2C1 的布局写 tile info image（图像消息 D55 指向，HEVC_WriteTileInfo），slice 消息的 D10/D43/D44 用 tile 扫描地址（HEVCHAL_V5R2C1_StartDec），见 histb_hevc_pack_tile_info() 与 histb_hevc_slice_ctb_range()。不打开的型号照旧拒收 tiles（Hi3798MV100 bring-up 时 tiles 图像都只解出不完整的第一帧就停），也不写 image。
 	 */
 	bool			hevc_tiles;
+	/*
+	 * H.264 场图像（field_pic_flag=1）与 MBAFF 帧按厂商 V5R2C1 HAL 的写法编程（histb_vdec_v2_h264.c）：图像消息 D0 高度与 CFG0 宏块数取本图像（场为半帧）、底场的当前 PMV 写半槽、参考结构码与 APC 号带场编码与奇偶、collocated PMV 按参考是否按场解出取半槽、VDM_REF_PIC_TYPE 按参考是否按场解出置位、VDM_FF_APT_EN 恒 0、末 slice 的 D44 对 MBAFF 取宏块对数；同时放开场/MBAFF 的 B slice。依据在 histb_vdec_v2_h264.c 各处注释（读厂商汇编）；Hi3798MV300 上 MBAFF、场编码与帧/场自适应码流（含 B）都与软解逐字节一致。不打开的型号保持原来的写法。
+	 */
+	bool			h264_interlace_vfmw5;
 };
 
 /*
@@ -319,6 +323,11 @@ struct histb_vdec_ctx {
 	 * that still traverse every macroblock, so a per-frame report is noise.
 	 */
 	bool			diag_reported;
+
+	/*
+	 * capture 下标位图：这个 buffer 被 V4L2_BUF_FLAG_M2M_HOLD_CAPTURE_BUF 扣住期间（一对场的第一场）有 job 出错或被拒收。v4l2_m2m_buf_done_and_job_finish() 对扣住的 buffer 不记完成状态，第二场正常完成时整帧会以 DONE 交出，这里让它带上 ERROR。buffer 开始一帧新的解码（不是接着扣住的那一帧）时清零。
+	 */
+	u32			held_err;
 
 	void			*priv;
 };

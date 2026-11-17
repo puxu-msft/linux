@@ -248,6 +248,23 @@ static int histb_vdec_s_fmt_cap(struct file *file, void *priv,
 	return 0;
 }
 
+/*
+ * OUTPUT 队列是否声明 V4L2_BUF_CAP_SUPPORTS_M2M_HOLD_CAPTURE_BUF：只在 gen 打开 hold_capture、且当前 OUTPUT 格式是 H.264 时（只有 H.264 的场对要两场解进同一个 capture buffer；其它协议的场图像都被拒收）。没有这个标志时 vb2 在 QBUF 时悄悄清掉 V4L2_BUF_FLAG_M2M_HOLD_CAPTURE_BUF（videobuf2-v4l2.c 的 vb2_fill_vb2_v4l2_buffer），一对场的第二场就会落进新的 capture buffer。两代后端的完成路径都是 v4l2_m2m_buf_done_and_job_finish()，decoder_cmd 用的是 v4l2_m2m_ioctl_stateless_decoder_cmd。
+ */
+static void histb_vdec_update_hold(struct histb_vdec_core_ctx *ctx,
+				   struct vb2_queue *src_vq)
+{
+	struct histb_vdec_common *common = histb_vdec_common_of_ctx(ctx);
+
+	if (common->gen->hold_capture &&
+	    ctx->desc->fourcc == V4L2_PIX_FMT_H264_SLICE)
+		src_vq->subsystem_flags |=
+			VB2_V4L2_FL_SUPPORTS_M2M_HOLD_CAPTURE_BUF;
+	else
+		src_vq->subsystem_flags &=
+			~VB2_V4L2_FL_SUPPORTS_M2M_HOLD_CAPTURE_BUF;
+}
+
 static int histb_vdec_s_fmt_out(struct file *file, void *priv,
 				struct v4l2_format *f)
 {
@@ -286,6 +303,7 @@ static int histb_vdec_s_fmt_out(struct file *file, void *priv,
 		ctx->desc = desc;
 		if (common->gen->protocol_changed)
 			common->gen->protocol_changed(ctx);
+		histb_vdec_update_hold(ctx, vq);
 	}
 	ctx->out_fmt = *f;
 	histb_vdec_reset_capture_fmt(ctx);
@@ -577,6 +595,7 @@ static int histb_vdec_queue_init(void *priv, struct vb2_queue *src_vq,
 	src_vq->lock = &common->vdev_lock;
 	src_vq->dev = gen->dma_dev(common);
 	src_vq->supports_requests = true;
+	histb_vdec_update_hold(ctx, src_vq);
 
 	ret = vb2_queue_init(src_vq);
 	if (ret)

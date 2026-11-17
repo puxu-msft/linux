@@ -122,6 +122,7 @@ struct histb_vdec_v2_part {
 	bool			qmatrix_vfmw5; /* 见 histb_vdec_dev 同名字段 */
 	bool			mv_out; /* 见 histb_vdec_dev 同名字段 */
 	bool			hevc_tiles; /* 见 histb_vdec_dev 同名字段 */
+	bool			h264_interlace_vfmw5; /* 见 histb_vdec_dev 同名字段 */
 };
 
 static struct histb_vdec_dev *histb_vdec_dev_of(const struct histb_vdec_ctx *ctx)
@@ -528,14 +529,25 @@ static void histb_vdec_job_complete(struct histb_vdec_dev *dev,
 				    const struct histb_vdec_job *job,
 				    enum vb2_buffer_state state, bool produced)
 {
-	struct vb2_v4l2_buffer *dst =
-		v4l2_m2m_next_dst_buf(job->ctx->fh.m2m_ctx);
+	struct histb_vdec_ctx *ctx = (struct histb_vdec_ctx *)job->ctx;
+	struct vb2_v4l2_buffer *src = v4l2_m2m_next_src_buf(ctx->fh.m2m_ctx);
+	struct vb2_v4l2_buffer *dst = v4l2_m2m_next_dst_buf(ctx->fh.m2m_ctx);
+	bool hold = src && (src->flags & V4L2_BUF_FLAG_M2M_HOLD_CAPTURE_BUF);
 
 	if (dst) {
+		u32 bit = BIT(dst->vb2_buf.index % 32);
+
 		if (produced)
-			histb_vdec_frame_to_linear((struct histb_vdec_ctx *)job->ctx, dst);
+			histb_vdec_frame_to_linear(ctx, dst);
 		else
 			vb2_set_plane_payload(&dst->vb2_buf, 0, 0);
+		/* 一对场里任何一场出错，整帧交出时都带 ERROR（见 histb_vdec_ctx.held_err） */
+		if (hold && (state == VB2_BUF_STATE_ERROR || !produced))
+			ctx->held_err |= bit;
+		if (!hold && (ctx->held_err & bit)) {
+			ctx->held_err &= ~bit;
+			state = VB2_BUF_STATE_ERROR;
+		}
 	}
 	v4l2_m2m_buf_done_and_job_finish(dev->common.m2m_dev, job->ctx->fh.m2m_ctx,
 					 state);
@@ -840,6 +852,9 @@ static void histb_vdec_device_run(void *priv)
 		goto err_job;
 	}
 
+	/* 不是接着一个被扣住的 buffer 解第二场：清掉这个下标上一帧留下的出错记录 */
+	if (!dst->is_held)
+		ctx->held_err &= ~BIT(dst->vb2_buf.index % 32);
 	v4l2_m2m_buf_copy_metadata(src, dst);
 
 	/*
@@ -1063,6 +1078,7 @@ int histb_vdec_v2_probe(struct platform_device *pdev,
 	dev->qmatrix_vfmw5 = part->qmatrix_vfmw5;
 	dev->mv_out = part->mv_out;
 	dev->hevc_tiles = part->hevc_tiles;
+	dev->h264_interlace_vfmw5 = part->h264_interlace_vfmw5;
 	dev->common.priv = dev;
 	platform_set_drvdata(pdev, dev);
 
@@ -1372,7 +1388,7 @@ static const u32 *histb_vdec_v2_required_ctrls(
 					 num);
 }
 
-#define HISTB_VDEC_V2_GEN(_chip, _caps, _max_w, _max_h, _min_queued)	\
+#define HISTB_VDEC_V2_GEN(_chip, _caps, _max_w, _max_h, _min_queued, _hold)	\
 	{								\
 		.name			= "histb-vdec",			\
 		.ctx_size		= sizeof(struct histb_vdec_ctx),	\
@@ -1383,6 +1399,7 @@ static const u32 *histb_vdec_v2_required_ctrls(
 		.max_cap_buffers	= HISTB_VDEC_MAX_APC_SLOTS,	\
 		.min_queued_buffers	= _min_queued,				\
 		.cap_clamp		= true,				\
+		.hold_capture		= _hold,				\
 		.cap_formats		= _caps,				\
 		.num_cap_formats	= ARRAY_SIZE(_caps),			\
 		.dma_dev		= histb_vdec_v2_dma_dev,		\
@@ -1403,11 +1420,11 @@ static const u32 *histb_vdec_v2_required_ctrls(
 
 static const struct histb_vdec_v2_part histb_vdec_v2_part_mv100 = {
 	.gen = HISTB_VDEC_V2_GEN(&histb_vdec_v2_chip_mv100,
-				 histb_vdec_v2_cap_formats, 1920, 1920, 4),
+				 histb_vdec_v2_cap_formats, 1920, 1920, 4, false),
 };
 static const struct histb_vdec_v2_part histb_vdec_v2_part_cv200 = {
 	.gen = HISTB_VDEC_V2_GEN(&histb_vdec_v2_chip_cv200,
-				 histb_vdec_v2_cap_formats, 1920, 1920, 4),
+				 histb_vdec_v2_cap_formats, 1920, 1920, 4, false),
 };
 
 /*
@@ -1417,7 +1434,7 @@ static const struct histb_vdec_v2_part histb_vdec_v2_part_cv200 = {
  */
 static const struct histb_vdec_v2_part histb_vdec_v2_part_mv300 = {
 	.gen = HISTB_VDEC_V2_GEN(&histb_vdec_v2_chip_mv300,
-				 histb_vdec_v2_cap_formats, 2560, 1440, 2),
+				 histb_vdec_v2_cap_formats, 2560, 1440, 2, true),
 	.raster = true,
 	.direct_capture = true,
 	.crg_gates = true,
@@ -1426,6 +1443,7 @@ static const struct histb_vdec_v2_part histb_vdec_v2_part_mv300 = {
 	.qmatrix_vfmw5 = true,
 	.mv_out = true,
 	.hevc_tiles = true,
+	.h264_interlace_vfmw5 = true,
 };
 
 const struct histb_vdec_variant histb_vdec_v2_mv100_variant = {

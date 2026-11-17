@@ -45,11 +45,9 @@
  * field pictures reach the second half at an offset of half the slot size.
  */
 /*
- * The collocated bottom-field half of a PMV slot is deliberately not
- * programmed: writing base + half the slot size there was measured on the board
- * and changed nothing (10 of 50 pictures correct either way), so the engine
- * does not take that slot for an MBAFF reference; see the slice-side comment
- * for what is refused instead.
+ * 不打开 h264_interlace_vfmw5 的型号不写 collocated 的后半槽：Hi3798MV100 上给 MBAFF 参考写 base + 半槽测过，50 帧里 10 帧正确，写不写都一样（见 run() 里对场与 MBAFF 的 B slice 的拒收）。
+ *
+ * 打开 h264_interlace_vfmw5 的型号（V5R2C1）按厂商 HAL 用半槽：一个 capture buffer（帧存）一个 PMV 槽，逐行帧与 MBAFF 帧写整槽；按场解码时顶场写前半、底场写后半（H264HAL_V5R2C1_SetPicMsg 的 D7，tmp/media/vfmw_v5/vdm_hal_h264.S:2104-2113、2296-2303）；B slice 读 collocated 时，只有“按场解出的参考”才取后半（H264HAL_SetSliceMsgMvAddrInfo，同文件 349-430）。厂商的半槽偏移是 PMV 平面大小的一半（VDMHAL_V5R2C1_CalcFsSize，tmp/media/vfmw_v5/vdm_hal.S:462）；这里取本驱动槽大小的一半，读写两边一致即可，每场只写 W*(H/2) 个宏块，放得下。厂商对 MBAFF 帧本来就不写后半槽（MvAddrInfo 只对 frame_structure == 3 的场对写 D9），与 MV100 那次测量相符。
  */
 #define HISTB_H264_PMV_SLOT_MIN		261120u
 
@@ -105,7 +103,10 @@ static u8 histb_h264_slice_type_code(u8 slice_type)
 /*
  * Picture-structure code for picture-message word D0 bits [15:14], indexed 2 *
  * pic_structure + mbaff exactly as the firmware's own table is: 0 = frame, 1 =
- * top field, 2 = bottom field, 3 = paired fields.
+ * top field, 2 = bottom field, 3 = MBAFF frame (index 1: a frame picture whose
+ * SPS sets mb_adaptive_frame_field_flag).
+ *
+ * V5R2C1 的 g_StructTrans 与这张表相同（tmp/media/vfmw_v5/vdm_hal_h264.S:2892-2901，SetPicMsg 在 2032-2038 行按 2 * pic_structure + SPS 标志取它）。
  */
 static const u8 histb_h264_struct_trans[8] = { 0, 3, 1, 1, 2, 2, 3, 3 };
 
@@ -115,6 +116,18 @@ static const u8 histb_h264_struct_trans[8] = { 0, 3, 1, 1, 2, 2, 3, 3 };
  * are used here, masked to 2 bits.
  */
 static const u8 histb_h264_list_struct_frame[8] = { 0, 1, 3, 3, 3, 3, 2, 2 };
+
+/*
+ * 打开 h264_interlace_vfmw5 时参考项 4 位结构码里的低 2 位。厂商帧图像查 g_ListStructFrame = {0,1,3,3,3,3,2,2}、场图像查 g_ListStructField = {0,1,2,2,2,2,2,2}，下标都是 2 * 参考帧存的结构 + SPS 的 mb_adaptive_frame_field_flag（不是 MbaffFrameFlag），帧存结构按帧解出为 0、按场解出为 3（tmp/media/vfmw_v5/vdm_hal_h264.S:537-548、702-718、786-796、2855-2875；帧存结构的来源见 厂商 vfmw v5.0 Hi3798MV200 h264.S:3452、18680-18684，均读汇编）。在本驱动能遇到的下标上两张表给同一个码：按场解出的参考 2；按帧解出的参考在 SPS 允许 MBAFF 时 1、否则 0。uAPI 用 V4L2_H264_DPB_ENTRY_FLAG_FIELD（“a single field or a complementary field pair”）表示按场解出。
+ */
+static u32 histb_h264_ref_struct_vfmw5(const struct v4l2_h264_dpb_entry *dpb,
+				       bool sps_mbaff)
+{
+	if (dpb->flags & V4L2_H264_DPB_ENTRY_FLAG_FIELD)
+		return 2;
+
+	return sps_mbaff ? 1 : 0;
+}
 
 /* Per-frame assembly state shared by the picture and slice packers. */
 struct histb_h264_run {
@@ -128,7 +141,19 @@ struct histb_h264_run {
 	unsigned int		num_valid;
 	unsigned int		width_mbs;
 	unsigned int		height_mbs;
+	/*
+	 * 打开 h264_interlace_vfmw5 时：本图像的宏块行数（场图像为帧高的一半，厂商语法层 InitPic 的 pic_height_in_mb），mbamt 也随之取本图像的宏块数（厂商 mbtodec = pic_width_in_mb * pic_height_in_mb）；不打开时两者都按帧算。
+	 */
+	unsigned int		pic_height_mbs;
 	unsigned int		mbamt;
+	/* 下面几项由 run() 填；field_pic 两种写法都用，其余只在打开 h264_interlace_vfmw5 时使用 */
+	bool			interlace_vfmw5;
+	bool			field_pic;
+	bool			bottom_field;
+	/* MbaffFrameFlag：SPS 允许 MBAFF 且本图像是帧 */
+	bool			mbaff_frame;
+	/* VDM_REF_PIC_TYPE，按 APC 槽每槽 2 位 */
+	u32			ref_pic_type;
 	u32			tile_stride;
 	u32			buf_lines;
 	const u8		*src_va;
@@ -468,6 +493,92 @@ static void histb_h264_pack_apc_ref_idx(u32 *slot,
 	}
 }
 
+/*
+ * 打开 h264_interlace_vfmw5 时的 slice 参考列表，照厂商 H264HAL_SetSliceMsgRefPicFrame/RefPicField（tmp/media/vfmw_v5/vdm_hal_h264.S:494-640、646-885，读汇编）：
+ *  - 4 位码 = 结构码（histb_h264_ref_struct_vfmw5()）| 长期参考 8；场图像里顶场项再或 4（厂商取 top_structure == 1，顶场项恒为 1：语法层 WriteSliceMsg 与 SplitFrmToFlds 都把顶场的 structure 写 1，厂商 vfmw v5.0 Hi3798MV200 h264.S:3406-3418、7700-7702；底场项 btm_structure 为 2，不或）。
+ *  - 5 位 APC 号 = (APC 槽 & 15) << 1；场图像里底场项再或 1（vdm_hal_h264.S:818-819）。帧图像 bit 0 恒 0。
+ * 填充位置的规则与 histb_h264_pack_declist() 相同。
+ */
+static void histb_h264_pack_declist_vfmw5(u32 *slot,
+					  const struct histb_h264_run *run,
+					  const struct v4l2_h264_reference *list,
+					  unsigned int count, unsigned int distinct,
+					  bool list1)
+{
+	bool sps_mbaff = run->sps->flags &
+			 V4L2_H264_SPS_FLAG_MB_ADAPTIVE_FRAME_FIELD;
+	unsigned int nib_word = list1 ? 16 : 12;
+	unsigned int apc_word = list1 ? 28 : 20;
+	unsigned int i;
+
+	for (i = 0; i < count; i++) {
+		const struct v4l2_h264_reference *ref =
+			&list[distinct ? min_t(unsigned int, i, distinct - 1) : 0];
+		const struct v4l2_h264_dpb_entry *dpb = &run->dec->dpb[ref->index];
+		u32 nib = histb_h264_ref_struct_vfmw5(dpb, sps_mbaff);
+		u32 apc = ((u32)run->dpb2apc[ref->index] & 15) << 1;
+
+		if (dpb->flags & V4L2_H264_DPB_ENTRY_FLAG_LONG_TERM)
+			nib |= 8;
+		if (run->field_pic) {
+			if (ref->fields == V4L2_H264_BOTTOM_FIELD_REF)
+				apc |= 1;
+			else
+				nib |= 4;
+		}
+
+		slot[nib_word + (i >> 3)] |= nib << ((i & 7) * 4);
+		slot[apc_word + (i >> 2)] |= apc << ((i & 3) * 5);
+	}
+}
+
+/*
+ * 场图像的 D36..D43：厂商 FindMinRefIdx 只看 list0，以 APC 槽 << 1 | 底场为键，记该场在 list0 里第一次出现的位置，没出现的键保持 0（厂商 vfmw v5.0 Hi3798MV200 h264.S:5834-5882，键在 5856-5860、写入在 5866，读汇编；帧图像走 5798-5830，键 2 * apc 与 2 * apc + 1 同值，即 histb_h264_pack_apc_ref_idx()）。
+ */
+static void histb_h264_pack_apc_ref_idx_field(u32 *slot,
+					      const struct v4l2_h264_reference *list,
+					      unsigned int count,
+					      const u8 *dpb2apc)
+{
+	u32 seen = 0;
+	unsigned int i;
+
+	for (i = 0; i < count; i++) {
+		unsigned int key = ((dpb2apc[list[i].index] & 15) << 1) |
+				   (list[i].fields == V4L2_H264_BOTTOM_FIELD_REF);
+
+		if (seen & BIT(key))
+			continue;
+		seen |= BIT(key);
+		slot[36 + (key >> 2)] |= (u32)i << ((key & 3) * 5);
+	}
+}
+
+/*
+ * 打开 h264_interlace_vfmw5 时 B slice 的 collocated PMV（slice D8/D9），照厂商 H264HAL_SetSliceMsgMvAddrInfo（tmp/media/vfmw_v5/vdm_hal_h264.S:349-430，读汇编），collocated 取 list1[0]：
+ *  - 帧图像（含 MBAFF 帧）：它按场解出（帧存结构 3）时 D8 = 槽基址、D9 = 基址 + 半槽，否则只写 D8 = 基址；
+ *  - 场图像：它按帧解出（两场都在、帧存结构 0）时 D8 = 基址；按场解出时顶场 D8 = 基址、底场 D8 = 基址 + 半槽；D9 恒 0。
+ * 半槽与 D7 写入时用的是同一个值（histb_h264_assemble_pic()）。
+ */
+static void histb_h264_col_pmv_vfmw5(u32 *slot, const struct histb_h264_run *run,
+				     const struct v4l2_h264_reference *col,
+				     dma_addr_t base, u32 half)
+{
+	const struct v4l2_h264_dpb_entry *dpb = &run->dec->dpb[col->index];
+	bool fld = dpb->flags & V4L2_H264_DPB_ENTRY_FLAG_FIELD;
+
+	if (!run->field_pic) {
+		slot[8] = lower_32_bits(base);
+		if (fld)
+			slot[9] = lower_32_bits(base + half);
+		return;
+	}
+
+	if (fld && col->fields == V4L2_H264_BOTTOM_FIELD_REF)
+		base += half;
+	slot[8] = lower_32_bits(base);
+}
+
 static void histb_h264_assemble_pic(struct histb_vdec_dev *dev,
 				    const struct histb_vdec_h264_ctx *h264,
 				    const struct histb_h264_run *run,
@@ -491,15 +602,22 @@ static void histb_h264_assemble_pic(struct histb_vdec_dev *dev,
 	if (V4L2_H264_SPS_HAS_CHROMA_FORMAT(sps))
 		chroma = sps->chroma_format_idc;
 
+	/*
+	 * D0[24:16] 是本图像的宏块行数减 1：厂商场图像写半帧高（pic_height_in_mb，厂商 vfmw v5.0 Hi3798MV200 h264.S:23178-23192 按 field_pic_flag 除 2；SetPicMsg 在 tmp/media/vfmw_v5/vdm_hal_h264.S:2039-2041 取它）。run->pic_height_mbs 在不打开 h264_interlace_vfmw5 时等于帧高。
+	 */
 	pic[0] = (run->width_mbs - 1) |
 		 ((u32)histb_h264_struct_trans[2 * pic_struct + mbaff] << 14) |
-		 ((run->height_mbs - 1) << 16) |
+		 ((run->pic_height_mbs - 1) << 16) |
 		 ((chroma == 1 ? BIT(25) : 0)) |
 		 ((pps->flags & V4L2_H264_PPS_FLAG_CONSTRAINED_INTRA_PRED) ? BIT(26) : 0) |
 		 ((pps->flags & V4L2_H264_PPS_FLAG_ENTROPY_CODING_MODE) ? BIT(27) : 0) |
 		 ((pps->flags & V4L2_H264_PPS_FLAG_TRANSFORM_8X8_MODE) ? BIT(28) : 0) |
 		 (dec->nal_ref_idc ? BIT(31) : 0);
-	/* current frame, 2D tile output */
+	/*
+	 * current frame, 2D tile output
+	 *
+	 * 场图像也写帧的起始地址：厂商 D1 = CurrPicImg2DAddr、VDM_YSTADDR_1D = ImgPhyAddr[CurrPicImgIdc]，都不随结构变（vdm_hal_h264.S:2058-2062、1706-1712，读汇编），一对场的第二场与第一场是同一个 capture buffer（OUTPUT 队列的 HOLD，见 histb_vdec_gen::hold_capture），所以两场的地址、行距都与帧相同，第二场不加偏移；场行落在帧的哪几行由引擎按 D0[15:14] 自己决定：Hi3798MV300 上 JM 场编码码流（全场与帧/场自适应）两场都写这个地址，输出与软解逐字节一致。
+	 */
 	pic[1] = lower_32_bits(run->dst_dma);
 	/*
 	 * Picture order count of the coded picture: a field uses its own count,
@@ -518,7 +636,14 @@ static void histb_h264_assemble_pic(struct histb_vdec_dev *dev,
 	/* band-line scratch buffers and the CABAC context table */
 	pic[5] = lower_32_bits(tables + HISTB_TABLE_OFF_SCRATCH(HISTB_SCRATCH_SED_TOP));
 	pic[6] = lower_32_bits(tables + HISTB_TABLE_OFF_SCRATCH(HISTB_SCRATCH_PMV_TOP));
-	pic[7] = lower_32_bits(h264->pmv_dma[cur_pmv_slot]);
+	/*
+	 * 当前图像的 PMV：底场写半槽之后（厂商 SetPicMsg 对 pic_structure == 2 加 half_pmvblk_offset，vdm_hal_h264.S:2104-2113、2296-2303），一对场共用一个 capture buffer 也就共用一个槽，顶场在前半、底场在后半。
+	 */
+	if (run->interlace_vfmw5 && run->bottom_field)
+		pic[7] = lower_32_bits(h264->pmv_dma[cur_pmv_slot] +
+				       h264->pmv_slot_size / 2);
+	else
+		pic[7] = lower_32_bits(h264->pmv_dma[cur_pmv_slot]);
 	pic[8] = lower_32_bits(tables + HISTB_TABLE_OFF_SCRATCH(HISTB_SCRATCH_RCNTOP));
 	/* head of the slice chain */
 	pic[9] = lower_32_bits(histb_vdec_slice_slot_dma(&dev->pool, 0));
@@ -780,6 +905,8 @@ static int histb_h264_assemble_slice(struct histb_vdec_dev *dev,
 	 * correct with slot[9] written and the same 10 without), so no engine
 	 * path reads it for that case, and the pictures that need a half this
 	 * driver cannot name are refused by run() instead of delivered.
+	 *
+	 * 打开 h264_interlace_vfmw5 时按厂商 MvAddrInfo 选半槽（histb_h264_col_pmv_vfmw5()）。
 	 */
 	if (is_b && count0 + count1 > 0 &&
 	    run->dpb2apc[col[0].index] != HISTB_H264_APC_NONE) {
@@ -788,7 +915,12 @@ static int histb_h264_assemble_slice(struct histb_vdec_dev *dev,
 
 		if (col_slot < 0)
 			return col_slot;
-		slot[8] = lower_32_bits(h264->pmv_dma[col_slot]);
+		if (run->interlace_vfmw5)
+			histb_h264_col_pmv_vfmw5(slot, run, &col[0],
+						 h264->pmv_dma[col_slot],
+						 h264->pmv_slot_size / 2);
+		else
+			slot[8] = lower_32_bits(h264->pmv_dma[col_slot]);
 	}
 
 	/*
@@ -818,12 +950,29 @@ static int histb_h264_assemble_slice(struct histb_vdec_dev *dev,
 		   (((u32)slice->slice_beta_offset_div2 & 15) << 8) |
 		   (slice->disable_deblocking_filter_idc & 0xff);
 
-	histb_h264_pack_declist(slot, l0, count0, distinct0, run->dpb2apc,
-				run->dec, false);
-	histb_h264_pack_declist(slot, l1, count1, distinct1, run->dpb2apc,
-				run->dec, true);
-	histb_h264_pack_apc_ref_idx(slot, l0, distinct0, run->dpb2apc, &seen);
-	histb_h264_pack_apc_ref_idx(slot, l1, distinct1, run->dpb2apc, &seen);
+	if (run->interlace_vfmw5) {
+		histb_h264_pack_declist_vfmw5(slot, run, l0, count0, distinct0,
+					      false);
+		histb_h264_pack_declist_vfmw5(slot, run, l1, count1, distinct1,
+					      true);
+	} else {
+		histb_h264_pack_declist(slot, l0, count0, distinct0,
+					run->dpb2apc, run->dec, false);
+		histb_h264_pack_declist(slot, l1, count1, distinct1,
+					run->dpb2apc, run->dec, true);
+	}
+	/*
+	 * 场图像的 D36..D43 按厂商以“APC 槽 + 奇偶”为键、只看 list0（histb_h264_pack_apc_ref_idx_field()）。帧图像保持原来的写法：厂商同样只看 list0，这里还把 list1 里 list0 没有的图像补进去，MV100 实测这张表不影响像素（见 histb_h264_pack_apc_ref_idx()），V5R2C1 上未单独测。
+	 */
+	if (run->interlace_vfmw5 && run->field_pic) {
+		histb_h264_pack_apc_ref_idx_field(slot, l0, distinct0,
+						  run->dpb2apc);
+	} else {
+		histb_h264_pack_apc_ref_idx(slot, l0, distinct0, run->dpb2apc,
+					    &seen);
+		histb_h264_pack_apc_ref_idx(slot, l1, distinct1, run->dpb2apc,
+					    &seen);
+	}
 
 	/*
 	 * Slice chain words. D44 is a macroblock index: the firmware's caller
@@ -837,8 +986,15 @@ static int histb_h264_assemble_slice(struct histb_vdec_dev *dev,
 	 *
 	 * 上面一段说的是 V2/V3 引擎；V5R2C1 的链以空链接结束：厂商 H264HAL_V5R2C1_StartDec 给最后一个 slice 传入的后继地址是 0，随后还用 H264HAL_V5R2C1_CutSliceChain 把该槽的 D63 再清一次零（tmp/media/vfmw_v5/vdm_hal_h264.S，读汇编）。这一代引擎会顺着 D63 走进清空的槽、把它当成又一个 slice 来解：在 Hi3798MV300 上实测，单 slice 的 1080p 帧报 2 条 slice 报告，第二条为 98230000 0003ffff 0003ffff（起止宏块都是 0x3ffff），VDM_STATE 带 DEC_ERR，每帧都因此走复位、交出 V4L2_BUF_FLAG_ERROR；最后一个 slice 的 D63 写 0 后只剩 1 条报告（末宏块 8159 = 8160 - 1），DEC_ERR 消失，像素仍逐字节一致。
 	 */
-	slot[44] = index < last ? run->slices[index + 1].first_mb_in_slice - 1 :
-				  run->mbamt - 1;
+	/*
+	 * 打开 h264_interlace_vfmw5 时末 slice 按厂商写 (mbtodec - 1) / (1 + MbaffFrameFlag)（SetSliceMsg 在 pNextSlice 为空时改写 D44，tmp/media/vfmw_v5/vdm_hal_h264.S:2459-2462、2502-2515）：mbamt 已是本图像的宏块数（场为半帧），MBAFF 帧再折成宏块对数，与非末 slice 的 first_mb_in_slice（MBAFF 下本来就是宏块对单位）同单位。
+	 */
+	if (index < last)
+		slot[44] = run->slices[index + 1].first_mb_in_slice - 1;
+	else if (run->interlace_vfmw5 && run->mbaff_frame)
+		slot[44] = (run->mbamt - 1) / 2;
+	else
+		slot[44] = run->mbamt - 1;
 	if (index < last || !dev->h264_chain_null_end)
 		slot[63] = lower_32_bits(histb_vdec_slice_slot_dma(&dev->pool,
 								   index + 1));
@@ -864,6 +1020,8 @@ static void histb_h264_program_regs(struct histb_vdec_dev *dev,
 	 * quantiser-matrix load) and bit 24 (the coefficient-index detect) on
 	 * byte 3 of the word, and by clearing bit 23 and bit 25. Without bit 24
 	 * the VDM reconstructs intra prediction but drops every coefficient.
+	 *
+	 * 宏块数取本图像的：厂商 CFG0 写 mbtodec - 1（tmp/media/vfmw_v5/vdm_hal_h264.S:1541-1555），mbtodec = pic_width_in_mb * pic_height_in_mb（厂商 vfmw v5.0 Hi3798MV200 h264.S:23192-23197、19932-19933），场图像是半帧；打开 h264_interlace_vfmw5 时 run->mbamt 就按这个算，MBAFF 帧仍是整帧宏块数。
 	 */
 	vdm_write(dev, VDM_CFG0, ((run->mbamt - 1) & VDM_CFG0_MBAMT) |
 				  VDM_CFG0_COEFIDX_DETECT | VDM_CFG0_LD_QMATRIX);
@@ -894,15 +1052,22 @@ static void histb_h264_program_regs(struct histb_vdec_dev *dev,
 		   HISTB_TABLE_OFF_PPFD) & ~15u);
 	vdm_write(dev, VDM_PPFD_BUF_LEN, HISTB_VDEC_PPFD_SIZE / 64 - 1);
 	/*
-	 * FF_APT_EN takes histb_h264_struct_trans[2 * pic_structure + mb_aff];
-	 * the firmware maps that table entry to 2 only for the frame structure
-	 * code, and to 0 for every other one. Field and MBAFF pictures stay at
-	 * 0 until they are supported.
+	 * 不打开 h264_interlace_vfmw5 的型号沿用旧一代固件的取法：FF_APT_EN
+	 * takes histb_h264_struct_trans[2 * pic_structure + mb_aff], which the
+	 * firmware maps to 2 only for the frame structure code and to 0 for
+	 * every other one. V5R2C1 的厂商 HAL 不分结构恒写 0（H264HAL_V5R2C1_CfgVdmReg：mov w1, 0 后以寄存器号 152 调 MFDE_ConfigReg，tmp/media/vfmw_v5/vdm_hal_h264.S:1800-1803，读汇编），Hi3798MV300 上逐行、MBAFF 与场图像写 0 都逐字节一致。
 	 */
-	vdm_write(dev, VDM_FF_APT_EN,
-		  !(run->dec->flags & V4L2_H264_DECODE_PARAM_FLAG_FIELD_PIC) &&
-		  !(run->sps->flags & V4L2_H264_SPS_FLAG_MB_ADAPTIVE_FRAME_FIELD) ?
-		  2 : 0);
+	if (run->interlace_vfmw5)
+		vdm_write(dev, VDM_FF_APT_EN, 0);
+	else
+		vdm_write(dev, VDM_FF_APT_EN,
+			  !(run->dec->flags & V4L2_H264_DECODE_PARAM_FLAG_FIELD_PIC) &&
+			  !(run->sps->flags & V4L2_H264_SPS_FLAG_MB_ADAPTIVE_FRAME_FIELD) ?
+			  2 : 0);
+
+	/*
+	 * 帧、顶场、底场写同一个起始地址、同一个行距与色度偏移：厂商 CfgVdmReg 的 YSTADDR/YSTRIDE/UVOFFSET/HEAD_INF_OFFSET 都只取帧存的值，没有按结构的分支（vdm_hal_h264.S:1706-1745，读汇编）。
+	 */
 
 	/*
 	 * The 1D path writes 256x16-byte tiles, so the stride it is given is
@@ -917,11 +1082,10 @@ static void histb_h264_program_regs(struct histb_vdec_dev *dev,
 	vdm_write(dev, VDM_INT_STATE, 0xffffffffu);
 	vdm_write(dev, VDM_INT_MASK, 0xfffffffeu);
 	/*
-	 * Per-slot picture-type flags; frame pictures need none and field
-	 * coding is not modelled yet. TODO: field coding needs per-reference
-	 * field flags that no control carries.
+	 * Per-slot picture-type flags. 不打开 h264_interlace_vfmw5 的型号写 0（只解帧图像时与厂商相同）。打开时按厂商写：每个 APC 槽 2 位，参考帧存按场图像解出时为 1、按帧解出时为 0（CfgVdmReg 把 pic 参数 RefPicType[16] 按 2 位拼进 0x94，vdm_hal_h264.S:1780-1792；RefPicType[i] = FSP_GetStoreType(APC 第 i 槽的帧存) != 0，厂商 vfmw v5.0 Hi3798MV200 h264.S:7176-7181；存储类型在 InitPic 里取“当前图像是场”，同文件 23299、23345；均读汇编）。uAPI 里对应 V4L2_H264_DPB_ENTRY_FLAG_FIELD，值在 run() 里随 DPB 映射算好。
 	 */
-	vdm_write(dev, VDM_REF_PIC_TYPE, 0);
+	vdm_write(dev, VDM_REF_PIC_TYPE,
+		  run->interlace_vfmw5 ? run->ref_pic_type : 0);
 }
 
 static int histb_vdec_h264_try_ctrl(struct v4l2_ctrl *ctrl)
@@ -1412,7 +1576,20 @@ static int histb_vdec_h264_run(struct histb_vdec_ctx *ctx,
 	    run->width_mbs * 16 > HISTB_VDEC_MAX_WIDTH ||
 	    run->height_mbs * 16 > HISTB_VDEC_MAX_HEIGHT)
 		return -EINVAL;
-	run->mbamt = run->width_mbs * run->height_mbs;
+
+	/*
+	 * 本图像的几何。打开 h264_interlace_vfmw5 时照厂商：场图像的宏块行数是帧的一半（InitPic 用 field_pic_flag 除 frame_height_in_mb，厂商 vfmw v5.0 Hi3798MV200 h264.S:23178-23192），它进图像消息 D0、CFG0 与末 slice 的 D44；MbaffFrameFlag = SPS 允许 MBAFF 且本图像是帧（同文件 InitPic 在 23200-23205 行与 .L4072/.L4134（23470-23489）写 CURRPIC.MbaffFrameFlag），只用于末 slice 的 D44。不打开时保持原样：一律按帧。
+	 */
+	run->interlace_vfmw5 = dev->h264_interlace_vfmw5;
+	run->field_pic = run->dec->flags & V4L2_H264_DECODE_PARAM_FLAG_FIELD_PIC;
+	run->bottom_field = run->field_pic &&
+			    (run->dec->flags & V4L2_H264_DECODE_PARAM_FLAG_BOTTOM_FIELD);
+	run->mbaff_frame = !run->field_pic &&
+			   (run->sps->flags & V4L2_H264_SPS_FLAG_MB_ADAPTIVE_FRAME_FIELD);
+	run->pic_height_mbs = run->height_mbs;
+	if (run->interlace_vfmw5 && run->field_pic)
+		run->pic_height_mbs /= 2;
+	run->mbamt = run->width_mbs * run->pic_height_mbs;
 
 	/* The VDM writes full frames into the queued CAPTURE slots; a stream
 	 * larger than the negotiated geometry could not be held.
@@ -1476,16 +1653,15 @@ static int histb_vdec_h264_run(struct histb_vdec_ctx *ctx,
 	 * written but wrong. With this stickiness the same stream delivers 10
 	 * byte-exact frames (the two leading pictures of each GOP) and the
 	 * other 40 come back with a zeroed payload, so none is wrong.
+	 *
+	 * 上面几段是 Hi3798MV100 上不打开 h264_interlace_vfmw5 时的情形，前提“这套 API 让每个场图像各占一个 DPB 项与 capture buffer”与 uAPI 的实际用法不符：GStreamer v4l2codecs 给一对场的第一场 OUTPUT buffer 置 V4L2_BUF_FLAG_M2M_HOLD_CAPTURE_BUF、两场同一时间戳（GStreamer gst-plugins-bad sys/v4l2codecs/gstv4l2codech264dec.c:1417-1419），DPB 里一对场合成一项、flags 带 V4L2_H264_DPB_ENTRY_FLAG_FIELD、fields 取已解出的场（同文件 692-743），所以一对场就是一个 capture buffer、一个 PMV 槽，与厂商“每个帧存一个槽、两场各占半槽”的模型一一对应。打开 h264_interlace_vfmw5 的型号（同时打开 OUTPUT 队列的 HOLD，histb_vdec_gen::hold_capture）按厂商写半槽与参考结构码（histb_h264_col_pmv_vfmw5()、histb_h264_pack_declist_vfmw5()、VDM_REF_PIC_TYPE），场与 MBAFF 的 B slice 不再拒收。MV100 上那次 MBAFF 的 10/50 发生在驱动对 MBAFF 码流里按帧解出的参考写结构码 0（厂商写 1）、VDM_REF_PIC_TYPE 恒 0 的条件下，推断缺的是结构码而不是 slot[9]。Hi3798MV300 上场图像的 B（不作参考与作参考两种）与 MBAFF 的 B 帧逐字节一致。
 	 */
 	if (run->dec->flags & V4L2_H264_DECODE_PARAM_FLAG_IDR_PIC)
 		h264->col_half_lost = false;
 	if (h264->col_half_lost)
 		return -EINVAL;
-	if (histb_h264_has_b_slice(run)) {
-		bool field_pic = run->dec->flags &
-			V4L2_H264_DECODE_PARAM_FLAG_FIELD_PIC;
-
-		if (field_pic ||
+	if (!run->interlace_vfmw5 && histb_h264_has_b_slice(run)) {
+		if (run->field_pic ||
 		    (run->sps->flags &
 		     V4L2_H264_SPS_FLAG_MB_ADAPTIVE_FRAME_FIELD)) {
 			h264->col_half_lost = true;
@@ -1514,15 +1690,20 @@ static int histb_vdec_h264_run(struct histb_vdec_ctx *ctx,
 	if (dst->vb2_buf.index >= HISTB_VDEC_MAX_DPB_SLOTS)
 		return -EINVAL;
 
+	/*
+	 * 一对场的第二场：DPB 里第一场那一项的 reference_ts 就是当前 capture buffer 的时间戳，vb2_find_buffer() 找到的是 dst 自己。这时它的 APC 地址就是本帧地址（与第一场写入的是同一帧），PMV 槽也是同一个（pmv_map 按 capture 下标），第一场的运动信息在本槽的一半，第二场写另一半（histb_h264_assemble_pic() 的 D7），互不覆盖。
+	 */
 	cap_q = v4l2_m2m_get_dst_vq(ctx->fh.m2m_ctx);
 	for (i = 0; i < HISTB_H264_NUM_APC_SLOTS; i++) {
 		run->img_addr[i] = lower_32_bits(run->dst_dma);
 		run->apc_poc[0][i] = 0;
 		run->apc_poc[1][i] = 0;
 	}
+	run->ref_pic_type = 0;
 	for (i = 0; i < V4L2_H264_NUM_DPB_ENTRIES; i++) {
 		const struct v4l2_h264_dpb_entry *entry = &run->dec->dpb[i];
 		struct vb2_buffer *vb;
+		u8 fields;
 
 		run->dpb2apc[i] = HISTB_H264_APC_NONE;
 		if (!(entry->flags & V4L2_H264_DPB_ENTRY_FLAG_ACTIVE))
@@ -1539,6 +1720,19 @@ static int histb_vdec_h264_run(struct histb_vdec_ctx *ctx,
 			return -ENOMEM;
 		run->apc_poc[0][vb->index] = entry->top_field_order_cnt;
 		run->apc_poc[1][vb->index] = entry->bottom_field_order_cnt;
+		if (!run->interlace_vfmw5 ||
+		    !(entry->flags & V4L2_H264_DPB_ENTRY_FLAG_FIELD))
+			continue;
+
+		/*
+		 * 按场解出的参考：VDM_REF_PIC_TYPE 该槽置 1（见 histb_h264_program_regs()）。只解出一场的帧存（例：解第二场时的第一场）两个 POC 都填那一场的：厂商 GetAPC 以结构 1/2 调用时填 (top, top)/(bottom, bottom)（厂商 vfmw v5.0 Hi3798MV200 h264.S:3521-3525、3549-3551、3591-3593，读汇编），而 GStreamer 给缺的那一场填 0。
+		 */
+		run->ref_pic_type |= 1u << (2 * vb->index);
+		fields = entry->fields & V4L2_H264_FRAME_REF;
+		if (fields == V4L2_H264_TOP_FIELD_REF)
+			run->apc_poc[1][vb->index] = entry->top_field_order_cnt;
+		else if (fields == V4L2_H264_BOTTOM_FIELD_REF)
+			run->apc_poc[0][vb->index] = entry->bottom_field_order_cnt;
 	}
 
 	v4l2_h264_init_reflist_builder(&builder, run->dec, run->sps,
@@ -1587,7 +1781,13 @@ static int histb_vdec_h264_run(struct histb_vdec_ctx *ctx,
 	       HISTB_VDEC_SLOT_BYTES);
 
 	histb_h264_program_regs(dev, run);
-	dev->mb_total = run->width_mbs * run->height_mbs;
+	/*
+	 * slice 报告的覆盖检查按本图像算：打开 h264_interlace_vfmw5 时场图像只有半帧宏块（run->mbamt）。MBAFF 帧的报告按宏块计（不是末 slice D44 用的宏块对）：Hi3798MV300 实测 1080i MBAFF 帧的报告止于 8159，按宏块对的 4080 判覆盖会把每帧都当成越界、复位并在 CABAC 码流上交出 ERROR。
+	 */
+	if (run->interlace_vfmw5)
+		dev->mb_total = run->mbamt;
+	else
+		dev->mb_total = run->width_mbs * run->height_mbs;
 	if (dev->cabac_seg_stop_bit &&
 	    (run->pps->flags & V4L2_H264_PPS_FLAG_ENTROPY_CODING_MODE))
 		dev->tail_slack_total = dev->mb_total;

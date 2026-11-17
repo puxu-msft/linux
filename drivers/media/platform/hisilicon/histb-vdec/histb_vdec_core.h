@@ -118,6 +118,10 @@ struct histb_vdec_gen {
 	/* A capture queue deeper than the slot table is refused or clamped. */
 	bool				cap_full_einval;
 	bool				cap_clamp;
+	/*
+	 * OUTPUT 格式为 H.264 时队列声明 V4L2_BUF_CAP_SUPPORTS_M2M_HOLD_CAPTURE_BUF（histb_vdec_update_hold()）：一对场的第一场带 V4L2_BUF_FLAG_M2M_HOLD_CAPTURE_BUF 提交，两场解进同一个 capture buffer（GStreamer v4l2codecs 正是这样提交场对）。后端的 job 结束必须走 v4l2_m2m_buf_done_and_job_finish()，解码器命令必须是 stateless 那组；v2 后端打开它的型号同时打开 histb_vdec_dev.h264_interlace_vfmw5。
+	 */
+	bool				hold_capture;
 
 	const u32			*cap_formats;
 	unsigned int			num_cap_formats;
