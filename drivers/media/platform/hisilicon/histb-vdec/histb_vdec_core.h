@@ -5,11 +5,12 @@
  *
  * Both generations expose the same V4L2 stateless mem2mem interface: fully
  * parsed syntax arrives through request controls, one OUTPUT and one CAPTURE
- * buffer per job, and the capture buffer receives a linear frame that the
- * driver detiled from an internal surface. The core owns that interface, the
- * node and media registration and the request validation; a backend owns the
- * message ABI, the launch, the interrupt and the surface geometry, which are
- * where the two generations actually differ.
+ * buffer per job, and the capture buffer receives a linear frame (written by
+ * the engine itself where the generation can, otherwise copied out of an
+ * internal surface). The core owns that interface, the node and media
+ * registration and the request validation; a backend owns the message ABI,
+ * the launch, the interrupt and the surface geometry, which are where the two
+ * generations actually differ.
  */
 #ifndef __HISTB_VDEC_CORE_H__
 #define __HISTB_VDEC_CORE_H__

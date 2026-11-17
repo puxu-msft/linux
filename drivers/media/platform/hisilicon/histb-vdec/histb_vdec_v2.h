@@ -8,7 +8,7 @@
  * registers and rings the doorbell. Frame storage uses a table+index model:
  * capture buffers are registered by index and referenced by id from the message
  * pool.
- * 引擎把 NV21 帧写进每个 dpb index 各自的内部帧（见 histb_vdec_frame），V2/V3 上为 256x16 分块、V5R2C1 上为行优先，job 完成时再拷出到线性的 CAPTURE buffer。
+ * V2/V3 的引擎把 NV21 帧按 256x16 分块写进每个 dpb index 各自的内部帧（见 histb_vdec_frame），job 完成时再拷出到线性的 CAPTURE buffer；V5R2C1 行优先写，NV21 直接写进 CAPTURE buffer（见 histb_vdec_dev.direct_capture），只有 NV12 还经内部帧拷出。
  *
  * The register layouts, message slot encodings and buffer geometries recorded
  * below were derived from the vendor decoder firmware and then checked against
@@ -131,10 +131,10 @@ static inline unsigned int histb_vdec_hevc_stride(unsigned int width)
 }
 
 /*
- * 1D 写路径的帧缓冲几何，在板上实测，并与固件为 H.264 编程的几何一致。VDM_YSTRIDE_1D 给出的是 16 行 band *之间* 的间距，色度 band 从整个亮度 band 阵列再加一个逐画面 head-info 区（每个对齐行 16 字节）之后开始。
+ * 1D 写路径的帧缓冲几何，在板上实测，并与固件为 H.264 编程的几何一致。VDM_YSTRIDE_1D 给出的是 16 行 band *之间* 的间距。V2/V3 沿用厂商布局，色度 band 从整个亮度 band 阵列再加一个逐画面 head-info 区（每个对齐行 16 字节）之后开始；V5R2C1 色度紧跟亮度、不留 head-info 区（histb_vdec_uv_offset()）。
  * The band count rounds up to an even number because field coding reserves a pair.
  *
- * band 内部各代不同。V2/V3 写 256 字节 × 16 画面行的 tile，所以那里的行距就是 tile 宽度。V5R2C1 按行优先写同样的帧，以 tile stride 为行距：在 Hi3798MV300 上以 1920x1088 实测，H.264（行距 2304 字节）与 HEVC（行距 2048 字节）的帧读回来都是 NV21 光栅图，亮度与色度之间隔着 17408 字节的 head-info 区，与软件解码逐字节一致。
+ * band 内部各代不同。V2/V3 写 256 字节 × 16 画面行的 tile，所以那里的行距就是 tile 宽度。V5R2C1 按行优先写同样的帧，以 tile stride 为行距：在 Hi3798MV300 上以 1920x1088 实测，H.264（行距 2304 字节）与 HEVC（行距 2048 字节）的帧读回来都是 NV21 光栅图，与软件解码逐字节一致。色度相对亮度的实际偏移由 histb_vdec_uv_offset() 按型号决定（V5R2C1 色度紧跟亮度、head-info 区在色度之后，引擎不写它）。
  */
 static inline unsigned int histb_vdec_band_bytes(unsigned int tile_stride)
 {
@@ -152,7 +152,7 @@ static inline unsigned int histb_vdec_luma_bytes(unsigned int tile_stride,
 	return tile_stride * ALIGN(lines, 32);
 }
 
-/* Luma bands, the 1D area behind them, then the chroma bands at half size. */
+/* V2/V3 的帧缓冲：亮度 band、head-info 区与色度 band（亮度的一半）之和；V5R2C1 不留 head-info 区，见 histb_vdec_frame_store_bytes()。 */
 static inline unsigned int histb_vdec_frame_bytes(unsigned int tile_stride,
 						  unsigned int lines)
 {
@@ -244,6 +244,12 @@ struct histb_vdec_dev {
 	 */
 	bool			raster;
 	/*
+	 * 引擎直接写进客户端的 capture buffer（NV21），不经内部帧与 CPU 拷贝：capture 的 bytesperline 取引擎行距、高度取按协议网格再按 32 行对齐的帧高，色度紧跟亮度（histb_vdec_uv_offset()），sizeimage 与厂商帧缓冲同大（histb_vdec_frame_bytes()）。参考帧也直接从 capture buffer 读。NV12 仍走内部帧加拷贝（引擎只写 NV21）。
+	 *
+	 * Hi3798MV300 实测（#45 内核上的出树模块，25 例测试包全部逐字节一致、错误标志 0）：拷贝每帧约 3.4 ms 省掉，H.264 1080p60 91 → 140 fps（7.3 时期 SN21 零拷贝为 141 fps）、2560x1440 58 → 83 fps、HEVC P 87 → 176 fps、B-TMVP 136 → 242 fps。
+	 */
+	bool			direct_capture;
+	/*
 	 * 仅 H.264：V5R2C1 的 slice 链以最后一个 slice 的 D63 = 0 结束，不能指向一个清空的后继槽（见 histb_h264_assemble_slice()）。HEVC 在所有型号上本来就以 0 结束链，不读这个开关。
 	 */
 	bool			h264_chain_null_end;
@@ -272,6 +278,8 @@ struct histb_vdec_dev {
  * linear format, so every dpb index owns a tile buffer here and the job's
  * completion detiles it into the client's buffer. References are read from
  * these buffers too, which is why they have to outlive the job.
+ *
+ * direct_capture 的型号上 NV21 不用内部帧（引擎直写 capture，见 histb_vdec_dev.direct_capture），只有 NV12（引擎只写 NV21，要拷贝时交换 U/V）还走这里。
  *
  * 内部帧用可缓存映射（dma_alloc_noncoherent()）：每个 job 完成时 CPU 要把整帧读一遍，而这颗 SoC 的 DMA 不一致，dma_alloc_wc() 给的是 Normal-NC 映射，A53 在上面读得极慢。Hi3798MV300 实测：1080p 一帧的拷贝 29.9 ms → 3.0~3.4 ms（另加 0.3~0.5 ms 失效缓存），2560x1440 53 ms → 4.3~4.7 ms；H.264 1080p60 解码吞吐 26.7 → 92 fps。
  */
@@ -344,6 +352,10 @@ int histb_vdec_cap_dims(struct histb_vdec_ctx *ctx, unsigned int *w,
 			unsigned int *h);
 void histb_vdec_buf_geom(struct histb_vdec_ctx *ctx, unsigned int *stride,
 			 unsigned int *lines);
+unsigned int histb_vdec_uv_offset(const struct histb_vdec_dev *dev,
+				  unsigned int stride, unsigned int lines);
+void histb_vdec_write_frame_regs(struct histb_vdec_dev *dev, dma_addr_t dst,
+				 unsigned int stride, unsigned int lines);
 dma_addr_t histb_vdec_frame_dma(struct histb_vdec_ctx *ctx,
 				struct vb2_buffer *vb);
 void histb_vdec_frames_free(struct histb_vdec_ctx *ctx);

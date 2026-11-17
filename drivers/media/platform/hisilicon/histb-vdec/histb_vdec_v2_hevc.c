@@ -900,23 +900,16 @@ static void histb_hevc_program_regs(struct histb_vdec_dev *dev,
 	for (i = 1; i <= 7; i++)
 		vdm_write(dev, VDM_TO(i), VDM_TIMEOUT_MOD);
 
-	vdm_write(dev, VDM_YSTADDR_1D, lower_32_bits(run->dst_dma));
 	/*
-	 * The engine writes the band geometry documented in histb_vdec.h here
-	 * too: YSTRIDE_1D is the 16-row band pitch, the chroma plane sits
-	 * behind the whole luma band array plus the head-inf area. Measured on
-	 * a 320x240 intra frame: with the head-inf offset left clear and a line
+	 * The engine writes the band geometry documented in histb_vdec_v2.h
+	 * here too: YSTRIDE_1D is the 16-row band pitch, and the chroma offset
+	 * follows histb_vdec_uv_offset(). Measured on Hi3798MV100 with a
+	 * 320x240 intra frame: with the head-inf offset left clear and a line
 	 * pitch in YSTRIDE_1D, 73 of 4800 luma lines land where the model puts
-	 * them; with this shape and the picture message's scratch split,
-	 * all 4800.
+	 * them; with the band pitch, the head-inf area and the picture message's
+	 * scratch split, all 4800.
 	 */
-	vdm_write(dev, VDM_YSTRIDE_1D,
-		  histb_vdec_band_bytes(run->tile_stride));
-	vdm_write(dev, VDM_UVOFFSET_1D,
-		  histb_vdec_luma_bytes(run->tile_stride, lines) +
-		  histb_vdec_head_inf_bytes(lines));
-	vdm_write(dev, VDM_HEAD_INF_OFFSET,
-		  histb_vdec_head_inf_bytes(lines));
+	histb_vdec_write_frame_regs(dev, run->dst_dma, run->tile_stride, lines);
 	/* post-filter scratch of this generation */
 	vdm_write(dev, VDM_PPFD_BUF_ADDR,
 		  lower_32_bits(histb_vdec_tables_dma(&dev->pool) +
@@ -1011,7 +1004,7 @@ static int histb_hevc_pack_rbsp(struct histb_vdec_ctx *ctx,
 	dst = hevc->rbsp_va;
 
 	/*
-	 * 两次防竞争字节之间整段 memcpy，与 histb_h264_pack_rbsp() 同一做法：OUTPUT 平面是 Normal-NC 映射，逐字节读每字节约 150 ns。Hi3798MV300 实测 HEVC 1080p，起始码扫描与这里都改成整字扫描后 I 帧组装时间 19~21 ms → 6~7 ms，解码吞吐 40 → 82 fps（P 帧 65 → 108 fps）。每段扫描止于下一个 slice 的 NAL 头字节，那之前是 00 00 01 起始码，不会有三字节组跨过它。
+	 * 两次防竞争字节之间整段 memcpy，与 histb_h264_pack_rbsp() 同一做法：一致性分配的 OUTPUT 平面是 Normal-NC 映射，逐字节读每字节约 150 ns。Hi3798MV300 实测 HEVC 1080p，起始码扫描与这里都改成整字扫描后 I 帧组装时间 19~21 ms → 6~7 ms，解码吞吐 40 → 82 fps（P 帧 65 → 108 fps）。每段扫描止于下一个 slice 的 NAL 头字节，那之前是 00 00 01 起始码，不会有三字节组跨过它。
 	 */
 	i = first;
 	while (i < end) {

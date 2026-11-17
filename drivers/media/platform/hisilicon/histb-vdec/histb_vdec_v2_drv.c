@@ -115,6 +115,7 @@ static const struct histb_vdec_chip histb_vdec_v2_chip_mv300 = {
 struct histb_vdec_v2_part {
 	struct histb_vdec_gen	gen;
 	bool			raster;	/* 见 histb_vdec_dev::raster */
+	bool			direct_capture; /* 见 histb_vdec_dev 同名字段 */
 	bool			crg_gates; /* VDH 门控在 CRG30：需要 hisilicon,crg */
 	bool			h264_chain_null_end; /* 见 histb_vdec_dev 同名字段 */
 	bool			cabac_seg_stop_bit; /* 见 histb_vdec_dev 同名字段 */
@@ -122,7 +123,7 @@ struct histb_vdec_v2_part {
 	bool			mv_out; /* 见 histb_vdec_dev 同名字段 */
 };
 
-static struct histb_vdec_dev *histb_vdec_dev_of(struct histb_vdec_ctx *ctx)
+static struct histb_vdec_dev *histb_vdec_dev_of(const struct histb_vdec_ctx *ctx)
 {
 	return video_get_drvdata(ctx->fh.vdev);
 }
@@ -133,12 +134,60 @@ static unsigned int histb_vdec_stride(const struct histb_vdec_ctx *ctx,
 	return ctx->desc->stride(width);
 }
 
+static bool histb_vdec_direct_capture_fmt(const struct histb_vdec_dev *dev,
+					  u32 fourcc)
+{
+	return dev->direct_capture && fourcc == V4L2_PIX_FMT_NV21;
+}
+
+static bool histb_vdec_direct_capture(struct histb_vdec_ctx *ctx)
+{
+	return histb_vdec_direct_capture_fmt(histb_vdec_dev_of(ctx),
+					     ctx->cap_fmt.fmt.pix_mp.pixelformat);
+}
+
+/*
+ * 色度平面相对亮度起点的偏移。V2/V3 的 tile 帧沿用厂商布局：亮度 band 阵列之后先是每对齐行 16 字节的 head-info 区，再是色度。direct_capture 的型号把色度紧接在亮度之后、不留 head-info 区，capture 才是标准的 NV21（色度从 bytesperline * height 起）。
+ *
+ * head-info 是厂商为帧压缩准备的区（vfmw_adapter.h 的 head 字段注释为 “YC head info stride when compress is used”，v5 后端同样只在压缩写路径上用它），本驱动不置 VDM_CFG1_COMPRESS_EN，引擎在不开压缩时不写它。Hi3798MV300 哨兵实测：capture 整块填 0xA5 后解码，按厂商布局时 H.264 1080p、HEVC 1080p 与 H.264 2560x1440 的 head-info 区一个字节都没被写；色度紧跟亮度、HEAD_INF_OFFSET 写 0 时三者都只写到色度末尾，6/6 帧逐字节一致。
+ */
+unsigned int histb_vdec_uv_offset(const struct histb_vdec_dev *dev,
+				  unsigned int stride, unsigned int lines)
+{
+	unsigned int luma = histb_vdec_luma_bytes(stride, lines);
+
+	return dev->direct_capture ? luma :
+				     luma + histb_vdec_head_inf_bytes(lines);
+}
+
+/* 一帧帧缓冲的字节数，布局见 histb_vdec_uv_offset()。 */
+static unsigned int histb_vdec_frame_store_bytes(const struct histb_vdec_dev *dev,
+						 unsigned int stride,
+						 unsigned int lines)
+{
+	return dev->direct_capture ?
+	       histb_vdec_luma_bytes(stride, lines) / 2 * 3 :
+	       histb_vdec_frame_bytes(stride, lines);
+}
+
+/* 本帧的写出几何：亮度起点、16 行 band 间距、色度偏移与 head-info 偏移。四个协议共用。 */
+void histb_vdec_write_frame_regs(struct histb_vdec_dev *dev, dma_addr_t dst,
+				 unsigned int stride, unsigned int lines)
+{
+	vdm_write(dev, VDM_YSTADDR_1D, lower_32_bits(dst));
+	vdm_write(dev, VDM_YSTRIDE_1D, histb_vdec_band_bytes(stride));
+	vdm_write(dev, VDM_UVOFFSET_1D, histb_vdec_uv_offset(dev, stride, lines));
+	vdm_write(dev, VDM_HEAD_INF_OFFSET,
+		  dev->direct_capture ? 0 : histb_vdec_head_inf_bytes(lines));
+}
+
 static unsigned int histb_vdec_frame_size(const struct histb_vdec_ctx *ctx,
 					  unsigned int width,
 					  unsigned int height)
 {
-	return histb_vdec_frame_bytes(histb_vdec_stride(ctx, width),
-				      ALIGN(height, ctx->desc->grid_align));
+	return histb_vdec_frame_store_bytes(histb_vdec_dev_of(ctx),
+					    histb_vdec_stride(ctx, width),
+					    ALIGN(height, ctx->desc->grid_align));
 }
 
 static void histb_vdec_set_frame_size(struct histb_vdec_ctx *ctx,
@@ -153,12 +202,36 @@ static void histb_vdec_set_frame_size(struct histb_vdec_ctx *ctx,
 	pix->plane_fmt[0].sizeimage = histb_vdec_frame_size(ctx, width, height);
 }
 
+/*
+ * direct_capture 的 capture 几何：bytesperline 是引擎行距（不受客户端要求影响），高度是帧缓冲的行数（按协议的网格再按 32 行对齐，与 histb_vdec_luma_bytes() 一致，所以可以超过 ENUM_FRAMESIZES 报的最大编码高度，例如 HEVC 2560x1440 为 1472 行），色度从 bytesperline * height 起。可见区由 G_SELECTION 的 COMPOSE 给出（OUTPUT 上声明的编码尺寸）。
+ */
+static void histb_vdec_set_direct_size(struct histb_vdec_ctx *ctx,
+				       struct v4l2_format *f,
+				       unsigned int width, unsigned int height)
+{
+	struct v4l2_pix_format_mplane *pix = &f->fmt.pix_mp;
+	unsigned int stride = histb_vdec_stride(ctx, width);
+	unsigned int lines = ALIGN(ALIGN(height, ctx->desc->grid_align), 32);
+
+	pix->width = width;
+	pix->height = lines;
+	pix->plane_fmt[0].bytesperline = stride;
+	pix->plane_fmt[0].sizeimage =
+		histb_vdec_frame_store_bytes(histb_vdec_dev_of(ctx), stride, lines);
+}
+
 static void histb_vdec_set_cap_size(struct histb_vdec_ctx *ctx,
 				    struct v4l2_format *f,
 				    unsigned int width, unsigned int height)
 {
 	struct v4l2_pix_format_mplane *pix = &f->fmt.pix_mp;
 	unsigned int bpl;
+
+	if (histb_vdec_direct_capture_fmt(histb_vdec_dev_of(ctx),
+					  pix->pixelformat)) {
+		histb_vdec_set_direct_size(ctx, f, width, height);
+		return;
+	}
 
 	bpl = max_t(u32, ALIGN(width, 16),
 		    round_up(pix->plane_fmt[0].bytesperline, 16));
@@ -231,7 +304,23 @@ histb_vdec_frame_get(struct histb_vdec_ctx *ctx, unsigned int index)
 dma_addr_t histb_vdec_frame_dma(struct histb_vdec_ctx *ctx,
 				struct vb2_buffer *vb)
 {
-	struct histb_vdec_frame *frame = histb_vdec_frame_get(ctx, vb->index);
+	struct histb_vdec_frame *frame;
+
+	if (histb_vdec_direct_capture(ctx)) {
+		dma_addr_t dma;
+
+		/*
+		 * 消息字与 YSTADDR 只带地址低 32 位，MPEG-2/4 还按 16 字节截取帧地址；不满足的 buffer（只可能来自导入的 DMABUF）按没有帧处理，由调用方拒收这个 job。
+		 */
+		if (!vb2_plane_cookie(vb, 0))
+			return 0;
+		dma = vb2_dma_contig_plane_dma_addr(vb, 0);
+		if ((dma & 15) || (u64)dma + vb2_plane_size(vb, 0) - 1 >
+				  DMA_BIT_MASK(32))
+			return 0;
+		return dma;
+	}
+	frame = histb_vdec_frame_get(ctx, vb->index);
 
 	return frame ? frame->dma : 0;
 }
@@ -255,7 +344,7 @@ void histb_vdec_frames_free(struct histb_vdec_ctx *ctx)
 }
 
 /*
- * 返回 buf[pos..end) 中下一个 00 00 @last 三字节序列的位置，H.264 与 HEVC 的起始码扫描和防竞争字节扫描共用。OUTPUT 平面以 write-combining（normal non-cacheable）方式映射，逐字节扫描每字节约 150 ns，在 1080p60 下占去了每帧预算的大头；改用整字加载加零字节检测，每次加载跳过八个字节。没有匹配时返回 @end。
+ * 返回 buf[pos..end) 中下一个 00 00 @last 三字节序列的位置，H.264 与 HEVC 的起始码扫描和防竞争字节扫描共用。一致性分配的 OUTPUT 平面是 write-combining（normal non-cacheable）映射，逐字节扫描每字节约 150 ns，在 1080p60 下占去了每帧预算的大头；改用整字加载加零字节检测，每次加载跳过八个字节。没有匹配时返回 @end。
  */
 u32 histb_vdec_scan_triple(const u8 *buf, u32 end, u32 pos, u8 last)
 {
@@ -367,6 +456,11 @@ static void histb_vdec_frame_to_linear(struct histb_vdec_ctx *ctx,
 	const u8 *src;
 	u8 *out;
 
+	if (histb_vdec_direct_capture(ctx)) {
+		/* 引擎已经写在这个 buffer 里了 */
+		vb2_set_plane_payload(vb, 0, (size_t)bpl * h * 3 / 2);
+		return;
+	}
 	if (vb->index >= HISTB_VDEC_MAX_DPB_SLOTS)
 		goto no_frame;
 	frame = &ctx->frame[vb->index];
@@ -374,8 +468,8 @@ static void histb_vdec_frame_to_linear(struct histb_vdec_ctx *ctx,
 	if (!frame->va || !out)
 		goto no_frame;
 
-	uv = frame->stride * ALIGN(frame->lines, 32) +
-	     16 * ALIGN(frame->lines, 32);
+	uv = histb_vdec_uv_offset(histb_vdec_dev_of(ctx), frame->stride,
+				  frame->lines);
 	src = frame->va;
 	/* The CPU writes this plane; whoever imported it reads it afterwards. */
 	if (dbuf && dma_buf_begin_cpu_access(dbuf, DMA_TO_DEVICE))
@@ -962,6 +1056,7 @@ int histb_vdec_v2_probe(struct platform_device *pdev,
 	dev->dev = &pdev->dev;
 	dev->chip = gen->chip;
 	dev->raster = part->raster;
+	dev->direct_capture = part->direct_capture;
 	dev->h264_chain_null_end = part->h264_chain_null_end;
 	dev->cabac_seg_stop_bit = part->cabac_seg_stop_bit;
 	dev->qmatrix_vfmw5 = part->qmatrix_vfmw5;
@@ -1141,8 +1236,9 @@ static void histb_vdec_v2_buf_geom_hook(struct histb_vdec_core_ctx *cctx,
 {
 	struct histb_vdec_ctx *ctx = (struct histb_vdec_ctx *)cctx;
 
-	g->uv_offset = 0;
 	histb_vdec_buf_geom(ctx, &g->pitch, &g->lines);
+	g->uv_offset = histb_vdec_uv_offset(histb_vdec_dev_of(ctx), g->pitch,
+					    g->lines);
 }
 
 static int histb_vdec_v2_buf_prepare_hook(struct histb_vdec_core_ctx *cctx,
@@ -1242,6 +1338,22 @@ static void histb_vdec_v2_set_out_size(struct histb_vdec_core_ctx *cctx,
 				  height);
 }
 
+/*
+ * OUTPUT 格式一变就重置 capture：direct_capture 的 NV21 取引擎直写的几何，其余沿用内部帧的几何（bytesperline 为引擎行距，色度紧跟亮度、由拷贝写出）。
+ */
+static void histb_vdec_v2_set_cap_reset(struct histb_vdec_core_ctx *cctx,
+					struct v4l2_format *f,
+					unsigned int width, unsigned int height)
+{
+	struct histb_vdec_ctx *ctx = (struct histb_vdec_ctx *)cctx;
+
+	if (histb_vdec_direct_capture_fmt(histb_vdec_dev_of(ctx),
+					  f->fmt.pix_mp.pixelformat))
+		histb_vdec_set_direct_size(ctx, f, width, height);
+	else
+		histb_vdec_set_frame_size(ctx, f, width, height);
+}
+
 static void histb_vdec_v2_set_cap_size(struct histb_vdec_core_ctx *cctx,
 				       struct v4l2_format *f,
 				       unsigned int width, unsigned int height)
@@ -1274,7 +1386,7 @@ static const u32 *histb_vdec_v2_required_ctrls(
 		.dma_dev		= histb_vdec_v2_dma_dev,		\
 		.set_out_size		= histb_vdec_v2_set_out_size,		\
 		.set_cap_size		= histb_vdec_v2_set_cap_size,		\
-		.set_cap_reset		= histb_vdec_v2_set_out_size,		\
+		.set_cap_reset		= histb_vdec_v2_set_cap_reset,		\
 		.buf_geom		= histb_vdec_v2_buf_geom_hook,		\
 		.buf_prepare		= histb_vdec_v2_buf_prepare_hook,	\
 		.min_coded_width	= histb_vdec_v2_min_coded_width,	\
@@ -1299,12 +1411,13 @@ static const struct histb_vdec_v2_part histb_vdec_v2_part_cv200 = {
 /*
  * Hi3798MV300 的引擎最高可解 4096x2304（厂商能力表，424,673,280 像素/秒），但消息池的 band-line scratch、内部帧和 capture buffer 都随画面增大，4K 需要的 CMA 超过默认大小的区域所能容纳。2560x1440 是目前跑通过的最大几何；再往上提还需要同时增大 HISTB_VDEC_MAX_WIDTH（scratch 跟随它）、HISTB_VDEC_POOL_SIZE 和板级 CMA。
  *
- * capture 下限两个是单参考帧逐行码流的最低需求，不是 DPB 深度策略：深度是码流属性，没有哪个格式能携带，所以参考 N 帧的客户端得自己保持 N+1 个 buffer 轮转。下限压低在 1440p 下很要紧，那里每个 capture buffer 及其背后的内部帧各占 5.5 MB。
+ * capture 下限两个是单参考帧逐行码流的最低需求，不是 DPB 深度策略：深度是码流属性，没有哪个格式能携带，所以参考 N 帧的客户端得自己保持 N+1 个 buffer 轮转。下限压低在 1440p 下很要紧，那里每个 capture buffer 占 5.5 MB（NV12 时背后另有同样大的内部帧）。
  */
 static const struct histb_vdec_v2_part histb_vdec_v2_part_mv300 = {
 	.gen = HISTB_VDEC_V2_GEN(&histb_vdec_v2_chip_mv300,
 				 histb_vdec_v2_cap_formats, 2560, 1440, 2),
 	.raster = true,
+	.direct_capture = true,
 	.crg_gates = true,
 	.h264_chain_null_end = true,
 	.cabac_seg_stop_bit = true,

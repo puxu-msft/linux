@@ -904,7 +904,6 @@ static void histb_h264_program_regs(struct histb_vdec_dev *dev,
 		  !(run->sps->flags & V4L2_H264_SPS_FLAG_MB_ADAPTIVE_FRAME_FIELD) ?
 		  2 : 0);
 
-	vdm_write(dev, VDM_YSTADDR_1D, lower_32_bits(run->dst_dma));
 	/*
 	 * The 1D path writes 256x16-byte tiles, so the stride it is given is
 	 * the pitch of a whole 16-row band, not of a picture line: the firmware
@@ -914,11 +913,7 @@ static void histb_h264_program_regs(struct histb_vdec_dev *dev,
 	 * band b's rows 3..15, so only the first three lines of every 16-row
 	 * band survived and the frame looked "truncated at 8-20%".
 	 */
-	vdm_write(dev, VDM_YSTRIDE_1D, histb_vdec_band_bytes(run->tile_stride));
-	vdm_write(dev, VDM_UVOFFSET_1D,
-		  histb_vdec_luma_bytes(run->tile_stride, lines) +
-		  histb_vdec_head_inf_bytes(lines));
-	vdm_write(dev, VDM_HEAD_INF_OFFSET, histb_vdec_head_inf_bytes(lines));
+	histb_vdec_write_frame_regs(dev, run->dst_dma, run->tile_stride, lines);
 	vdm_write(dev, VDM_INT_STATE, 0xffffffffu);
 	vdm_write(dev, VDM_INT_MASK, 0xfffffffeu);
 	/*

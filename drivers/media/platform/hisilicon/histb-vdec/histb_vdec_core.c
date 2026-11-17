@@ -3,12 +3,12 @@
  * V4L2 mem2mem core of the HiSilicon HiSTB stateless video decoders.
  *
  * Userspace hands in fully parsed syntax through request controls; one job is
- * one OUTPUT (coded slice data) and one CAPTURE (a linear frame the backend
- * detiled from its own surface) buffer.  What lives here is everything the two
- * generations do the same way: the video node and its media entity, format
- * negotiation against the generation's own list, the vb2 queues, the control
- * handler and request validation.  The message ABI, the launch, the interrupt,
- * the surface geometry and the clock/reset glue stay with the backends.
+ * one OUTPUT (coded slice data) and one CAPTURE (a linear frame) buffer.  What
+ * lives here is everything the two generations do the same way: the video node
+ * and its media entity, format negotiation against the generation's own list,
+ * the vb2 queues, the control handler and request validation.  The message
+ * ABI, the launch, the interrupt, the surface geometry and the clock/reset
+ * glue stay with the backends.
  */
 
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
@@ -44,8 +44,7 @@ static struct histb_vdec_core_ctx *histb_vdec_ctx_of_file(struct file *filp)
 /* ---------------------------------------------------------------- formats */
 
 /*
- * dev is passed explicitly, not looked up through ctx: ->open() calls this
- * before v4l2_fh_init(), so ctx->fh.vdev is still NULL there.
+ * ->open() 先 v4l2_fh_init() 再调这里：后端的 set_cap_reset 钩子要经 ctx->fh.vdev 找到设备（v2 后端按型号决定 capture 几何）。
  */
 static void histb_vdec_reset_fmts(struct histb_vdec_core_ctx *ctx,
 				  const struct histb_vdec_common *common)
@@ -327,25 +326,29 @@ static int histb_vdec_g_selection(struct file *file, void *priv,
 	    s->type != V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE)
 		return -EINVAL;
 
+	s->r.left = 0;
+	s->r.top = 0;
 	switch (s->target) {
 	case V4L2_SEL_TGT_COMPOSE_DEFAULT:
 	case V4L2_SEL_TGT_COMPOSE:
+		/*
+		 * The stateless controls carry no cropping information, so the
+		 * coded size declared on OUTPUT is the visible size. The CAPTURE
+		 * format can be taller than that: a backend that has the engine
+		 * write the client buffer reports the frame store's row count
+		 * there, rows the engine never writes.
+		 */
+		s->r.width = min(ctx->out_fmt.fmt.pix_mp.width, pix->width);
+		s->r.height = min(ctx->out_fmt.fmt.pix_mp.height, pix->height);
+		return 0;
 	case V4L2_SEL_TGT_COMPOSE_BOUNDS:
 	case V4L2_SEL_TGT_COMPOSE_PADDED:
-		break;
+		s->r.width = pix->width;
+		s->r.height = pix->height;
+		return 0;
 	default:
 		return -EINVAL;
 	}
-
-	/*
-	 * The stateless controls carry no cropping information, so the coded
-	 * size is the visible size here; tiles past it are never written.
-	 */
-	s->r.left = 0;
-	s->r.top = 0;
-	s->r.width = pix->width;
-	s->r.height = pix->height;
-	return 0;
 }
 
 /* ------------------------------------------------------------ vb2 queues */
@@ -454,6 +457,10 @@ static int histb_vdec_buf_out_validate(struct vb2_buffer *vb)
 	struct vb2_v4l2_buffer *vbuf = to_vb2_v4l2_buffer(vb);
 
 	vbuf->field = V4L2_FIELD_NONE;
+	/*
+	 * 可缓存的 OUTPUT buffer 必须在交给引擎前清缓存：驱动用 CPU 从缓存里读出的码流切 slice、算段长，引擎从内存读同一段字节，客户端用 V4L2_BUF_FLAG_NO_CACHE_CLEAN 跳过清缓存会让两者不一致。这里先于 vb2 的内存准备执行，忽略这个提示。
+	 */
+	vb->skip_cache_sync_on_prepare = 0;
 	return 0;
 }
 
@@ -560,6 +567,10 @@ static int histb_vdec_queue_init(void *priv, struct vb2_queue *src_vq,
 	 * DMA_ATTR_NO_KERNEL_MAPPING would leave vb2_plane_vaddr() NULL.
 	 */
 	src_vq->dma_attrs = DMA_ATTR_ALLOC_SINGLE_PAGES;
+	/*
+	 * 客户端可以用 V4L2_MEMORY_FLAG_NON_COHERENT 申请可缓存的 OUTPUT buffer：两代后端都要用 CPU 扫一遍码流（找起始码与防竞争字节、读头），而 HiSTB 的视频解码器 DMA 不一致，一致性内存在 arm64 上是 Normal-NC 映射，逐字读得很慢。可缓存时 vb2 在 buffer 准备时（带 request 的在请求排队时，vb2_req_prepare()）清缓存（vb2_dc_prepare()），引擎读到的是客户端写下的数据；驱动对 OUTPUT 平面只读不写，清缓存的提示在 histb_vdec_buf_out_validate() 里被忽略。Hi3798MV300 实测 H.264 1080p60 每帧组装 3.2 → 0.5 ms。
+	 */
+	src_vq->allow_cache_hints = 1;
 	src_vq->buf_struct_size = sizeof(struct v4l2_m2m_buffer);
 	src_vq->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_COPY;
 	src_vq->lock = &common->vdev_lock;
@@ -575,8 +586,13 @@ static int histb_vdec_queue_init(void *priv, struct vb2_queue *src_vq,
 	dst_vq->drv_priv = ctx;
 	dst_vq->ops = &histb_vdec_queue_ops;
 	dst_vq->mem_ops = &vb2_dma_contig_memops;
-	/* The completion writes the linear frame through a kernel mapping. */
+	/*
+	 * A backend that copies the frame out writes it through a kernel
+	 * mapping; one whose engine writes the buffer itself also reads it back
+	 * as a reference picture, hence the bidirectional mapping.
+	 */
 	dst_vq->dma_attrs = DMA_ATTR_ALLOC_SINGLE_PAGES;
+	dst_vq->bidirectional = true;
 	dst_vq->buf_struct_size = sizeof(struct v4l2_m2m_buffer);
 	dst_vq->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_COPY;
 	dst_vq->lock = &common->vdev_lock;
@@ -689,8 +705,8 @@ static int histb_vdec_open(struct file *filp)
 	if (!ctx)
 		return -ENOMEM;
 
-	histb_vdec_reset_fmts(ctx, common);
 	v4l2_fh_init(&ctx->fh, video_devdata(filp));
+	histb_vdec_reset_fmts(ctx, common);
 
 	ctx->fh.m2m_ctx = v4l2_m2m_ctx_init(common->m2m_dev, ctx,
 					    histb_vdec_queue_init);

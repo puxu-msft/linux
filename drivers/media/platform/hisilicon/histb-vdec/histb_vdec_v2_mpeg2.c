@@ -1074,12 +1074,7 @@ static int histb_vdec_mpeg2_run(struct histb_vdec_ctx *ctx,
 	 * would otherwise apply (the MPEG-2 path keeps FF_APT_EN at 0, unlike
 	 * H.264's 2 for frame pictures).
 	 */
-	vdm_write(dev, VDM_YSTADDR_1D, dst_addr & ~15U);
-	vdm_write(dev, VDM_YSTRIDE_1D, histb_vdec_band_bytes(tile_stride));
-	vdm_write(dev, VDM_UVOFFSET_1D,
-		  histb_vdec_luma_bytes(tile_stride, lines) +
-		  histb_vdec_head_inf_bytes(lines));
-	vdm_write(dev, VDM_HEAD_INF_OFFSET, histb_vdec_head_inf_bytes(lines));
+	histb_vdec_write_frame_regs(dev, dst_addr & ~15U, tile_stride, lines);
 	vdm_write(dev, VDM_REF_PIC_TYPE, 0);
 	vdm_write(dev, VDM_FF_APT_EN, 0);
 
