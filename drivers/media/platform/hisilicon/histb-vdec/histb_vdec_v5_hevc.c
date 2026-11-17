@@ -301,81 +301,6 @@ static void histb_vdec_v5_hevc_tile_info(struct histb_vdec_v5_hevc *hevc,
 	}
 }
 
-/* --------------------------------------------------------- quantiser */
-
-static u32 histb_vdec_v5_hevc_pack4(const u8 *m, unsigned int a,
-				  unsigned int b, unsigned int c,
-				  unsigned int d)
-{
-	return m[a] | m[b] << 8 | m[c] << 16 | m[d] << 24;
-}
-
-/*
- * Scaling lists, picture words 64 to 313: each row is four coefficients per
- * word, the two diagonals interleaving.
- */
-static void
-histb_vdec_v5_hevc_qmatrix(u32 *pic,
-			 const struct v4l2_ctrl_hevc_scaling_matrix *scaling)
-{
-	const u8 *dc16 = scaling->scaling_list_dc_coef_16x16;
-	const u8 *dc32 = scaling->scaling_list_dc_coef_32x32;
-	unsigned int list, row, base;
-
-	memset(&pic[64], 0, 256 * sizeof(*pic));
-	for (list = 0; list < ARRAY_SIZE(scaling->scaling_list_8x8); list++) {
-		const u8 *m = scaling->scaling_list_8x8[list];
-
-		base = 64 + 16 * list;
-		for (row = 0; row < 8; row++) {
-			pic[base + 2 * row] =
-				histb_vdec_v5_hevc_pack4(m, row, 16 + row,
-						       32 + row, 48 + row);
-			pic[base + 2 * row + 1] =
-				histb_vdec_v5_hevc_pack4(m, 8 + row, 24 + row,
-						       40 + row, 56 + row);
-		}
-	}
-	for (list = 0; list < ARRAY_SIZE(scaling->scaling_list_16x16); list++) {
-		const u8 *m = scaling->scaling_list_16x16[list];
-
-		base = 160 + 16 * list;
-		for (row = 0; row < 8; row++) {
-			pic[base + 2 * row] =
-				histb_vdec_v5_hevc_pack4(m, row, 8 + row,
-						       16 + row, 24 + row);
-			pic[base + 2 * row + 1] =
-				histb_vdec_v5_hevc_pack4(m, 32 + row, 40 + row,
-						       48 + row, 56 + row);
-		}
-	}
-	for (list = 0; list < ARRAY_SIZE(scaling->scaling_list_32x32); list++) {
-		const u8 *m = scaling->scaling_list_32x32[list];
-
-		base = 256 + 16 * list;
-		for (row = 0; row < 8; row++) {
-			pic[base + 2 * row] =
-				histb_vdec_v5_hevc_pack4(m, row, 8 + row,
-						       16 + row, 24 + row);
-			pic[base + 2 * row + 1] =
-				histb_vdec_v5_hevc_pack4(m, 32 + row, 40 + row,
-						       48 + row, 56 + row);
-		}
-	}
-	for (list = 0; list < ARRAY_SIZE(scaling->scaling_list_4x4); list++) {
-		const u8 *m = scaling->scaling_list_4x4[list];
-
-		base = 288 + 4 * list;
-		for (row = 0; row < 4; row++)
-			pic[base + row] = histb_vdec_v5_hevc_pack4(m, row,
-								 8 + row,
-								 4 + row,
-								 12 + row);
-	}
-	pic[312] = histb_vdec_v5_hevc_pack4(dc16, 0, 1, 2, 3);
-	pic[313] = dc16[4] | dc16[5] << 8 | dc32[0] << 16 | dc32[1] << 24;
-}
-
 /* ---------------------------------------------------------- validation */
 
 static int histb_vdec_v5_hevc_check_syntax(struct histb_vdec_v5 *dec,
@@ -807,8 +732,9 @@ static void histb_vdec_v5_hevc_pack_pic(struct histb_vdec_v5 *dec,
 		histb_vdec_v5_hevc_slot_dma(dec, V5R6_HEVC_SLICE_SLOT),
 		V5R6_ADDR_SHIFT);
 
+	/* 量化矩阵图像布局与 v2 后端（V5R2C1）相同，见 histb_vdec_hevc_pack_scaling() */
 	if (sps->flags & V4L2_HEVC_SPS_FLAG_SCALING_LIST_ENABLED)
-		histb_vdec_v5_hevc_qmatrix(pic, run->scaling);
+		histb_vdec_hevc_pack_scaling(&pic[64], run->scaling);
 	else
 		for (i = 64; i < 314; i++)
 			pic[i] = 0x10101010;

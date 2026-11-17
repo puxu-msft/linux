@@ -10,7 +10,7 @@
  * internal surface). The core owns that interface, the node and media
  * registration and the request validation; a backend owns the message ABI,
  * the launch, the interrupt and the surface geometry, which are where the two
- * generations actually differ.
+ * generations actually differ. 两代逐字相同的消息打包（HEVC 量化矩阵图像）例外地放在 core，见 histb_vdec_hevc_pack_scaling()。
  */
 #ifndef __HISTB_VDEC_CORE_H__
 #define __HISTB_VDEC_CORE_H__
@@ -218,5 +218,9 @@ dma_addr_t histb_vdec_src_dma(struct vb2_buffer *vb);
 /* Window for the CPU reads a backend makes of an imported OUTPUT plane. */
 int histb_vdec_src_cpu_begin(struct vb2_buffer *vb);
 void histb_vdec_src_cpu_end(struct vb2_buffer *vb);
+
+/* HEVC 量化矩阵图像（256 个消息字），两代后端共用，见 histb_vdec_core.c */
+void histb_vdec_hevc_pack_scaling(u32 *dst,
+				  const struct v4l2_ctrl_hevc_scaling_matrix *m);
 
 #endif /* __HISTB_VDEC_CORE_H__ */

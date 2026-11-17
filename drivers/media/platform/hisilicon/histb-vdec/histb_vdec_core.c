@@ -8,7 +8,8 @@
  * and its media entity, format negotiation against the generation's own list,
  * the vb2 queues, the control handler and request validation.  The message
  * ABI, the launch, the interrupt, the surface geometry and the clock/reset
- * glue stay with the backends.
+ * glue stay with the backends; the one message image both generations pack
+ * word for word the same (HEVC scaling lists) is shared from here.
  */
 
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
@@ -986,6 +987,62 @@ void histb_vdec_src_cpu_end(struct vb2_buffer *vb)
 
 	if (dbuf)
 		dma_buf_end_cpu_access(dbuf, DMA_FROM_DEVICE);
+}
+
+/* ------------------------------------------------------- HEVC 量化矩阵 */
+
+/* 一个消息字：s[a]、s[b]、s[c]、s[d] 依次放进字节 0..3 */
+static u32 histb_vdec_qm_word(const u8 *s, unsigned int a, unsigned int b,
+			      unsigned int c, unsigned int d)
+{
+	return s[a] | s[b] << 8 | s[c] << 16 | (u32)s[d] << 24;
+}
+
+/*
+ * HEVC 量化矩阵图像：256 个消息字，两代后端（V5R2C1 的 v2 后端与 V5R6 的 v5 后端）布局相同，都放在图像消息 D64 起。
+ *
+ * 布局取自厂商 vfmw v5.0 语法层 HEVC_WritePicMsg 与 HEVC_WriteQmatrix_4x4/8x8/16x16/32x32（Hi3798MV200 hevc.S，读汇编并逐字节符号执行核对）：W0..W95 是 8x8 列表 0..5，W96..W191 是 16x16 列表 0..5，W192..W223 是 32x32 列表 0..1（H.265 matrixId 0 与 3），每表 16 字；W224..W247 是 4x4 列表 0..5，每表 4 字；W248 装 16x16 的 DC 0..3，W249 装 16x16 的 DC 4..5 与 32x32 的 DC 0..1，W250..W255 写 0。每张表按列（x 从 0 起）输出，同一列的系数按 y 装进字的字节 0..3：4x4 每列一字，行序 0、2、1、3；8x8 每列两字，先偶数行 0、2、4、6 再奇数行 1、3、5、7；16x16 与 32x32（8x8 个系数）每列两字，行 0..3 与 4..7 顺排。uAPI 各表为光栅序（y*N+x），与厂商 ctx->qmatrix 的字节序相同。
+ */
+void histb_vdec_hevc_pack_scaling(u32 *dst,
+				  const struct v4l2_ctrl_hevc_scaling_matrix *m)
+{
+	const u8 *dc16 = m->scaling_list_dc_coef_16x16;
+	const u8 *dc32 = m->scaling_list_dc_coef_32x32;
+	unsigned int i, x;
+
+	for (i = 0; i < 6; i++) {
+		const u8 *s = m->scaling_list_8x8[i];
+
+		for (x = 0; x < 8; x++) {
+			dst[16 * i + 2 * x] =
+				histb_vdec_qm_word(s, x, 16 + x, 32 + x, 48 + x);
+			dst[16 * i + 2 * x + 1] =
+				histb_vdec_qm_word(s, 8 + x, 24 + x, 40 + x, 56 + x);
+		}
+	}
+
+	/* 6 个 16x16 与 2 个 32x32 列表排布相同且首尾相接（W96..W223） */
+	for (i = 0; i < 8; i++) {
+		const u8 *s = i < 6 ? m->scaling_list_16x16[i] :
+				      m->scaling_list_32x32[i - 6];
+
+		for (x = 0; x < 8; x++) {
+			dst[96 + 16 * i + 2 * x] =
+				histb_vdec_qm_word(s, x, 8 + x, 16 + x, 24 + x);
+			dst[96 + 16 * i + 2 * x + 1] =
+				histb_vdec_qm_word(s, 32 + x, 40 + x, 48 + x, 56 + x);
+		}
+	}
+
+	for (i = 0; i < 6; i++)
+		for (x = 0; x < 4; x++)
+			dst[224 + 4 * i + x] =
+				histb_vdec_qm_word(m->scaling_list_4x4[i],
+						   x, 8 + x, 4 + x, 12 + x);
+
+	dst[248] = histb_vdec_qm_word(dc16, 0, 1, 2, 3);
+	dst[249] = dc16[4] | dc16[5] << 8 | dc32[0] << 16 | (u32)dc32[1] << 24;
+	memset(&dst[250], 0, 6 * sizeof(*dst));
 }
 
 /* ---------------------------------------------------------------- driver */
