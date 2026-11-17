@@ -271,6 +271,10 @@ struct histb_vdec_dev {
 	 * Hi3798MV300 实测（不置位 → 置位）：解完后各 PMV 槽非零字数 0 → 数千到数万；HEVC 开 TMVP 的 I+P 码流以 P 帧为 collocated 的帧亮度 PSNR 27.3–27.9 dB → 逐字节一致，B slice 的 collocated 取自 L1 的 30 帧码流置位后同样逐字节一致；H.264 空间 direct 与时间 direct 的 30 帧 IPBPB 码流各 14 个 B 帧全部失配 → 30 帧逐字节一致，无 B 帧的码流两种取值都一致。写回量：HEVC 按每 16x16 块 16 字节写（由非零记录推断：1080p 的非零数据写到 130556 字节为止；上界取自厂商 VDMHAL_V5R2C1_CalcFsSize 给 HEVC 的 W_mb * H_mb * 16 = 130560），H.264 按每宏块 32 字节写（1080p/1440p 的非零数据恰好写到 261120/460800 字节即槽尾为止，槽后到页尾的 1024/2048 字节保持为零），都在本驱动分配的槽内。
 	 */
 	bool			mv_out;
+	/*
+	 * HEVC tiles：每帧按厂商 V5R2C1 的布局写 tile info image（图像消息 D55 指向，HEVC_WriteTileInfo），slice 消息的 D10/D43/D44 用 tile 扫描地址（HEVCHAL_V5R2C1_StartDec），见 histb_hevc_pack_tile_info() 与 histb_hevc_slice_ctb_range()。不打开的型号照旧拒收 tiles（Hi3798MV100 bring-up 时 tiles 图像都只解出不完整的第一帧就停），也不写 image。
+	 */
+	bool			hevc_tiles;
 };
 
 /*
@@ -442,9 +446,9 @@ static inline u32 histb_vdec_trail_zero_bits(const u8 *va, u32 end_bit)
 /*
  * Layout of the per-protocol table area, as offsets from
  * histb_vdec_msgpool::table_off. The CABAC M/N tables are constant and are
- * programmed once at probe, the tile info image is zeroed there because no
- * accepted picture uses it, and the remaining areas are filled per frame by the
- * message assembly code. The scratch blocks follow in enum histb_vdec_scratch
+ * programmed once at probe, the tile info image is zeroed there (parts with
+ * histb_vdec_dev.hevc_tiles rewrite it for every HEVC picture), and the
+ * remaining areas are filled per frame by the message assembly code. The scratch blocks follow in enum histb_vdec_scratch
  * order, HISTB_VDEC_SCRATCH_SIZE bytes each.
  */
 #define HISTB_TABLE_OFF_CABAC_MN_H264	0

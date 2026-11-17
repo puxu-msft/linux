@@ -121,6 +121,7 @@ struct histb_vdec_v2_part {
 	bool			cabac_seg_stop_bit; /* 见 histb_vdec_dev 同名字段 */
 	bool			qmatrix_vfmw5; /* 见 histb_vdec_dev 同名字段 */
 	bool			mv_out; /* 见 histb_vdec_dev 同名字段 */
+	bool			hevc_tiles; /* 见 histb_vdec_dev 同名字段 */
 };
 
 static struct histb_vdec_dev *histb_vdec_dev_of(const struct histb_vdec_ctx *ctx)
@@ -1061,6 +1062,7 @@ int histb_vdec_v2_probe(struct platform_device *pdev,
 	dev->cabac_seg_stop_bit = part->cabac_seg_stop_bit;
 	dev->qmatrix_vfmw5 = part->qmatrix_vfmw5;
 	dev->mv_out = part->mv_out;
+	dev->hevc_tiles = part->hevc_tiles;
 	dev->common.priv = dev;
 	platform_set_drvdata(pdev, dev);
 
@@ -1423,6 +1425,7 @@ static const struct histb_vdec_v2_part histb_vdec_v2_part_mv300 = {
 	.cabac_seg_stop_bit = true,
 	.qmatrix_vfmw5 = true,
 	.mv_out = true,
+	.hevc_tiles = true,
 };
 
 const struct histb_vdec_variant histb_vdec_v2_mv100_variant = {

@@ -86,6 +86,209 @@ struct histb_vdec_hevc_ctx {
 	unsigned int	rbsp_size;
 };
 
+/*
+ * tile info image（图像消息 D55 指向的那块）的厂商布局，vdm_hal_hevc.S:297–427 HEVC_WriteTileInfo：
+ *   字 0..63    TileId[0]：每个 16 像素列单位一字节，值为所在 tile 列号，4 个单位小端打包成一字；字 64..127 为 0；
+ *   字 128..191 TileId[1]：每个 16 像素行单位一字节，值为所在 tile 行号；字 192..255 为 0；
+ *   字 256..275 tile 列 i：起始 CTB 列 | 末尾 CTB 列（含）<< 16，只用前 10 个；
+ *   字 276..297 tile 行 j：起始 CTB 行 | 末尾 CTB 行（含）<< 16，只用前 11 个。
+ * 共 298 字 = 1192 字节，tiles 关时也按单 tile 写（vdm_hal_hevc.S:588 无条件调用）。
+ */
+#define HISTB_HEVC_TILE_COLS_MAX	10	/* 厂商 vfmw v5.0 hevc.S:16061、vdm_hal_hevc.S:376，厂商 HEVC_LOGIC_TILE_COLUMNS_LIMIT */
+#define HISTB_HEVC_TILE_ROWS_MAX	11	/* 厂商 vfmw v5.0 hevc.S:16063、vdm_hal_hevc.S:400，厂商 HEVC_LOGIC_TILE_ROWS_LIMIT */
+#define HISTB_HEVC_TILE_ID_UNITS	256	/* 每个 TileId 表的 16 像素单位数，超出即报错（厂商 vfmw v5.0 hevc.S:1851、1857） */
+#define HISTB_HEVC_TILE_ID_WORDS	128	/* 每个 TileId 表占 512 字节，后一半恒为 0 */
+#define HISTB_HEVC_TILE_POS_X_WORDS	20
+#define HISTB_HEVC_TILE_POS_Y_WORDS	22
+#define HISTB_HEVC_TILE_POS_X		(2 * HISTB_HEVC_TILE_ID_WORDS)
+#define HISTB_HEVC_TILE_POS_Y		(HISTB_HEVC_TILE_POS_X + \
+					 HISTB_HEVC_TILE_POS_X_WORDS)
+#define HISTB_HEVC_TILE_INFO_WORDS	(HISTB_HEVC_TILE_POS_Y + \
+					 HISTB_HEVC_TILE_POS_Y_WORDS)
+
+/*
+ * 一帧的 tile 网格，CTB 为单位：tile 列 i 覆盖 CTB 列 [col_bd[i], col_bd[i + 1])，行同理。tiles 关时是覆盖整帧的单个 tile，地址换算退化为恒等。
+ */
+struct histb_hevc_tiles {
+	u16 col_bd[HISTB_HEVC_TILE_COLS_MAX + 1];
+	u16 row_bd[HISTB_HEVC_TILE_ROWS_MAX + 1];
+	u16 width_ctbs;
+	u16 height_ctbs;
+	u8 cols;
+	u8 rows;
+	u8 ctb_log2;
+};
+
+/*
+ * 一个方向上的 tile 边界。uniform 按 H.265 式 (6-3)/(6-4)：第 i 个宽度 = ((i + 1) * size) / n - (i * size) / n，等价于边界 bd[i] = (i * size) / n（厂商 vfmw v5.0 hevc.S:16196–16230、UpdatePicPPS 厂商 vfmw v5.0 hevc.S:5452–5485 同式）；非 uniform 前 n - 1 个取 minus1 + 1，最后一个取剩余，剩余不为正即拒收（厂商 vfmw v5.0 hevc.S:16340–16392）。
+ */
+static int histb_hevc_tile_bounds(u16 *bd, unsigned int n, unsigned int size,
+				  const u8 *minus1, bool uniform)
+{
+	unsigned int i;
+
+	bd[0] = 0;
+	for (i = 0; i < n; i++) {
+		if (uniform || i + 1 == n) {
+			bd[i + 1] = uniform ? (i + 1) * size / n : size;
+			continue;
+		}
+		if ((unsigned int)bd[i] + minus1[i] + 1 >= size)
+			return -EINVAL;
+		bd[i + 1] = bd[i] + minus1[i] + 1;
+	}
+
+	return 0;
+}
+
+/*
+ * 由 SPS/PPS 求 tile 网格并按厂商的硬件限制把关：列数 ≤ 10、行数 ≤ 11（厂商 vfmw v5.0 hevc.S:16045–16066）；tile 列宽不大于 64 个亮度样本（图宽大于 64 时）或 tile 行高小于 64 个亮度样本时，厂商报 “tile width/height is too small.(Logic Unsupport)” 拒收（厂商 vfmw v5.0 hevc.S:15913–15957）。H.265 Main 档次本身要求 tile 列宽 ≥ 256、行高 ≥ 64 个亮度样本，所以这些限制不拒收合规码流。厂商对 tiles 关的整帧也做同一行高检查，这里只对 tiles 开把关，tiles 关维持驱动现状。
+ */
+static int histb_hevc_tiles_init(struct histb_hevc_tiles *t,
+				 const struct v4l2_ctrl_hevc_sps *sps,
+				 const struct v4l2_ctrl_hevc_pps *pps)
+{
+	unsigned int ctb_log2 = sps->log2_min_luma_coding_block_size_minus3 + 3 +
+				sps->log2_diff_max_min_luma_coding_block_size;
+	bool uniform = pps->flags & V4L2_HEVC_PPS_FLAG_UNIFORM_SPACING;
+	unsigned int w, h, i;
+	int ret;
+
+	if (ctb_log2 < 4 || ctb_log2 > 6)
+		return -EINVAL;
+	w = (sps->pic_width_in_luma_samples + (1u << ctb_log2) - 1) >> ctb_log2;
+	h = (sps->pic_height_in_luma_samples + (1u << ctb_log2) - 1) >> ctb_log2;
+	if (!w || !h)
+		return -EINVAL;
+	t->ctb_log2 = ctb_log2;
+	t->width_ctbs = w;
+	t->height_ctbs = h;
+
+	if (!(pps->flags & V4L2_HEVC_PPS_FLAG_TILES_ENABLED)) {
+		/* 厂商 tiles 关：单 tile，宽高为整帧 CTB 数（厂商 vfmw v5.0 hevc.S:15907–15912） */
+		t->cols = 1;
+		t->rows = 1;
+		t->col_bd[0] = 0;
+		t->col_bd[1] = w;
+		t->row_bd[0] = 0;
+		t->row_bd[1] = h;
+		return 0;
+	}
+
+	/* 先比 minus1 再加 1：控件层不限这两个 u8 的范围，255 + 1 会在 u8 里回绕成 0 */
+	if (pps->num_tile_columns_minus1 >= HISTB_HEVC_TILE_COLS_MAX ||
+	    pps->num_tile_rows_minus1 >= HISTB_HEVC_TILE_ROWS_MAX ||
+	    pps->num_tile_columns_minus1 >= w || pps->num_tile_rows_minus1 >= h)
+		return -EINVAL;
+	t->cols = pps->num_tile_columns_minus1 + 1;
+	t->rows = pps->num_tile_rows_minus1 + 1;
+	ret = histb_hevc_tile_bounds(t->col_bd, t->cols, w,
+				     pps->column_width_minus1, uniform);
+	if (ret)
+		return ret;
+	ret = histb_hevc_tile_bounds(t->row_bd, t->rows, h,
+				     pps->row_height_minus1, uniform);
+	if (ret)
+		return ret;
+
+	for (i = 0; i < t->cols; i++)
+		if ((unsigned int)(t->col_bd[i + 1] - t->col_bd[i]) << ctb_log2 <= 64 &&
+		    sps->pic_width_in_luma_samples > 64)
+			return -EINVAL;
+	for (i = 0; i < t->rows; i++)
+		if ((unsigned int)(t->row_bd[i + 1] - t->row_bd[i]) << ctb_log2 < 64)
+			return -EINVAL;
+	/* TileId 表每个方向 256 个 16 像素单位（HEVC_CalcTileInfo 越界即报错），MV300 的 2560x1440 上限只用到 160/90 个 */
+	if ((unsigned int)t->col_bd[t->cols] << (ctb_log2 - 4) > HISTB_HEVC_TILE_ID_UNITS ||
+	    (unsigned int)t->row_bd[t->rows] << (ctb_log2 - 4) > HISTB_HEVC_TILE_ID_UNITS)
+		return -EINVAL;
+
+	return 0;
+}
+
+/*
+ * 按厂商布局写 tile info image（HISTB_HEVC_TILE_INFO_WORDS 字）。TileId 以 16 像素为单位、覆盖到 CTB 边界，帧外单位为 0（厂商 vfmw v5.0 hevc.S:1833–1907 HEVC_CalcTileInfo）；网格超过 256 个单位的情形已由 histb_hevc_tiles_init() 拒收（厂商同样报 “idx out of range”，hevc.S:1851–1858、1888–1896）。
+ */
+static void histb_hevc_pack_tile_info(u32 *img, const struct histb_hevc_tiles *t)
+{
+	unsigned int shift = t->ctb_log2 - 4;
+	unsigned int i, u, end;
+
+	memset(img, 0, HISTB_HEVC_TILE_INFO_WORDS * sizeof(*img));
+	for (i = 0; i < t->cols; i++) {
+		end = (unsigned int)t->col_bd[i + 1] << shift;
+		for (u = (unsigned int)t->col_bd[i] << shift; u < end; u++)
+			img[u / 4] |= i << (u % 4 * 8);
+		img[HISTB_HEVC_TILE_POS_X + i] = t->col_bd[i] |
+						 (u32)(t->col_bd[i + 1] - 1) << 16;
+	}
+	for (i = 0; i < t->rows; i++) {
+		end = (unsigned int)t->row_bd[i + 1] << shift;
+		for (u = (unsigned int)t->row_bd[i] << shift; u < end; u++)
+			img[HISTB_HEVC_TILE_ID_WORDS + u / 4] |= i << (u % 4 * 8);
+		img[HISTB_HEVC_TILE_POS_Y + i] = t->row_bd[i] |
+						 (u32)(t->row_bd[i + 1] - 1) << 16;
+	}
+}
+
+/*
+ * H.265 6.5.1 式 (6-10)：光栅 CTB 地址 → tile 扫描地址（厂商 vfmw v5.0 hevc.S:3433–3627 HEVC_CtbRsAddrToTsAddr，tiles 关时恒等）。前面整行 tile 共 row_bd[j] * W 个 CTB，同一 tile 行里左侧 tile 共 col_bd[i] * 本行高个，再加 tile 内光栅偏移。@rs 须小于 CTB 总数。
+ */
+static u32 histb_hevc_ctb_rs_to_ts(const struct histb_hevc_tiles *t, u32 rs)
+{
+	u32 x = rs % t->width_ctbs;
+	u32 y = rs / t->width_ctbs;
+	unsigned int i = 0, j = 0;
+
+	while (i + 1 < t->cols && x >= t->col_bd[i + 1])
+		i++;
+	while (j + 1 < t->rows && y >= t->row_bd[j + 1])
+		j++;
+
+	return (u32)t->row_bd[j] * t->width_ctbs +
+	       (u32)t->col_bd[i] * (t->row_bd[j + 1] - t->row_bd[j]) +
+	       (y - t->row_bd[j]) * (t->col_bd[i + 1] - t->col_bd[i]) +
+	       (x - t->col_bd[i]);
+}
+
+/* 反方向，tile 扫描地址 → 光栅地址（厂商 vfmw v5.0 hevc.S:3633–3777 HEVC_CtbTsAddrToRsAddr）。@ts 须小于 CTB 总数。 */
+static u32 histb_hevc_ctb_ts_to_rs(const struct histb_hevc_tiles *t, u32 ts)
+{
+	unsigned int i, j;
+
+	for (j = 0; j < t->rows; j++) {
+		u32 th = t->row_bd[j + 1] - t->row_bd[j];
+
+		for (i = 0; i < t->cols; i++) {
+			u32 tw = t->col_bd[i + 1] - t->col_bd[i];
+
+			if (ts < tw * th)
+				return (t->row_bd[j] + ts / tw) * t->width_ctbs +
+				       t->col_bd[i] + ts % tw;
+			ts -= tw * th;
+		}
+	}
+
+	return (u32)t->width_ctbs * t->height_ctbs - 1;
+}
+
+/*
+ * slice 消息的 CTB 区间字。厂商 StartDec（vdm_hal_hevc.S:2105–2143）与语法层 WriteSliceMsg（厂商 vfmw v5.0 hevc.S:4730–4746、4788–4816）合起来是：
+ *   D10 = CtbAddrRsToTs[起始光栅地址]；
+ *   D44 = 下一 slice 的 CtbAddrRsToTs − 1，最后一个 slice 为 CTB 总数 − 1；
+ *   D43 = CtbAddrTsToRs[D44]（tiles 关时与 D44 相同）。
+ * @next_rs 为下一 slice 的起始光栅地址，@last 表示本 slice 是链尾。D8/D9 仍是起始光栅地址与其坐标，不经本函数。
+ */
+static void histb_hevc_slice_ctb_range(const struct histb_hevc_tiles *t,
+				       u32 start_rs, u32 next_rs, bool last,
+				       u32 *d10, u32 *d43, u32 *d44)
+{
+	*d10 = histb_hevc_ctb_rs_to_ts(t, start_rs);
+	*d44 = (last ? (u32)t->width_ctbs * t->height_ctbs :
+		       histb_hevc_ctb_rs_to_ts(t, next_rs)) - 1;
+	*d43 = histb_hevc_ctb_ts_to_rs(t, *d44);
+}
+
 /* Per-frame assembly state shared by the picture and slice packers. */
 struct histb_hevc_run {
 	const struct v4l2_ctrl_hevc_sps *sps;
@@ -100,6 +303,8 @@ struct histb_hevc_run {
 	unsigned int		height_ctbs;
 	unsigned int		ctb_log2;
 	unsigned int		ctu_count;
+	/* tile 网格；tiles 关或型号不支持 tiles 时为覆盖整帧的单个 tile，地址换算恒等 */
+	struct histb_hevc_tiles	tiles;
 	u32			tile_stride;
 	u32			buf_lines;
 	const u8		*stream_va;
@@ -351,6 +556,11 @@ static void histb_hevc_assemble_pic(struct histb_vdec_dev *dev,
 	 * the reconstructed band in D7.
 	 */
 	pic[55] = lower_32_bits(tables + HISTB_TABLE_OFF_TILE_INFO);
+	/* 厂商每帧都写这块（tiles 关时是单 tile 描述，HAL HEVC_WriteTileInfo 在 SetPicMsg 里无条件调用） */
+	if (dev->hevc_tiles)
+		histb_hevc_pack_tile_info((u32 *)((u8 *)histb_vdec_tables_base(&dev->pool) +
+						  HISTB_TABLE_OFF_TILE_INFO),
+					  &run->tiles);
 	pic[56] = lower_32_bits(tables + HISTB_TABLE_OFF_SCRATCH(HISTB_SCRATCH_SAO_LEFT));
 	pic[57] = lower_32_bits(tables + HISTB_TABLE_OFF_SCRATCH(HISTB_SCRATCH_DBLK_LEFT));
 	pic[58] = lower_32_bits(tables + HISTB_TABLE_OFF_SCRATCH(HISTB_SCRATCH_SAO_TOP));
@@ -474,12 +684,8 @@ static int histb_hevc_assemble_slice(struct histb_vdec_dev *dev,
 	u32 *slot = histb_vdec_slice_slot(&dev->pool, index);
 	unsigned int last = run->num_slices - 1;
 	unsigned int count0 = 0, count1 = 0;
-	unsigned int end_ctb, i;
-	/*
-	 * Tiles are refused in histb_vdec_hevc_run, so every picture reaching
-	 * here is untiled and the tile-scan and raster-scan CTB orders coincide.
-	 */
-	unsigned int tile_addr = slice->slice_segment_addr;
+	unsigned int i;
+	u32 start_rs = slice->slice_segment_addr, d10, d43, d44;
 	bool is_low_delay;
 	bool is_b = slice->slice_type == V4L2_HEVC_SLICE_TYPE_B;
 	bool is_p = slice->slice_type == V4L2_HEVC_SLICE_TYPE_P;
@@ -737,15 +943,22 @@ static int histb_hevc_assemble_slice(struct histb_vdec_dev *dev,
 		slot[23] = lower_32_bits(hevc->pmv_dma[col_pmv]);
 	}
 
-	/* D8/D9 carry the slice's start CTB in raster order and the
-	 * coordinates derived from it; D10 carries the same value in tile
-	 * order. For the untiled pictures this driver accepts the two orders
-	 * are equal.
+	/*
+	 * D8/D9 carry the slice's start CTB in raster order and the
+	 * coordinates derived from it; D10 carries the same CTB in tile scan
+	 * order. D43/D44 below close the range: D44 is the last CTB in tile
+	 * scan order (the next slice's tile-scan start minus one, or the last
+	 * CTB of the picture), D43 the same CTB in raster order. Without tiles
+	 * both orders coincide.
 	 */
-	slot[8] = tile_addr;
-	slot[9] = ((tile_addr / run->width_ctbs) << 16) |
-		  (tile_addr % run->width_ctbs);
-	slot[10] = tile_addr;
+	histb_hevc_slice_ctb_range(&run->tiles, start_rs,
+				   index < last ?
+				   run->slices[index + 1].slice_segment_addr : 0,
+				   index == last, &d10, &d43, &d44);
+	slot[8] = start_rs;
+	slot[9] = ((start_rs / run->width_ctbs) << 16) |
+		  (start_rs % run->width_ctbs);
+	slot[10] = d10;
 	slot[11] = (((u32)slice->slice_cb_qp_offset & 31) << 8) |
 		   ((u32)slice->slice_cr_qp_offset & 31);
 	slot[12] = (lf_across ? BIT(0) : 0) |
@@ -783,18 +996,13 @@ static int histb_hevc_assemble_slice(struct histb_vdec_dev *dev,
 
 	/*
 	 * Slice chain words. The CTB range of the slice ends where the next
-	 * slice begins (minus one, vendor arithmetic); the last slice ends at
-	 * the last CTB of the picture. D63 links to the next slot, the tail
-	 * terminates at zero, and a stateless driver refuses chains longer than
-	 * the message pool holds.
+	 * slice begins (minus one, vendor arithmetic, counted in tile scan
+	 * order); the last slice ends at the last CTB of the picture. D63
+	 * links to the next slot, the tail terminates at zero, and a stateless
+	 * driver refuses chains longer than the message pool holds.
 	 */
-	end_ctb = index < last ? run->slices[index + 1].slice_segment_addr - 1 :
-		  run->ctu_count - 1;
-	slot[43] = end_ctb;
-	/* D44 is the tile-scan version of the same end; the vendor converts
-	 * only the raster word.
-	 */
-	slot[44] = end_ctb;
+	slot[43] = d43;
+	slot[44] = d44;
 	if (index < last)
 		slot[63] = lower_32_bits(histb_vdec_slice_slot_dma(&dev->pool,
 								   index + 1));
@@ -1074,15 +1282,12 @@ static int histb_vdec_hevc_run(struct histb_vdec_ctx *ctx,
 	    (run.sps->flags & V4L2_HEVC_SPS_FLAG_SEPARATE_COLOUR_PLANE))
 		return -EINVAL;
 	/*
-	 * Tiled pictures are refused: with V4L2_HEVC_PPS_FLAG_TILES_ENABLED the
-	 * engine stops after a partial first frame for every grid shape tried
-	 * on the board, whether or not the tile info image is written. Accepting
-	 * them would need the raster/tile address split the vendor applies, but
-	 * both local encoders emit a single slice per tiled picture, where the
-	 * two orders coincide, so the corpus cannot exercise the split and the
-	 * refusal is the delivered disposition.
+	 * Tiled pictures are refused on parts without hevc_tiles: on Hi3798MV100
+	 * the engine stopped after a partial first frame for every grid shape
+	 * tried on the board, whether or not the tile info image was written.
 	 */
-	if (run.pps->flags & V4L2_HEVC_PPS_FLAG_TILES_ENABLED)
+	if (!dev->hevc_tiles &&
+	    (run.pps->flags & V4L2_HEVC_PPS_FLAG_TILES_ENABLED))
 		return -EINVAL;
 	/*
 	 * A picture whose SPS declares scaling lists is not decodable here.
@@ -1291,6 +1496,9 @@ static int histb_vdec_hevc_run(struct histb_vdec_ctx *ctx,
 	if (run.height_ctbs < 2)
 		return -EINVAL;
 	run.ctu_count = run.width_ctbs * run.height_ctbs;
+	ret = histb_hevc_tiles_init(&run.tiles, run.sps, run.pps);
+	if (ret)
+		return ret;
 
 	/*
 	 * PMV slot geometry follows the stream resolution with a 1080p floor;
@@ -1447,22 +1655,23 @@ static int histb_vdec_hevc_run(struct histb_vdec_ctx *ctx,
 		if (!i && run.slices[i].slice_segment_addr)
 			return -EINVAL;
 		/*
-		 * The chain is a partition of the CTB grid: each slice's range
-		 * end (D43/D44) is the next slice's start minus one, so an
-		 * address that repeats or goes backwards puts the previous
-		 * slot's end at or below its own start while this slot claims a
-		 * range another slot already covers. Nothing can be clamped
-		 * here without dropping CTBs out of every window, which is what
-		 * the engine would then be told to skip. H.265 7.4.3 emits
-		 * slice addresses in increasing raster order, and this never
-		 * fired on anything measured so far: the scored corpus carries
-		 * one slice per picture, so the multi-slice chains that
-		 * exercise it are H.264's.
-		 *
-		 * 上面说的语料是 Hi3798MV100 bring-up 时的。Hi3798MV300 上每帧 4 个 slice（x265 WPP）的 30 帧码流逐字节一致，各 slice 报告的起止 CTB 首尾相接（0..479、480..1019、1020..1499、1500..2039），D43/D44 的区间算法在 slice 交界处成立。
+		 * The chain is a partition of the CTB grid in tile scan order:
+		 * each slice's range end (D44) is the next slice's tile-scan
+		 * start minus one, so an address that repeats or goes backwards
+		 * in that order puts the previous slot's end at or below its own
+		 * start while this slot claims a range another slot already
+		 * covers. Nothing can be clamped here without dropping CTBs out
+		 * of every window. H.265 7.4.3/6.5.1 emit slice segments in
+		 * increasing tile scan order; without tiles that is raster
+		 * order, with tiles the raster address can go back (the first
+		 * slice of the second tile column sits above the later slices
+		 * of the first), and the vendor likewise finds the next slice by
+		 * SliceSegmentTileAddress (HEVCHAL_V5R2C1_StartDec). Hi3798MV300 上每帧 4 个 slice（x265 WPP）与每 tile 一个 slice（3x2 非均匀 tiles）的码流都逐字节一致。
 		 */
-		if (i && run.slices[i].slice_segment_addr <=
-		    run.slices[i - 1].slice_segment_addr)
+		if (i && histb_hevc_ctb_rs_to_ts(&run.tiles,
+						 run.slices[i].slice_segment_addr) <=
+			 histb_hevc_ctb_rs_to_ts(&run.tiles,
+						 run.slices[i - 1].slice_segment_addr))
 			return -EINVAL;
 
 		ret = histb_hevc_assemble_slice(dev, ctx, hevc, &run, i,

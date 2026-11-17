@@ -146,9 +146,10 @@ void histb_vdec_hw_init_tables(struct histb_vdec_dev *dev)
 	}
 
 	/*
-	 * Every HEVC picture message points at the tile info image, but untiled
-	 * pictures decode with it all zero and the HEVC run path refuses tiled
-	 * ones, so it is programmed once here rather than per frame.
+	 * Every HEVC picture message points at the tile info image. Untiled
+	 * pictures decode with it all zero, and parts without hevc_tiles refuse
+	 * tiled ones, so for them it is programmed once here; parts with
+	 * hevc_tiles write it per picture (histb_hevc_pack_tile_info()).
 	 */
 	memset(tables + HISTB_TABLE_OFF_TILE_INFO, 0,
 	       HISTB_VDEC_TILE_INFO_SIZE);
