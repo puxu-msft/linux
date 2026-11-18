@@ -287,6 +287,10 @@ struct histb_vdec_dev {
 	 * MPEG-1/2 与 MPEG-4/H.263 帧按上行 slice 报告的起止宏块（字 1/字 2）判覆盖，有缺口或没覆盖到最后一个宏块即失败；MPEG-1/2 与 H.263 的 DEC_ERR 在覆盖完整时不算失败（histb_vdec_reports_cover()、histb_vdec_dec_err_benign()）。字 1/字 2 的这一用法读自厂商 V5R2C1 的 VDMHAL_V5R2C1_MakeDecReport，只在打开它的型号上用；不打开的型号保持原来的写法：MPEG-1/2 只看报告止点覆盖到底，MPEG-4/H.263 按 DEC_ERR 判。
 	 */
 	bool			mpeg_cov_reports;
+	/*
+	 * 宏块全覆盖、只带 DEC_ERR 的 MPEG-1/2 与 H.263 帧（histb_vdec_reports_cover()、histb_vdec_dec_err_benign()）解完不复位引擎。厂商 V5R2C1 固件对 DEC_ERR 从不复位（读汇编）：VDMDRV_IsrProcess → VDMDRV_AfterDec 一路没有复位，复位只发生在 VDMDRV_CheckDevice（超过 1000 ms 的超时）与 VCTRL_ResetHardware/VCTRL_CloseHardware/VCTRL_DestroyChan（经 VDMDRV_ResetVDH）里，经 HAL 表 +152 的 VDMHAL_V5R2C1_ResetVdm 或 VDH_Reset_Module（后者本体不在手头反汇编里，VDH_Reset_Mfde_Module 同样经 +152 调 ResetVdm，转录待亲验）。不打开的型号保持每个 DEC_ERR 都复位：那是 Hi3798MV100 上的实测（带 DEC_ERR 的 MPEG-2 图像之后紧接的 H.264 8/8 超时，见 histb_vdec_irq_handler()）。
+	 */
+	bool			covered_err_keeps_engine;
 };
 
 /*

@@ -125,6 +125,7 @@ struct histb_vdec_v2_part {
 	bool			h264_interlace_vfmw5; /* 见 histb_vdec_dev 同名字段 */
 	bool			mpeg4_vfmw5; /* 见 histb_vdec_dev 同名字段 */
 	bool			mpeg_cov_reports; /* 见 histb_vdec_dev 同名字段 */
+	bool			covered_err_keeps_engine; /* 见 histb_vdec_dev 同名字段 */
 };
 
 static struct histb_vdec_dev *histb_vdec_dev_of(const struct histb_vdec_ctx *ctx)
@@ -776,8 +777,10 @@ irqreturn_t histb_vdec_irq_handler(int irq, void *priv)
 	 * (H.264 alone 4/4 clean, H.264 right after one MPEG-2 picture 8/8 timed
 	 * out with the engine not reading a single macroblock), and only the CRG
 	 * reset recovered it. Reset here so an errored stream cannot poison the
-	 * next job, whatever opened it. Under the coverage rule the
-	 * one-per-stream diagnostic is kept for the frames that fail it.
+	 * next job, whatever opened it; parts with covered_err_keeps_engine skip
+	 * it for the frames the coverage rule accepts, as the vendor firmware
+	 * does. Under the coverage rule the one-per-stream diagnostic is kept for
+	 * the frames that fail it.
 	 */
 	if ((state & VDM_STATE_DEC_ERR) || short_cov) {
 		if ((cov_judged ? deliver_err : !slack_only) &&
@@ -785,7 +788,8 @@ irqreturn_t histb_vdec_irq_handler(int irq, void *priv)
 			histb_vdec_report_failure(dev, state, slices);
 			((struct histb_vdec_ctx *)job.ctx)->diag_reported = true;
 		}
-		histb_vdec_hw_reset(dev);
+		if (!(benign && !short_cov && dev->covered_err_keeps_engine))
+			histb_vdec_hw_reset(dev);
 	}
 
 	cancel_delayed_work(&dev->watchdog);
@@ -1139,6 +1143,7 @@ int histb_vdec_v2_probe(struct platform_device *pdev,
 	dev->h264_interlace_vfmw5 = part->h264_interlace_vfmw5;
 	dev->mpeg4_vfmw5 = part->mpeg4_vfmw5;
 	dev->mpeg_cov_reports = part->mpeg_cov_reports;
+	dev->covered_err_keeps_engine = part->covered_err_keeps_engine;
 	dev->common.priv = dev;
 	platform_set_drvdata(pdev, dev);
 
@@ -1506,6 +1511,7 @@ static const struct histb_vdec_v2_part histb_vdec_v2_part_mv300 = {
 	.h264_interlace_vfmw5 = true,
 	.mpeg4_vfmw5 = true,
 	.mpeg_cov_reports = true,
+	.covered_err_keeps_engine = true,
 };
 
 const struct histb_vdec_variant histb_vdec_v2_mv100_variant = {
