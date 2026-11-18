@@ -124,6 +124,7 @@ struct histb_vdec_v2_part {
 	bool			hevc_tiles; /* 见 histb_vdec_dev 同名字段 */
 	bool			h264_interlace_vfmw5; /* 见 histb_vdec_dev 同名字段 */
 	bool			mpeg4_vfmw5; /* 见 histb_vdec_dev 同名字段 */
+	bool			mpeg_cov_reports; /* 见 histb_vdec_dev 同名字段 */
 };
 
 static struct histb_vdec_dev *histb_vdec_dev_of(const struct histb_vdec_ctx *ctx)
@@ -609,6 +610,51 @@ static bool histb_vdec_tail_slack_only(struct histb_vdec_dev *dev,
 	return next == dev->tail_slack_total;
 }
 
+/*
+ * 打开 mpeg_cov_reports 的型号上，MPEG-1/2 与 MPEG-4 Part 2（含 H.263 短头）的前端按 slice 报告的宏块覆盖判帧好坏；MPEG-1/2 与 H.263 的 DEC_ERR 本身不算失败，与厂商 V5R2C1 固件同一口径（读汇编，tmp/media/vfmw_v5/ 与 build/scratch-vdec74/review-cov/vendor-dl/）：VDMHAL_V5R2C1_MakeDecReport 在 VDM_STATE 同时带 DEC_OVER 与 DEC_ERR 时，只对 MPEG-2（VID_STD_E 3）把 RetType 记成 0（vdm_hal.S 的 ubfx x0, x1, 17, 2 / ccmp w21, 3 一段）；MPEG-2 与 MPEG-4 的帧错误率都由 PostPro_GetMp24MbGroup 按各 slice 报告字 1/字 2 的起止宏块之间的缺口算（postprocess.S），没有缺口时只看修复参数里的 ErrFrame_Flag（手头的反汇编里找不到它的写入方，全局变量零初始化），不读 RetType，也不读第 0 条报告字 0 的 bit 31。H.263 在厂商那里走同一条 MPEG-4 路径（VDMHAL_V5R2C1_PrepareDec 对 VFMW_H263 不派发，短头由 MPEG-4 语法层 Mp4_Syntax_ShortHeader/Mp4_Syntax_Slice_SH 处理）。
+ *
+ * Hi3798MV300 上这两种协议带 DEC_ERR 而像素与软解只差反变换的帧（07 #109）：MPEG-2 每帧都报；H.263 也每帧都报，它的 GOB 段在宏块数据之后总还有位（现行段长到图像末尾；止于下一 GOB 起始码时仍带补到字节边界的 GSTUF 零位，单靠字节分不出它与宏块数据末尾的 0 位）。07 #109 ④ 试过的三种段尾口径（止于下一 GOB、去末尾零字节、再去末字节低位零）都没消掉它，后一种同时会裁掉数据末尾的 0 位，所以不是反证；推断与 MPEG-4 段尾带着填充位就报 DEC_ERR、去掉即不报是同一机理，未上机证实。MPEG-4（非短头）去掉填充位之后干净的帧不再报 DEC_ERR，那里 DEC_ERR 仍是有用的出错信号，所以它照旧算失败，覆盖不全另外也算（比厂商严）。
+ *
+ * 判据：报告从宏块 0 起、相邻 slice 之间没有缺口（允许重叠，厂商同样只找缺口）、每条的止点不越出画面，并且最终覆盖到最后一个宏块。比厂商严一处：厂商把止于最后 10 个宏块之内的帧也当作完整（PostPro_GetMp24MbGroup 的 sub w1, w5, #10），这里要求覆盖到底。slice 数超出上行报告区（HISTB_VDEC_MAX_UP_SLICES）时报告不全、无从判断，histb_vdec_coverage_judged() 让这样的帧退回 DEC_ERR 判据。
+ */
+static bool histb_vdec_reports_cover(struct histb_vdec_dev *dev,
+				     unsigned int slices)
+{
+	const u32 *up = histb_vdec_up_msgs(&dev->pool);
+	u32 next = 0;
+	unsigned int i;
+
+	if (!dev->mb_total || !slices || slices > HISTB_VDEC_MAX_UP_SLICES)
+		return false;
+
+	for (i = 0; i < slices; i++) {
+		u32 start = up[4 * i + 1], end = up[4 * i + 2];
+
+		if (start > next || end < start || end >= dev->mb_total)
+			return false;
+		next = max(next, end + 1);
+	}
+
+	return next == dev->mb_total;
+}
+
+/* 这一帧按 histb_vdec_reports_cover() 判覆盖：打开 mpeg_cov_reports 的型号上的 MPEG-1/2 与 MPEG-4/H.263，且报告没有溢出上行报告区 */
+static bool histb_vdec_coverage_judged(const struct histb_vdec_dev *dev,
+				       const struct histb_vdec_fmt *fmt, u32 state)
+{
+	return dev->mpeg_cov_reports && dev->mb_total &&
+	       FIELD_GET(VDM_STATE_SLICE_NUM, state) <= HISTB_VDEC_MAX_UP_SLICES &&
+	       (fmt->vidstd == HISTB_VIDSTD_MPEG2 ||
+		fmt->vidstd == HISTB_VIDSTD_MPEG4);
+}
+
+/* DEC_ERR 在宏块全覆盖时不算失败的协议：MPEG-1/2 与 H.263（V4L2_PIX_FMT_MPEG4 的短头 VOP 被前端拒收，H.263 只经 V4L2_PIX_FMT_H263 进来） */
+static bool histb_vdec_dec_err_benign(const struct histb_vdec_fmt *fmt)
+{
+	return fmt->vidstd == HISTB_VIDSTD_MPEG2 ||
+	       fmt->fourcc == V4L2_PIX_FMT_H263;
+}
+
 static void histb_vdec_report_failure(struct histb_vdec_dev *dev, u32 state,
 				      unsigned int slices)
 {
@@ -643,7 +689,7 @@ irqreturn_t histb_vdec_irq_handler(int irq, void *priv)
 	struct histb_vdec_dev *dev = priv;
 	struct histb_vdec_job job;
 	unsigned int slices;
-	bool short_cov, deliver_err, slack_only;
+	bool short_cov, deliver_err, slack_only, cov_judged, benign;
 	u32 state;
 
 	/*
@@ -663,20 +709,32 @@ irqreturn_t histb_vdec_irq_handler(int irq, void *priv)
 		(state & VDM_STATE_DEC_ERR) ? ", decode error" : "");
 	slack_only = (state & VDM_STATE_DEC_ERR) &&
 		     histb_vdec_tail_slack_only(dev, slices);
-	histb_vdec_dump_up(dev, slices,
-			   (state & VDM_STATE_DEC_ERR) && !slack_only);
 
 	/*
-	 * One 4-word report per slice; word 2 is the last macroblock the slice
-	 * covered (measured: a 300-MB picture reports 0x12b, and a stream cut
-	 * mid-slice reports the shorter end). Coverage is judged whenever the front
-	 * end reports a macroblock total, and a frame whose reports stop short is
-	 * always recovered from below; only for MPEG-2 does it also decide what the
-	 * client is told, because that front end raises DEC_ERR on pictures this
-	 * check can prove complete.
+	 * One 4-word report per slice; word 1 is the first and word 2 the last
+	 * macroblock the slice covered (measured: a 300-MB picture reports 0x12b,
+	 * and a stream cut mid-slice reports the shorter end; the vendor's
+	 * MakeDecReport copies the same two words into SliceMbRange). Coverage is
+	 * judged whenever the front end reports a macroblock total, and a frame
+	 * whose reports stop short is always recovered from below. On parts with
+	 * mpeg_cov_reports, for MPEG-1/2 and MPEG-4/H.263 a gap also fails the
+	 * frame (histb_vdec_reports_cover()), and for MPEG-1/2 and H.263 coverage
+	 * alone decides it (histb_vdec_dec_err_benign()). Elsewhere MPEG-1/2 is
+	 * decided by the end-only check, because that front end raises DEC_ERR
+	 * on pictures the check can prove complete, and the other front ends keep
+	 * the DEC_ERR rule.
 	 */
+	cov_judged = histb_vdec_coverage_judged(dev, job.ctx->desc, state);
+	benign = cov_judged && histb_vdec_dec_err_benign(job.ctx->desc);
 	short_cov = false;
-	if (dev->mb_total && slices) {
+	if (cov_judged) {
+		short_cov = !histb_vdec_reports_cover(dev, slices);
+		if (short_cov)
+			dev_err_ratelimited(dev->dev,
+					    "slice reports do not cover all %u macroblocks (%u reports)\n",
+					    dev->mb_total,
+					    (unsigned int)FIELD_GET(VDM_STATE_SLICE_NUM, state));
+	} else if (dev->mb_total && slices) {
 		const u32 *up = histb_vdec_up_msgs(&dev->pool);
 		u32 max_end = 0;
 		bool bad = false;
@@ -699,6 +757,18 @@ irqreturn_t histb_vdec_irq_handler(int irq, void *priv)
 		}
 	}
 
+	if (cov_judged)
+		deliver_err = short_cov ||
+			      ((state & VDM_STATE_DEC_ERR) && !benign);
+	else if (dev->mb_total && slices &&
+		 job.ctx->desc->vidstd == HISTB_VIDSTD_MPEG2)
+		deliver_err = short_cov;
+	else
+		deliver_err = (state & VDM_STATE_DEC_ERR) && !slack_only;
+	histb_vdec_dump_up(dev, slices,
+			   cov_judged ? deliver_err :
+				    (state & VDM_STATE_DEC_ERR) && !slack_only);
+
 	/*
 	 * A picture the engine flagged leaves the VDM pipeline in a state the next
 	 * frame cannot be programmed out of: measured on the board, an MPEG-2
@@ -706,30 +776,17 @@ irqreturn_t histb_vdec_irq_handler(int irq, void *priv)
 	 * (H.264 alone 4/4 clean, H.264 right after one MPEG-2 picture 8/8 timed
 	 * out with the engine not reading a single macroblock), and only the CRG
 	 * reset recovered it. Reset here so an errored stream cannot poison the
-	 * next job, whatever opened it.
+	 * next job, whatever opened it. Under the coverage rule the
+	 * one-per-stream diagnostic is kept for the frames that fail it.
 	 */
 	if ((state & VDM_STATE_DEC_ERR) || short_cov) {
-		if (!slack_only &&
+		if ((cov_judged ? deliver_err : !slack_only) &&
 		    !((struct histb_vdec_ctx *)job.ctx)->diag_reported) {
 			histb_vdec_report_failure(dev, state, slices);
 			((struct histb_vdec_ctx *)job.ctx)->diag_reported = true;
 		}
 		histb_vdec_hw_reset(dev);
 	}
-
-	/*
-	 * The engine raises DEC_ERR on pictures whose data ends exactly at the
-	 * declared length even when every macroblock was decoded; measured on the
-	 * board, an MPEG-2 picture carrying the bit still matches a software decode
-	 * in luma (MSE 4, corr 0.9993). For the protocols whose front end reports a
-	 * macroblock total (MPEG-1/2) coverage decides delivery and the bit alone is
-	 * not a failure; the other front ends keep the old rule.
-	 */
-	if (dev->mb_total && slices &&
-	    job.ctx->desc->vidstd == HISTB_VIDSTD_MPEG2)
-		deliver_err = short_cov;
-	else
-		deliver_err = (state & VDM_STATE_DEC_ERR) && !slack_only;
 
 	cancel_delayed_work(&dev->watchdog);
 	histb_vdec_job_complete(dev, &job,
@@ -1081,6 +1138,7 @@ int histb_vdec_v2_probe(struct platform_device *pdev,
 	dev->hevc_tiles = part->hevc_tiles;
 	dev->h264_interlace_vfmw5 = part->h264_interlace_vfmw5;
 	dev->mpeg4_vfmw5 = part->mpeg4_vfmw5;
+	dev->mpeg_cov_reports = part->mpeg_cov_reports;
 	dev->common.priv = dev;
 	platform_set_drvdata(pdev, dev);
 
@@ -1447,6 +1505,7 @@ static const struct histb_vdec_v2_part histb_vdec_v2_part_mv300 = {
 	.hevc_tiles = true,
 	.h264_interlace_vfmw5 = true,
 	.mpeg4_vfmw5 = true,
+	.mpeg_cov_reports = true,
 };
 
 const struct histb_vdec_variant histb_vdec_v2_mv100_variant = {

@@ -283,6 +283,10 @@ struct histb_vdec_dev {
 	 * MPEG-4 与 H.263 按厂商 V5R2C1 编程（histb_vdec_v2_mpeg4.c）：CFG1 写厂商的 0x2001C002 一组位（DDR_STRIDE 为 0、MV_OUT_EN 等）；MPEG-4 每个视频包的段长止于下一包的 resync marker，并去掉 next_resync_marker()/next_start_code() 的填充位（histb_vdec_mpeg4_strip_stuffing()）；H.263 短头图像的 fcode 取 1。不打开的型号保持 MV100 bring-up 时的写法。
 	 */
 	bool			mpeg4_vfmw5;
+	/*
+	 * MPEG-1/2 与 MPEG-4/H.263 帧按上行 slice 报告的起止宏块（字 1/字 2）判覆盖，有缺口或没覆盖到最后一个宏块即失败；MPEG-1/2 与 H.263 的 DEC_ERR 在覆盖完整时不算失败（histb_vdec_reports_cover()、histb_vdec_dec_err_benign()）。字 1/字 2 的这一用法读自厂商 V5R2C1 的 VDMHAL_V5R2C1_MakeDecReport，只在打开它的型号上用；不打开的型号保持原来的写法：MPEG-1/2 只看报告止点覆盖到底，MPEG-4/H.263 按 DEC_ERR 判。
+	 */
+	bool			mpeg_cov_reports;
 };
 
 /*

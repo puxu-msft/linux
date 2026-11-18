@@ -2309,6 +2309,8 @@ out:
 	if (ret)
 		return ret;
 
+	/* 完成路径按 slice 报告的覆盖判这一帧（histb_vdec_reports_cover()） */
+	dev->mb_total = pic.mb_total;
 	histb_vdec_hw_kick(dev, ctx->desc->vidstd);
 
 	return 0;
