@@ -1,0 +1,440 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * CM201-2（Sunnovo / Hi3798MV300，1 GiB + 8 GiB eMMC）板级 DTS。
+ *
+ * 派生自 hataketsu 的 hi3798mv300-mainline tvbox DTS，按本机需要做了以下改动：
+ *   - CM201-2 的 model 字符串，以及给 SDIO Wi-Fi 的 mmc2 别名；
+ *   - BL31 预留在厂商 fastboot 放置它的 0x04400000，而不是 l-loader 的地址；
+ *   - eMMC 沿用 U-Boot 的引脚设置（不挂 pinctrl state），SDIO1 使用 bootloader 留作 GPIO 的 sdio 复用（F20 留给蓝牙的 BT_REG_ON）；
+ *   - eMMC 的 DDR52/HS200/HS400；SD0 卡槽用控制器自带的卡检测并带 disable-wp，SDIO Wi-Fi 那一路带 broken-cd；
+ *   - 通过 MV300 USB2 PHY 的 MMIO 序列启用 USB host（patches/linux/0002 "inno-usb2: 支持 Hi3798MV300 的 MMIO 端口"）；
+ *   - SoC dtsi 没有的 PMC tsensor、thermal zone 与 TRNG；
+ *   - UART2 上的 RTL8822BS 蓝牙（H5，btrtl）；
+ *   - 机身 AV 口的模拟音频：AIAO 发送口 1 → 片内 TianLai V700 ADAC（声卡 "CM201 AV"）；
+ *   - CPU 供电 PMC6 由 histb-regulator 接管（vdd_cpu），operating point 带 opp-microvolt，并以 CPU 作为 thermal zone 的冷却设备；tsensor 的窗口让出 PMC6–PMC8。
+ *
+ * 基于 v7.4-rc1 + histb-mainline/patches pending-7.4 编写。
+ *
+ * 厂商设备树里没有板名；型号依据标签和导出的原厂 DTB 判定。
+ */
+
+/dts-v1/;
+
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/leds/common.h>
+#include <dt-bindings/thermal/thermal.h>
+
+#include "hi3798mv200.dtsi"
+
+/ {
+	model = "CM201-2 Hi3798MV300 TV box";
+	compatible = "hisilicon,hi3798mv300-tvbox", "hisilicon,hi3798mv200";
+
+	aliases {
+		serial0 = &uart0;
+		serial1 = &uart2;
+		mmc0 = &emmc;
+		mmc1 = &sd0;
+		mmc2 = &sd1;
+		ethernet0 = &femac;
+	};
+
+	chosen {
+		stdout-path = "serial0:115200n8";
+		/* 默认先 DHCP（EA7500 在 192.168.75.0/24），失败才落到静态 192.168.1.249 —— 静态只用于 DHCP 不可达时的带外入口。 */
+		/*
+		 * 盘上没有 GPT。分区表来自 U-Boot env 的 blkdevparts（9 个分区，与 630 MiB 处的 ext4 对齐）；mainline 需要 CONFIG_CMDLINE_PARTITION=y 才会解析。不要改成 GPT：sector 0 是原厂 fastboot。
+		 * root=/dev/mmcblk0p9 给 p6 里的「无 initramfs」内核直接挂载用；带诊断 initramfs 的 TFTP 镜像由 /init 自己 switch_root，会忽略这个 root=（两者共用同一份 DTB）。
+		 * diag.rootfs=0 可让某次启动留在诊断态（改 DTB 或直接换 hi_kernel-mv300-diag-blkparts.bin）。
+		 * fsck.repair=yes：根分区由 /init 以只读交给 systemd，systemd-fsck-root 遇到需要人工确认的错误也自动修复，不停在交互提示上（无人值守，docs/04-ROOTFS.md「根分区 fsck」）。
+		 * ext4.max_folio_order=0：普通文件的页缓存回到逐页，经 mmap 的小更新不再整块（最大 2 MiB）回写（patches/linux 的 ext4 补丁，docs/12-DURABILITY.md）。
+		 * cma=64M：默认 32 MB CMA 装不下 VDEC。7.3 的零拷贝口径是消息池 + H.264 PMV 池 + 4 个 1440p capture buffer 约 40 MB；7.4 的 v2 后端在每个 capture buffer 后面多一份同尺寸内部帧（1440p 每对约 11 MB），估算 1440p H.264 2 个 buffer 约 30 MB、4 个约 52 MB，HEVC 的 PMV 池仍一次分配 20 槽（1440p 约 9 MB），4 个 buffer 约 62 MB——都是算出来的，未在 7.4 上实测。
+		 */
+		bootargs = "console=ttyAMA0,115200 panic=5 panic_on_oops=1 systemd.unit=multi-user.target fsck.repair=yes ext4.max_folio_order=0 clk_ignore_unused cma=64M diag.ip=192.168.1.249 diag.gw=192.168.1.1 diag.shell=1 diag.rootfs=1 root=/dev/mmcblk0p9 rootfstype=ext4 rootwait blkdevparts=mmcblk0:1M(boot),1M(bootargs),4M(baseparam),4M(pqparam),4M(logo),40M(kernel),64M(busybox),512M(backup),-(ubuntu)";
+	};
+
+	/*
+	 * 1 GiB。原厂 bootloader 的 `getinfo ddrfree` 报告空闲 DDR 为 0x1000000..0x40000000，HC2910 DTS 的 0x80000000 会映射出并不存在的半个 GiB。
+	 */
+	memory@0 {
+		device_type = "memory";
+		reg = <0x0 0x0 0x0 0x40000000>;
+	};
+
+	/*
+	 * pstore：板子没有可用的 UART，所以卡死或 panic 的那次启动的控制台输出保存在 RAM 里、跨热复位保留（SysRq-B 与 SP805 看门狗复位都已实测，07 #41、#62），在下次启动时读回（systemd-pstore 把它归档到 /var/lib/systemd/pstore）。不放在 DDR 顶端：热复位后最后 1 MiB 存着 DDR training pattern 和 fastboot 数据（2026-11-12 实测），ramoops 在那里发现每个 header 都已损坏。放在 0x30000000 时，上一次启动的 console 与 pmsg 读回时报告 "ECC: No errors detected"。no-map 让该区域不进线性映射，因此以 uncached 方式写入，并可通过 /dev/mem 读出核对。
+	 */
+	reserved-memory {
+		/*
+		 * 两条启动链上 BL31 都作为 PSCI 固件常驻 EL3：厂商 fastboot 把 FIP 里的 BL31 拷到这里并热复位进入它（TFTP 镜像用厂商 BL31，p6 里的 route-D 链用上游 TF-A）。厂商 BL31 链接在 0x04400000，并把自己映射在 [0x04400000, 0x04410000)；上游 BL31 链接进同一个 0x14000 字节的槽。
+		 */
+		bl31@4400000 {
+			reg = <0x0 0x04400000 0x0 0x00014000>;
+			no-map;
+		};
+
+		ramoops@30000000 {
+			compatible = "ramoops";
+			reg = <0x0 0x30000000 0x0 0x100000>;
+			no-map;
+			console-size = <0x80000>;
+			record-size = <0x20000>;
+			pmsg-size = <0x20000>;
+			ecc-size = <16>;
+		};
+	};
+
+	/*
+	 * 两颗前面板 LED 都在 gpio5 上——即 0xf8004000 处的 PL061，待机时仍然供电。两颗都是高电平有效，且都无法单靠软件发现：bootloader 把蓝色 LED 的引脚留作输入，只有逐条驱动每根线才找到了它。
+	 *
+	 * 线 1 有意不分配：它是 bootloader 置高的输出，但不点亮任何东西。
+	 */
+	leds {
+		compatible = "gpio-leds";
+
+		led-0 {
+			gpios = <&gpio5 0 GPIO_ACTIVE_HIGH>;
+			color = <LED_COLOR_ID_RED>;
+			function = LED_FUNCTION_ACTIVITY;
+			linux,default-trigger = "mmc0";
+		};
+
+		led-1 {
+			gpios = <&gpio5 2 GPIO_ACTIVE_HIGH>;
+			color = <LED_COLOR_ID_BLUE>;
+			function = LED_FUNCTION_POWER;
+			linux,default-trigger = "heartbeat";
+		};
+	};
+};
+
+&uart0 {
+	status = "okay";
+};
+
+/*
+ * RTL8822BS 的蓝牙部分：H5（三线 UART）接 UART2。UART2 是 K19/J20/J19/H21 四线，原厂与 histb 两份 fastboot 寄存器表都把这四脚设成功能 5；主线 pinctrl 表里 K19 的 uart 功能号是 4，与硬件现值不符，所以不挂 pinctrl，沿用 bootloader 的复用（同 &emmc）。
+ * BT_REG_ON 是 GPIO4_2（焊盘 F20），高有效：原厂 hi_rfkill.ko 用 GPIO 34 驱动它（rfkill 解除阻塞时输出 1）。hci_h5 在 probe（注册 hci 设备时打开 H5 协议）时先拉低 100 ms 再拉高、卸载时拉低，hci0 的 up/down 不动它。
+ * 固件按芯片版本由 btrtl 选（rtl_bt/rtl8822bs_fw.bin、rtl8822bs_config.bin，原厂 /etc/firmware 同名文件）；config 把链路切到 1.5 Mbaud 并开硬件流控。
+ */
+&uart2 {
+	status = "okay";
+
+	bluetooth {
+		compatible = "realtek,rtl8822bs-bt", "realtek,rtl8822cs-bt";
+		enable-gpios = <&gpio4 2 GPIO_ACTIVE_HIGH>;
+	};
+};
+
+/*
+ * eMMC 实测（2026-11-07）：
+ * - DDR52、HS200、HS400 均能在 mainline 7.3 下读写；HS400 跑 150 MHz。
+ * - HS400 早先全读失败（CRC 错误）的根因不是采样相位或 SAP DLL，而是 mainline pinctrl：dtsi 的 emmc_default 把 eMMC 引脚统一配成 8mA + slew-rate 1，而厂商驱动在 HS400 下用 8mA + slew-rate 0（himciv200_set_driver）。U-Boot 已按 HS400 配好 IO 引脚，删掉 pinctrl 保留其设置后，HS400 读、写、回读校验全部通过。
+ * - 保留 HS200 作为 HS400 不可用时的回退，DDR52 继续保留。
+ */
+&emmc {
+	/* 不要挂 pinctrl-0：mainline emmc_default 的 slew-rate 1 会破坏 HS400 数据窗口。引脚复用和驱动强度沿用 U-Boot 的配置。 */
+	/delete-property/ pinctrl-0;
+	/delete-property/ pinctrl-names;
+
+	fifo-depth = <256>;
+	clock-frequency = <50000000>;
+	max-frequency = <150000000>;
+	bus-width = <8>;
+	cap-mmc-highspeed;
+	cap-mmc-ddr52;
+	mmc-hs200-1_8v;
+	mmc-hs400-1_8v;
+	mmc-ddr-1_8v;
+	non-removable;
+	status = "okay";
+};
+
+/*
+ * SD 卡槽（SD0）：卡检测走控制器自带的 CDETECT，由 dtsi 的 sd0_default 把 C5 复用成 sdio 功能（上拉；无卡时 C5 读高，07 #73），不再用 broken-cd 让 mmc 核心反复重试整套初始化。microSD 没有写保护开关，C2 悬空上拉会被读成写保护，所以 disable-wp。
+ * 只开 SD 高速（50 MHz）：板上没有 1.8 V IO 电压切换（dw_mmc-hi3798mv200 不做电压切换、也没有 vqmmc 稳压器），声明 UHS 会让卡在 CMD11 后切到 1.8 V 而主机仍按 3.3 V 驱动。
+ */
+&sd0 {
+	fifo-depth = <256>;
+	clock-frequency = <150000000>;
+	bus-width = <4>;
+	cap-sd-highspeed;
+	disable-wp;
+	status = "okay";
+};
+
+/*
+ * RTL8822BS 使用的 SDIO1 引脚。厂商 bootloader 把这些引脚留作 GPIO 复用，所以卡从不应答 CMD52。运行期经 pinctrl debugfs 验证（把引脚复用为 "sdio"，重新绑定 mmc2）后卡能枚举出来；这里固定该复用。pinconf 有意不动：bootloader 的偏置与驱动强度设置已经可用。
+ * F20 不在组里：它是蓝牙的 BT_REG_ON（GPIO4_2，&uart2 的 enable-gpios），pinctrl 是 strict 的，留在 sdio 组里 GPIO 就请求不到。原厂 fastboot 寄存器表里 SDIO1 只用 E20/E19/D21/E18/C20/D19 六脚，F20/F19 都是 GPIO（BT_REG_ON / WL_REG_ON）；F19 与 B21 仍按现状留在 sdio 组，WiFi 一直在这个配置下工作。
+ */
+&ioconfig {
+	sdio1_default: sdio1-default-state {
+		sdio1-pins {
+			pins = "F19", "E20", "E19", "D21", "E18", "C20",
+			       "D19", "B21";
+			function = "sdio";
+		};
+	};
+};
+
+/* SDIO Wi-Fi：RTL8822BS，由 rtw88 驱动。 */
+&sd1 {
+	pinctrl-0 = <&sdio1_default>;
+	pinctrl-names = "default";
+
+	bus-width = <4>;
+	max-frequency = <50000000>;
+	cap-sd-highspeed;
+	cap-sdio-irq;
+	sd-uhs-sdr12;
+	sd-uhs-sdr25;
+	sd-uhs-sdr50;
+	non-removable;
+	broken-cd;
+	status = "okay";
+};
+
+/*
+ * CPU operating point：取 CPU PLL 在 fastboot 留下的分频下能精确得到的频率（24 MHz / (postdiv1 2 * postdiv2 1 * refdiv 2) = 反馈分频每步 6 MHz；时钟驱动会重新调谐 PLL，见 crg-hi3798mv200.c）。SoC 表里的 24/200/400/800 MHz 在这个 PLL 上达不到。
+ * 电压：1.2 GHz 保持 1.10 V（fastboot 为它设的值，厂商 OPP 表同值）；600 MHz 930 mV、900 MHz 1002.5 mV，都是运行期满载实测过的 PMC6 值（userspace 钉频 + /dev/mem 直写 PMC6，3 核 openssl + sha256 已知结果校验，600 MHz 30 min、900 MHz 20 min 无错，docs/07-EVIDENCE.md #70），比厂商 OPP 表的 SVB 修正前默认值（600 MHz 850 mV、800 MHz 930 mV、1.2 GHz 1100 mV，07 #31）留出余量。驱动按 PWM 周期 220 换算（V = 1250 mV − 2.5 mV × duty，寄存器里的 duty 与周期字段都是值加 1），930000 写成 duty 字段 0x81，1002500 写成 0x64，与实测值逐位一致。
+ * opp-suspend 让有序重启/关机前回到 1.2 GHz/1.10 V，即 fastboot 交棒时的状态。
+ */
+&cpu_opp_table {
+	/delete-node/ opp-24000000;
+	/delete-node/ opp-200000000;
+	/delete-node/ opp-400000000;
+	/delete-node/ opp-800000000;
+	/delete-node/ opp-1350000000;
+	/delete-node/ opp-1600000000;
+
+	opp-600000000 {
+		opp-microvolt = <930000 930000 1250000>;
+	};
+
+	opp-900000000 {
+		opp-hz = /bits/ 64 <900000000>;
+		opp-microvolt = <1002500 1002500 1250000>;
+	};
+
+	opp-1200000000 {
+		opp-microvolt = <1100000 1100000 1250000>;
+		opp-suspend;
+	};
+};
+
+/* OPP 表是共享的，因此 cpu0 的 policy 就是唯一的冷却设备；四个核同在 vdd_cpu 一路上。 */
+&{/cpus/cpu@0} { #cooling-cells = <2>; cpu-supply = <&vdd_cpu>; };
+&{/cpus/cpu@1} { cpu-supply = <&vdd_cpu>; };
+&{/cpus/cpu@2} { cpu-supply = <&vdd_cpu>; };
+&{/cpus/cpu@3} { cpu-supply = <&vdd_cpu>; };
+
+&femac {
+	status = "okay";
+	/*
+	 * U-Boot 的 ethaddr 不会传给 mainline（bootm 只传 ATAGS，mainline 不读），不指定时 of_get_ethdev_address() 返回失败，驱动退化成每次启动随机 MAC（实测 26:bd:3a:64:6a:c5），DHCP 地址随之漂移，远程排障无法定位。
+	 * 固定一个本地管理地址（首字节 0x02 = locally administered）。
+	 * 真实 vendor MAC 可用 U-Boot 的 printenv ethaddr 读出后替换这里。
+	 */
+	local-mac-address = [02 ca 20 12 00 01];
+};
+
+/*
+ * IR 接收器。随盒遥控器使用 NEC 协议、地址 0x22；方向键与 OK 和 rc-hisi-tv-demo 表一致（0xca=UP，0xd2=DOWN），但返回、频道和音量用的是 0x2295、0x2285/0x2286 和 0x2280/0x2281（2026-11-08 抓取），所以 rc-cm201 并不是把那张表单纯平移到 0x22XX。
+ */
+&ir {
+	status = "okay";
+	linux,rc-map-name = "rc-cm201";
+};
+
+/*
+ * VDEC：这颗芯片运行 VDH V5R2C1（固件标签 HiVDHFMWV500R001），由 histb-vdec 的 v2 后端驱动，而不是 dtsi 的 "hisilicon,hi3798mv200-vdec" 所选的 MV200H V5R6 block。VDM 窗口必须覆盖到 0x1014 之后，以容纳语法错误记录；SCD 承载三个解码器全局寄存器。与 dtsi 注释描述的 MV200H block 不同，这颗芯片的 CRG30（0x078）确实包含 VDH 与 DSP 门控（bit 0/1）以及 global/SCD/MFD 软复位（bit 4/5/6）：驱动通过 "hisilicon,crg" syscon 打开门控，两路复位请求是 global 与 VDM 复位。模块 histb_vdec 随开机自动加载；回归用 build/scratch-vdec74 的测试包（docs/10-MEDIA.md，07 #74、#76）。
+ */
+&vdec {
+	compatible = "hisilicon,hi3798mv300-vdec";
+	reg = <0x8c30000 0x1100>, <0x8c3c000 0x1000>;
+	reg-names = "vdm", "scd";
+	resets = <&crg 0x78 4>, <&crg 0x78 6>;
+	reset-names = "global", "vdm";
+	hisilicon,crg = <&crg>;
+	status = "okay";
+};
+
+/*
+ * 显示：VDP v4 引擎经 of_graph 端口 0 接片上 HDMI 发送器，寄存器窗口、时钟与复位都取 dtsi 原样（docs/10-MEDIA.md §4，上板进度见 docs/TASKS.md 第 6 项）。兼容串换成 "hisilicon,hi3798mv300-vdp"：这颗芯片的 VDP 是厂商 hal/98mv200 那一版寄存器布局（VDPVERSION 0x09349963/0x20150807），CRG54 bit30 是 VOU 复位、bit31 是配置时钟，像素钟 = 显示 PLL ÷ 4 ÷ (CRG211[28:24] + 1)，都与 dtsi 的 "hisilicon,hi3798mv200-vdp" 所指的 MV310 布局不同（07 #125，docs/14-VDP-HDMI.md）。
+ */
+&vdp {
+	compatible = "hisilicon,hi3798mv300-vdp";
+	status = "okay";
+};
+
+/*
+ * HDMI 发送器兼容串换成 "hisilicon,hi3798mv300-hdmi"：PHY 按本机 fastboot 对 MV300 的分频、驱动电流/终端与展频表编程，PHY 复位走 PHY 窗口的 DPHY_RST 而不是 CRG68 bit4（07 #126 的 A/B 寄存器对比，captures/20261122-hdmi/）。
+ */
+&hdmi {
+	compatible = "hisilicon,hi3798mv300-hdmi";
+	status = "okay";
+};
+
+&soc {
+	/*
+	 * CPU 供电：板上 buck 的反馈由 PMC6（0xf8a23018）的 PWM 微调，duty 越大电压越低。厂商 4.4 内核（device_volt_scale/mpu_get_volt）按 1250 mV − 2.5 mV × duty、period 220 换算，满量程 0.70–1.25 V，厂商 DT 给 PMC8（vdd-gpu）的也是这个量程。histb-regulator 把 regulator-min/max-microvolt 当作换算端点，所以这两个值是换算常数，不能用来收窄允许范围。厂商升压后等 10 ms 才升频（hi_device_scale），settling-time-up 复现这一点。非 dms 板（SC_GEN5[31:29] != 2，本机读得 0）上厂商只用 PMC6 给 CPU 调压；PMC7/PMC8 不在这里描述。
+	 */
+	vdd_cpu: regulator@8a23018 {
+		compatible = "hisilicon,hi3798cv200-regulator";
+		reg = <0x8a23018 0x4>;
+		regulator-name = "vdd-cpu";
+		regulator-min-microvolt = <700000>;
+		regulator-max-microvolt = <1250000>;
+		regulator-always-on;
+		regulator-boot-on;
+		regulator-settling-time-up-us = <10000>;
+	};
+
+	/*
+	 * PMC 温度传感器。厂商设备树描述它时没有 reg（其驱动把 0xf8a23000 写死）；窗口从 +0x28 的控制字开始，到 +0x30..+0x3c 的四个采样字为止，不覆盖 +0x18..+0x20 的 PMC6–PMC8 调压寄存器。
+	 */
+	tsensor: tsensor@8a23028 {
+		compatible = "hisilicon,hi3798mv200-tsensor";
+		reg = <0x8a23028 0x18>;
+		#thermal-sensor-cells = <0>;
+	};
+
+	/*
+	 * TRNG：厂商的 "v200" block（HiSTB SDK 的 drv_osal_hi3798mv300.h 在 0xf8005200 选用 CHIP_TRNG_VER_V200，没有时钟、复位或 CRG 条目）。在本板上该窗口在 0xf8005200 应答（CTRL 0xa、STAT 0x2000，每次读都给出新的数据字），而 0xf8005000 处的三个字读出为零。
+	 */
+	rng: rng@8005200 {
+		compatible = "hisilicon,hi3798mv300-rng", "hisilicon,hi3798cv200-rng";
+		reg = <0x8005200 0x100>;
+	};
+};
+
+/ {
+	/*
+	 * trip 温度与轮询周期同原厂设备树（95 与 105 degC passive，120 degC critical，滞回 5 degC，1 s / 100 ms）。两个 passive trip 都通过 operating point 给 CPU 降频；critical trip 触发有序关机，BL31 把其中的 PSCI SYSTEM_OFF 改成复位（patches/tf-a 的 SYSTEM_OFF 补丁，HISI_SYSTEM_OFF_RESETS），所以板子是重启而不是停机。
+	 */
+	thermal-zones {
+		soc-thermal {
+			polling-delay = <1000>;
+			polling-delay-passive = <100>;
+			thermal-sensors = <&tsensor>;
+
+			trips {
+				soc_alert0: soc-alert0 {
+					temperature = <95000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+
+				soc_alert1: soc-alert1 {
+					temperature = <105000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+
+				soc-crit {
+					temperature = <120000>;
+					hysteresis = <5000>;
+					type = "critical";
+				};
+			};
+
+			cooling-maps {
+				map0 {
+					trip = <&soc_alert0>;
+					cooling-device = <&{/cpus/cpu@0} THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+
+				map1 {
+					trip = <&soc_alert1>;
+					cooling-device = <&{/cpus/cpu@0} THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+	};
+};
+
+/*
+ * 模拟音频输出（机身 AV 口的左右声道）：AIAO 发送口 1 → 片内 TianLai V700 ADAC → 片内 lineout 驱动（charge pump）。
+ * 依据：厂商 SDK aiao_v1_1/ao/drv_ao_op.c:30-88（S28 平台 DAC0 = AIAO_PORT_TX1）与原厂 3.18 内核 SndOpGetPort；ADAC 寄存器是 PERICTRL 0x110/0x114（ADAC0/1）与 0x160/0x164（ADAC2/3），时钟 CRG69[0]、复位 CRG69[4]（hi3798mv200/hi_reg_peri.h、hi_reg_crg.h）；上电序列取原厂 CM201-2 内核走的 HI_ADAC_INTERNAL_AMP_SUPPORT 分支。原厂内核没有编入静音 GPIO（HI_SND_MUTECTL_SUPPORT），本板不挂 GPIO。
+ * 声卡只连 DAC：HDMI（发送口 2）待 HDMI 打通后在同一张卡里加 playback 链路。
+ */
+&perictrl {
+	adac: audio-codec@110 {
+		compatible = "hisilicon,hi3798mv300-adac";
+		reg = <0x110 0x8>, <0x160 0x8>;
+		clocks = <&crg HI3798MV200_ADAC_CLK>;
+		resets = <&crg 0x114 4>;
+		#sound-dai-cells = <0>;
+	};
+};
+
+&aiao {
+	status = "okay";
+};
+
+/ {
+	sound {
+		compatible = "hisilicon,hi3798mv200-aiao-card";
+		model = "CM201 AV";
+
+		/* <&aiao 2> 是 histb-aiao-i2s 的第三个 DAI（aiao-i2s-dac），在 S28 变体里落在发送口 1 */
+		dac-playback {
+			cpu {
+				sound-dai = <&aiao 2>;
+			};
+
+			codec {
+				sound-dai = <&adac>;
+			};
+		};
+	};
+};
+
+/*
+ * USB2 host。MV300 的 PHY 寄存器直接映射到内存地址空间（每个 8 位寄存器占一个 32 位字，端口 1 在 +0x400），不在 CV200 的 test port 后面。下面的绑定给驱动一个真实的逐端口 reg 用于 iomap；第二路父复位（0xbc 15）是厂商 dtsi 挂在从未 probe 过的 test bus 上的那一路。PHY 驱动会编程 MV300 额外的五个寄存器；不写它们时 EHCI 报 "port 2 reset error -110"。
+ */
+&usb2_phy1 {
+	compatible = "hisilicon,hi3798mv300-usb2-phy";
+	reg = <0x9865000 0x1000>;
+	resets = <&crg 0xbc 4>, <&crg 0xbc 15>;
+	ranges = <0x0 0x9865000 0x1000>;
+	#address-cells = <1>;
+	#size-cells = <1>;
+	status = "okay";
+};
+
+&usb2_phy1_port0 {
+	reg = <0x0 0x400>;
+};
+
+&usb2_phy1_port1 {
+	reg = <0x400 0x400>;
+};
+
+&ohci {
+	status = "okay";
+};
+
+&ehci {
+	status = "okay";
+};
+
+&gpio0 { status = "okay"; };
+&gpio1 { status = "okay"; };
+&gpio2 { status = "okay"; };
+&gpio3 { status = "okay"; };
+&gpio4 { status = "okay"; };
+&gpio5 { status = "okay"; };
+&gpio6 { status = "okay"; };
+&gpio7 { status = "okay"; };
+&gpio8 { status = "okay"; };
+&gpio9 { status = "okay"; };
+
+&wdg0 {
+	status = "okay";
+};
+
+/* CM201-2 的 FE PHY 挂在 MDIO 地址 2（U-Boot 打印 0x02）；mainline FEMAC 用地址 1 时 PHY ID 读 0、carrier 始终为 0，只有地址 2 能建立链路。 */
+&fephy {
+	reg = <2>;
+};
