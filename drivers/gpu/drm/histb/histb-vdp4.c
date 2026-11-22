@@ -1043,15 +1043,12 @@ static int histb_vdp4_probe(struct platform_device *pdev,
 	}
 
 	/*
-	 * Clear any latched status and mask every source before requesting the
-	 * line: a pending bit arriving on an unmasked line makes the core
-	 * disable the interrupt ("nobody cared"). drm_crtc_vblank_on() unmasks
-	 * VTTHD1 later.
+	 * 申请中断线之前清掉已锁存的状态并屏蔽全部中断源：未屏蔽的线上先到一个挂起位，内核会因“nobody cared”关掉这条中断。VOINTMSK 的位为 1 是放行（见 histb-vdp4-regs.h 里对这个名字的说明；原厂 VDP_DISP_SetIntMask 是把位或进去），所以屏蔽全部是写 0；vblank 源由 histb_vdp4_crtc_enable_vblank() 在需要时单独放行。
 	 */
 	vdp->irq = platform_get_irq_optional(pdev, 0);
 	if (vdp->irq >= 0) {
 		vo_write(vdp, VO_MSKINTSTA, ~0u);
-		vo_write(vdp, VO_INTMSK, ~0u);
+		vo_write(vdp, VO_INTMSK, 0);
 
 		ret = devm_request_irq(dev, vdp->irq, histb_vdp4_irq_handler,
 				       IRQF_SHARED, dev_name(dev), vdp);
