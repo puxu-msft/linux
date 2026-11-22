@@ -146,10 +146,33 @@ enum histb_vdp4_clk {
 /* regup + iop + fpga_lmt_width bit 3: the idle channel word. */
 #define MV310_DHD0_CTRL_DEFAULT		0x00008011
 
+struct histb_vdp4;
+
+/*
+ * 一种寄存器布局的全部硬件编程，由变体的 data 选定。DRM 对象、中断处理与设备生命周期各布局共用；上电顺序、像素钟来源与寄存器位置各布局不同。
+ */
+struct histb_vdp4_hw {
+	/* 打开时钟并让寄存器文件可访问；中断处理在它返回之后才会访问寄存器 */
+	int (*power_on)(struct histb_vdp4 *vdp);
+	/* power_on 的逆过程；调用前中断处理已停止访问寄存器 */
+	void (*power_off)(struct histb_vdp4 *vdp);
+	enum drm_mode_status (*mode_valid)(struct histb_vdp4 *vdp,
+					   const struct drm_display_mode *mode);
+	/* 像素钟、管线与通道时序，接口保持关闭，由 intf_set() 打开 */
+	void (*enable)(struct histb_vdp4 *vdp,
+		       const struct drm_display_mode *mode);
+	void (*g0_set)(struct histb_vdp4 *vdp, const struct drm_framebuffer *fb,
+		       struct drm_gem_dma_object *gem, bool enable, u8 alpha);
+	void (*intf_set)(struct histb_vdp4 *vdp, bool enable);
+	/* G0 取数宽高字段能表示的最大值 */
+	unsigned int fetch_max;
+};
+
 struct histb_vdp4 {
 	struct histb_vdp	base;
 	struct device		*dev;
 	void __iomem		*regs;
+	const struct histb_vdp4_hw	*hw;
 
 	struct clk_bulk_data	clks[HISTB_VDP4_CLK_NUM];
 
@@ -158,8 +181,8 @@ struct histb_vdp4 {
 	struct regmap		*crg;
 
 	int			irq;
-
-	struct histb_vdp4_display	*disp;	/* NULL unless the pipeline is bound */
+	/* 寄存器文件可访问；中断处理据此避开断电之后的访问 */
+	bool			powered;
 };
 
 /*
@@ -213,7 +236,7 @@ static inline struct histb_vdp4 *crtc_to_vdp(struct drm_crtc *crtc)
  * clock's .prepare, because with 1:2 the VDP register file cannot be reached
  * at all on this part.
  */
-static int histb_vdp4_set_pixclk(struct histb_vdp4 *vdp, unsigned int mode_khz)
+static int histb_vdp4_mv310_set_pixclk(struct histb_vdp4 *vdp, unsigned int mode_khz)
 {
 	unsigned long rate = (unsigned long)mode_khz * 1000;
 	struct clk *clk = vdp->clks[HISTB_VDP4_CLK_PIX].clk;
@@ -265,7 +288,7 @@ static u32 histb_vdp4_m1(u32 v)
  * carries format, geometry, address and stride, and G0_CTRL keeps only alpha,
  * update mode and enable.
  */
-static void histb_vdp4_g0_set(struct histb_vdp4 *vdp, const struct drm_framebuffer *fb,
+static void histb_vdp4_mv310_g0_set(struct histb_vdp4 *vdp, const struct drm_framebuffer *fb,
 			      struct drm_gem_dma_object *gem, bool enable, u8 alpha)
 {
 	u32 fmt, ctrl, last;
@@ -353,8 +376,8 @@ static void histb_vdp4_plane_atomic_update(struct drm_plane *plane,
 	if (!gem)
 		return;
 
-	histb_vdp4_g0_set(vdp, fb, gem, new_state->visible,
-			  new_state->alpha >> 8);
+	vdp->hw->g0_set(vdp, fb, gem, new_state->visible,
+			new_state->alpha >> 8);
 }
 
 static void histb_vdp4_plane_atomic_disable(struct drm_plane *plane,
@@ -362,12 +385,13 @@ static void histb_vdp4_plane_atomic_disable(struct drm_plane *plane,
 {
 	struct histb_vdp4 *vdp = plane_to_vdp(plane);
 
-	histb_vdp4_g0_set(vdp, NULL, NULL, false, 0);
+	vdp->hw->g0_set(vdp, NULL, NULL, false, 0);
 }
 
 static int histb_vdp4_plane_atomic_check(struct drm_plane *plane,
 				       struct drm_atomic_commit *state)
 {
+	struct histb_vdp4 *vdp = plane_to_vdp(plane);
 	struct drm_plane_state *new_state =
 		drm_atomic_get_new_plane_state(state, plane);
 	struct drm_crtc_state *crtc_state;
@@ -379,8 +403,9 @@ static int histb_vdp4_plane_atomic_check(struct drm_plane *plane,
 	if (new_state->fb->pitches[0] % 16)
 		return -EINVAL;
 
-	/* the fetch geometry words are 16-bit halves on this part */
-	if (new_state->fb->width > 0xffff || new_state->fb->height > 0xffff)
+	/* G0 取数宽高字段的位宽随布局而定 */
+	if (new_state->fb->width > vdp->hw->fetch_max ||
+	    new_state->fb->height > vdp->hw->fetch_max)
 		return -EINVAL;
 
 	if (!new_state->crtc)
@@ -442,7 +467,7 @@ static const struct drm_plane_funcs histb_vdp4_plane_funcs = {
  * The mv200 header's VOAXICTRL words at 0x30/0x34 do not exist on this part;
  * its VO_MUX at 0x100 is this part's VO_MUX at 0xc004.
  */
-static void histb_vdp4_pipeline_init(struct histb_vdp4 *vdp)
+static void histb_vdp4_mv310_pipeline_init(struct histb_vdp4 *vdp)
 {
 	u32 ctrl;
 
@@ -486,7 +511,7 @@ static void histb_vdp4_pipeline_init(struct histb_vdp4 *vdp)
  * The two words are DHD0_VTTHD (thd1/thd2) and DHD0_VTTHD3 (thd3/thd4); on this
  * part they sit at 0xc228 and 0xc224, the reverse of the mv200 header.
  */
-static void histb_vdp4_set_thresholds(struct histb_vdp4 *vdp, u32 total, u32 vfb,
+static void histb_vdp4_mv310_set_thresholds(struct histb_vdp4 *vdp, u32 total, u32 vfb,
 				      u32 vrefresh)
 {
 	u32 period = vrefresh ? 100000 / (vrefresh * 100) : 1;
@@ -522,7 +547,7 @@ static void histb_vdp4_set_thresholds(struct histb_vdp4 *vdp, u32 total, u32 vfb
  * its DATA_SEL/SYNC_INV do not describe this block: here the front porch and
  * the bottom field live in separate words.
  */
-static void histb_vdp4_crtc_setup_timing(struct histb_vdp4 *vdp,
+static void histb_vdp4_mv310_setup_timing(struct histb_vdp4 *vdp,
 				       const struct drm_display_mode *mode)
 {
 	u32 hbb = mode->htotal - mode->hsync_start;	/* sync + back porch */
@@ -555,7 +580,7 @@ static void histb_vdp4_crtc_setup_timing(struct histb_vdp4 *vdp,
 		 FIELD_PREP(DHD_PWR_HPW, histb_vdp4_m1(hpw)) |
 		 FIELD_PREP(DHD_PWR_VPW, histb_vdp4_m1(vpw)));
 
-	histb_vdp4_set_thresholds(vdp, mode->vtotal, vfb, drm_mode_vrefresh(mode));
+	histb_vdp4_mv310_set_thresholds(vdp, mode->vtotal, vfb, drm_mode_vrefresh(mode));
 
 	/* Latch the timing with the interface still off. */
 	vo_write(vdp, HD_CTRL, ctrl);
@@ -604,10 +629,10 @@ static void histb_vdp4_crtc_setup_timing(struct histb_vdp4 *vdp,
 
 }
 
-static enum drm_mode_status histb_vdp4_crtc_mode_valid(struct drm_crtc *crtc,
-						     const struct drm_display_mode *mode)
+static enum drm_mode_status
+histb_vdp4_mv310_mode_valid(struct histb_vdp4 *vdp,
+			    const struct drm_display_mode *mode)
 {
-	struct histb_vdp4 *vdp = crtc_to_vdp(crtc);
 	long rate;
 
 	/* G0/GP0 position and resolution fields are 12 bits wide */
@@ -658,6 +683,38 @@ static enum drm_mode_status histb_vdp4_crtc_mode_valid(struct drm_crtc *crtc,
 	return MODE_OK;
 }
 
+static void histb_vdp4_mv310_enable(struct histb_vdp4 *vdp,
+				    const struct drm_display_mode *mode)
+{
+	/* the channel clock is what the HDMI transmitter receives, too */
+	histb_vdp4_mv310_set_pixclk(vdp, mode->clock);
+
+	histb_vdp4_mv310_pipeline_init(vdp);
+
+	histb_vdp4_mv310_setup_timing(vdp, mode);
+}
+
+/*
+ * The channel word is written whole, never read-modify-written: these
+ * registers do not read back, so a read-modify-write would write a word made
+ * up of zeros plus the enable bit and clear iop, hdmi_mode and twochn_debug
+ * again.  Enabling follows VDP_DISP_SetIntfEnable; disabling keeps the
+ * vendor's idle channel word.
+ */
+static void histb_vdp4_mv310_intf_set(struct histb_vdp4 *vdp, bool enable)
+{
+	vo_write(vdp, HD_CTRL,
+		 MV310_DHD0_CTRL_DEFAULT | (enable ? DHD_CTRL_INTF_EN : 0));
+}
+
+static enum drm_mode_status histb_vdp4_crtc_mode_valid(struct drm_crtc *crtc,
+						     const struct drm_display_mode *mode)
+{
+	struct histb_vdp4 *vdp = crtc_to_vdp(crtc);
+
+	return vdp->hw->mode_valid(vdp, mode);
+}
+
 static void histb_vdp4_crtc_atomic_enable(struct drm_crtc *crtc,
 					struct drm_atomic_commit *state)
 {
@@ -668,19 +725,8 @@ static void histb_vdp4_crtc_atomic_enable(struct drm_crtc *crtc,
 	struct drm_gem_dma_object *gem;
 	struct drm_framebuffer *fb;
 
-	/* the channel clock is what the HDMI transmitter receives, too */
-	histb_vdp4_set_pixclk(vdp, mode->clock);
-
-	histb_vdp4_pipeline_init(vdp);
-
-	histb_vdp4_crtc_setup_timing(vdp, mode);
-
-	/*
-	 * The channel is enabled by histb_vdp4_crtc_setup_timing()'s control word:
-	 * these registers do not read back, so a second read-modify-write here would
-	 * write a word made up of zeros plus these two bits and clear iop, hdmi_mode
-	 * and twochn_debug again.
-	 */
+	/* 像素钟、管线与通道时序；接口在 G0 编程之后才打开 */
+	vdp->hw->enable(vdp, mode);
 
 	/*
 	 * commit_planes runs before modeset_enables, and G0 drops register
@@ -695,12 +741,12 @@ static void histb_vdp4_crtc_atomic_enable(struct drm_crtc *crtc,
 	if (fb) {
 		gem = drm_fb_dma_get_gem_obj(fb, 0);
 		if (gem)
-			histb_vdp4_g0_set(vdp, fb, gem, pstate->visible,
-					  pstate->alpha >> 8);
+			vdp->hw->g0_set(vdp, fb, gem, pstate->visible,
+					pstate->alpha >> 8);
 	}
 
-	/* G0 is latched; now start the interface, as VDP_DISP_SetIntfEnable. */
-	vo_write(vdp, HD_CTRL, MV310_DHD0_CTRL_DEFAULT | DHD_CTRL_INTF_EN);
+	/* G0 is latched; now start the interface. */
+	vdp->hw->intf_set(vdp, true);
 
 	drm_crtc_vblank_on(crtc);
 }
@@ -712,8 +758,7 @@ static void histb_vdp4_crtc_atomic_disable(struct drm_crtc *crtc,
 
 	drm_crtc_vblank_off(crtc);
 
-	/* Drop the interface enable, keep the vendor's idle channel word. */
-	vo_write(vdp, HD_CTRL, MV310_DHD0_CTRL_DEFAULT);
+	vdp->hw->intf_set(vdp, false);
 }
 
 static int histb_vdp4_crtc_enable_vblank(struct drm_crtc *crtc)
@@ -801,9 +846,19 @@ static const struct drm_crtc_funcs histb_vdp4_crtc_funcs = {
 static irqreturn_t histb_vdp4_irq_handler(int irq, void *data)
 {
 	struct histb_vdp4 *vdp = data;
-	struct histb_vdp4_display *disp = READ_ONCE(vdp->disp);
-	u32 sta = vo_read(vdp, VO_MSKINTSTA);
+	/*
+	 * 显示对象用 core 维护的 base.disp：bind 出错与 unbind 时 core 会把它清成 NULL，本驱动原先自存的指针从不清空，解绑后被调到会碰已释放的 CRTC。
+	 */
+	struct histb_vdp_display *disp = READ_ONCE(vdp->base.disp);
+	u32 sta;
 
+	/*
+	 * 中断线是共享申请的：断电（复位按住、配置时钟关闭）之后被调到时不能碰寄存器文件，那样的访问会挂住总线。
+	 */
+	if (!READ_ONCE(vdp->powered))
+		return IRQ_NONE;
+
+	sta = vo_read(vdp, VO_MSKINTSTA);
 	if (!sta)
 		return IRQ_NONE;
 
@@ -829,7 +884,7 @@ static irqreturn_t histb_vdp4_irq_handler(int irq, void *data)
 
 	/* the line stays requested across an aggregate unbind, no CRTC then */
 	if (disp && (sta & HD_INT_VBLANK))
-		drm_crtc_handle_vblank(&disp->base.crtc);
+		drm_crtc_handle_vblank(&disp->crtc);
 	return IRQ_HANDLED;
 }
 
@@ -862,7 +917,7 @@ static const struct drm_mode_config_funcs histb_vdp4_mode_config_funcs = {
  * runs with the HD domain clocked; the channel control readback at the end is the
  * first live access of the register file and it has to answer.
  */
-static int histb_vdp4_reset_release(struct histb_vdp4 *vdp)
+static int histb_vdp4_mv310_reset_release(struct histb_vdp4 *vdp)
 {
 	int ret;
 
@@ -903,24 +958,19 @@ static int histb_vdp4_reset_release(struct histb_vdp4 *vdp)
 	return 0;
 }
 
-static int histb_vdp4_runtime_suspend(struct device *dev)
+static void histb_vdp4_mv310_power_off(struct histb_vdp4 *vdp)
 {
-	struct histb_vdp4 *vdp = dev_get_drvdata(dev);
-
 	/*
-	 * Both reset requests stay as histb_vdp4_reset_release() left them:
+	 * Both reset requests stay as histb_vdp4_mv310_reset_release() left them:
 	 * putting either back would leave a block held in reset while the
 	 * transmitter still keeps the pixel clock running, and that is the
 	 * combination that locks the bus.
 	 */
 	clk_bulk_disable_unprepare(HISTB_VDP4_CLK_NUM, vdp->clks);
-
-	return 0;
 }
 
-static int histb_vdp4_runtime_resume(struct device *dev)
+static int histb_vdp4_mv310_power_on(struct histb_vdp4 *vdp)
 {
-	struct histb_vdp4 *vdp = dev_get_drvdata(dev);
 	int ret;
 
 	/*
@@ -936,9 +986,36 @@ static int histb_vdp4_runtime_resume(struct device *dev)
 	if (ret)
 		return ret;
 
-	ret = histb_vdp4_reset_release(vdp);
+	ret = histb_vdp4_mv310_reset_release(vdp);
 	if (ret)
 		return ret;
+
+	return 0;
+}
+
+static int histb_vdp4_runtime_suspend(struct device *dev)
+{
+	struct histb_vdp4 *vdp = dev_get_drvdata(dev);
+
+	WRITE_ONCE(vdp->powered, false);
+	if (vdp->irq > 0)
+		synchronize_irq(vdp->irq);
+
+	vdp->hw->power_off(vdp);
+
+	return 0;
+}
+
+static int histb_vdp4_runtime_resume(struct device *dev)
+{
+	struct histb_vdp4 *vdp = dev_get_drvdata(dev);
+	int ret;
+
+	ret = vdp->hw->power_on(vdp);
+	if (ret)
+		return ret;
+
+	WRITE_ONCE(vdp->powered, true);
 
 	return 0;
 }
@@ -955,6 +1032,7 @@ static int histb_vdp4_probe(struct platform_device *pdev,
 		return -ENOMEM;
 
 	vdp->dev = dev;
+	vdp->hw = variant->data;
 	vdp->base.dev = dev;
 	vdp->base.variant = variant;
 	platform_set_drvdata(pdev, &vdp->base);
@@ -964,7 +1042,7 @@ static int histb_vdp4_probe(struct platform_device *pdev,
 		return dev_err_probe(dev, PTR_ERR(vdp->regs), "ioremap failed\n");
 
 	/*
-	 * "pix" is the HD channel pixel clock that histb_vdp4_set_pixclk()
+	 * "pix" is the HD channel pixel clock that histb_vdp4_mv310_set_pixclk()
 	 * programs through the display PLL and CRG54's select and divider; "bus"
 	 * and "sdate" are the two CRG54 gates the channel runs through.  The VOU
 	 * reset request only shifts while the block is clocked, so all three are
@@ -982,7 +1060,7 @@ static int histb_vdp4_probe(struct platform_device *pdev,
 	/*
 	 * Two requests and one clock-generator field have to be in their running
 	 * state before the register file is touched, and the order is a hardware
-	 * constraint, not taste: histb_vdp4_reset_release() records what the
+	 * constraint, not taste: histb_vdp4_mv310_reset_release() records what the
 	 * board shows.  The VOU request is not a reset_control because the CRG
 	 * offers no way to say that its bit means the opposite of what the reset
 	 * framework's assert does, and getting that wrong on a clocked block
@@ -1080,7 +1158,6 @@ static int histb_vdp4_display_init(struct histb_vdp_display *base)
 	struct histb_vdp4 *vdp = (struct histb_vdp4 *)base->vdp;
 
 	disp->vdp = vdp;
-	WRITE_ONCE(vdp->disp, disp);
 
 	return 0;
 }
@@ -1091,8 +1168,20 @@ static const struct histb_vdp_ops histb_vdp4_ops = {
 	.display_init		= histb_vdp4_display_init,
 };
 
+/* 照 MV310 寄存器布局写的硬件编程（VDPVERSION 0x20170929 那颗芯片） */
+static const struct histb_vdp4_hw histb_vdp4_mv310_hw = {
+	.power_on	= histb_vdp4_mv310_power_on,
+	.power_off	= histb_vdp4_mv310_power_off,
+	.mode_valid	= histb_vdp4_mv310_mode_valid,
+	.enable		= histb_vdp4_mv310_enable,
+	.g0_set		= histb_vdp4_mv310_g0_set,
+	.intf_set	= histb_vdp4_mv310_intf_set,
+	.fetch_max	= 0xffff,	/* the fetch geometry words are 16-bit halves */
+};
+
 const struct histb_vdp_variant histb_vdp4_mv200_variant = {
 	.ops			= &histb_vdp4_ops,
+	.data			= &histb_vdp4_mv310_hw,
 	.probe			= histb_vdp4_probe,
 	.remove			= histb_vdp4_remove,
 	.display_size		= sizeof(struct histb_vdp4_display),
