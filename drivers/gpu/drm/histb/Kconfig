@@ -17,6 +17,8 @@ config DRM_HISTB_VDP
 	  transmitter selected through the device tree of_graph port@0 endpoint;
 	  the v2 engine also exposes its write-back taps.
 
+	  同属 v4 引擎的 hi3798mv300 以自己的寄存器布局、上电顺序与像素钟编程作为一个变体支持。
+
 	  If in doubt, say N.
 
 config DRM_HISTB_HDMI

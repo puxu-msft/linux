@@ -383,6 +383,11 @@ static const struct of_device_id histb_vdp_of_match[] = {
 	  .data = &histb_vdp2_cv200_variant },
 	{ .compatible = "hisilicon,hi3798mv200-vdp",
 	  .data = &histb_vdp4_mv200_variant },
+	/*
+	 * Hi3798MV300 的 VDP 与上面同属 v4 引擎，但寄存器布局、上电顺序与像素钟来源不同，见 histb-vdp4.c 的 Hi3798MV300 一节。
+	 */
+	{ .compatible = "hisilicon,hi3798mv300-vdp",
+	  .data = &histb_vdp4_mv300_variant },
 	{ }
 };
 MODULE_DEVICE_TABLE(of, histb_vdp_of_match);

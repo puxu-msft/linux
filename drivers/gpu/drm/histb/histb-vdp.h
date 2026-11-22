@@ -103,5 +103,6 @@ struct histb_vdp {
 extern const struct histb_vdp_variant histb_vdp2_mv100_variant;
 extern const struct histb_vdp_variant histb_vdp2_cv200_variant;
 extern const struct histb_vdp_variant histb_vdp4_mv200_variant;
+extern const struct histb_vdp_variant histb_vdp4_mv300_variant;
 
 #endif /* __HISTB_VDP_H__ */

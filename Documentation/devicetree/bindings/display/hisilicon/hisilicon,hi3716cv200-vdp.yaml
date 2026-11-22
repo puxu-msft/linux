@@ -21,12 +21,15 @@ description: |
   is the GP0 zoom engine, where cv200 keeps both horizontal offsets in a single
   register and takes both ratios in 4.12 fixed point.
 
+  hi3798mv300 的 v4 引擎与 hi3798mv200 节点的时钟、复位与 hisilicon,crg 描述相同，但寄存器布局、上电顺序与像素钟编程不同，驱动按兼容串区分。
+
 properties:
   compatible:
     enum:
       - hisilicon,hi3716cv200-vdp
       - hisilicon,hi3798mv100-vdp
       - hisilicon,hi3798mv200-vdp
+      - hisilicon,hi3798mv300-vdp
 
   reg:
     maxItems: 1
@@ -115,7 +118,9 @@ allOf:
       properties:
         compatible:
           contains:
-            const: hisilicon,hi3798mv200-vdp
+            enum:
+              - hisilicon,hi3798mv200-vdp
+              - hisilicon,hi3798mv300-vdp
     then:
       properties:
         clocks:
