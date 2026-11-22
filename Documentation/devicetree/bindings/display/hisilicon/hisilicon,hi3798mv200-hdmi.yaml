@@ -16,9 +16,13 @@ description: |
   and the analog PHY, and it needs two divider fields and the resets of the
   SoC clock generator, which is why it also refers to that block.
 
+  hi3798mv300 的发送器与 hi3798mv200 节点的寄存器窗口、时钟、复位与 hisilicon,crg 描述相同，但 PHY 的分频、驱动与展频参数和复位方式不同，驱动按兼容串区分。
+
 properties:
   compatible:
-    const: hisilicon,hi3798mv200-hdmi
+    enum:
+      - hisilicon,hi3798mv200-hdmi
+      - hisilicon,hi3798mv300-hdmi
 
   reg:
     minItems: 2

@@ -11,6 +11,8 @@
  * The transmitter is two register windows -- the digital blocks and the PHY --
  * plus two divider fields and the resets inside the SoC clock generator, which
  * this driver reaches through that node's syscon regmap.
+ *
+ * Hi3798MV300（hisilicon,hi3798mv300-hdmi）是同一个发送器，PHY 与发送器的编程照本机实际运行的 fastboot（fastboot-hi3798mv3dmw-64.bin，与原厂 3.18 内核同一套 HDMI 代码、表的版本更新）对 MV300（芯片号 5）走的分支：分频表、驱动电流/终端表与展频表都是它的，见“Hi3798MV300 变体”一节；两种芯片经 struct histb_hdmi_variant 分派。
  */
 
 #include <linux/array_size.h>
@@ -27,6 +29,7 @@
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
+#include <linux/property.h>
 #include <linux/regmap.h>
 #include <linux/reset.h>
 
@@ -90,6 +93,9 @@
 #define   FDET_ACTIVE			GENMASK(12, 0)
 #define   FDET_TOTAL			GENMASK(25, 13)
 
+#define  DMUX_Y_SEL		GENMASK(2, 0)
+#define  DMUX_CB_SEL		GENMASK(5, 3)
+#define  DMUX_CR_SEL		GENMASK(8, 6)
 #define  DMUX_SYNCMASK_EN	GENMASK(24, 21)
 #define  DMUX_INVER_SYNC	GENMASK(28, 25)
 #define  DMUX_INVER_V		BIT(0)
@@ -108,8 +114,17 @@
 #define PACK_FIFO_CTRL		0x1800
 #define  PACK_FIFO_AUTO_RST_EN	BIT(2)
 #define  PACK_FIFO_CK_DET_EN	BIT(4)
+#define  PACK_FIFO_DELAY_CNT	GENMASK(15, 8)
+/* 原厂只写 tmds_pack_mode [1:0]，其余字段是复位值：fastboot 出图时读到 0x7f14 */
+#define  PACK_FIFO_DELAY_RESET	0x7f
+#define PACK_FIFO_ST		0x1804
+#define  PACK_FIFO_PCLK2TCLK_STABLE	BIT(0)
 /* R->Cr, G->Y, B->Cb puts native RGB lanes on the three TMDS channels. */
 #define  DMUX_NATIVE_RGB	0x11
+/* 原厂 HAL_HDMI_CtrlVideoPathSet 对 4:4:4 输入（RGB 与 YCbCr 都一样）写的直通映射 */
+#define  DMUX_IDENTITY		(FIELD_PREP_CONST(DMUX_Y_SEL, 0) | \
+				 FIELD_PREP_CONST(DMUX_CB_SEL, 1) | \
+				 FIELD_PREP_CONST(DMUX_CR_SEL, 2))
 #define AVI_PACKET		0x1818
 #define AVI_PACKET_CFG		0x19a4
 #define HDMI_VS_PACKET		0x1980
@@ -117,9 +132,13 @@
 #define  PACKET_CFG_DISABLE	0
 #define  PACKET_CFG_ENABLE	3
 #define AVMUTE_CTRL		0x1a0c
+#define  AVMUTE_SET		BIT(0)
+#define  AVMUTE_CLR		BIT(1)
 #define AVMIXER_CONFIG		0x1a08
 #define  AVMIX_HDMI_MODE	BIT(0)
 #define  AVMIX_NULL_PKT_EN	BIT(2)
+/* bit8 原厂没有访问器、从不改写，fastboot 出图时为 1，是复位值；字段含义未知 */
+#define  AVMIX_RESET_BIT8	BIT(8)
 
 #define HDMI_ENC_CTRL		0x1a60
 #define  ENC_HDMI2_ON		BIT(0)
@@ -134,6 +153,9 @@
  * (PHY_TOP_PD 0x0830 out of a reset value of 0x17ffff), with the de-emphasis,
  * BIST and termination bits left as that system leaves them.
  */
+#define PHY_DPHY_RST		0x0010
+#define  DPHY_SRST_REQ		BIT(0)
+
 #define PHY_AFIFO_DATA_SEL	0x0050
 #define  AFIFO_DATA_CLK_H	GENMASK(18, 9)
 
@@ -157,6 +179,38 @@
 #define  PHY_PD_RXSENSE		PHY_GC_PD_RXSENSE
 #define  PHY_PD_TXPLL		PHY_GC_TXPLL_PD
 
+/*
+ * 驱动电流、预加重、终端与测试字（原厂 HDMI_APHY_DRIVER_*、RTERM_CTRL、TEST_CTRL 访问器的位段），每路一个字段：clk 与三条数据通道。
+ */
+#define PHY_DRIVER_IMAIN	0x0068
+#define  IMAIN_CLK		GENMASK(5, 0)
+#define  IMAIN_D0		GENMASK(11, 6)
+#define  IMAIN_D1		GENMASK(17, 12)
+#define  IMAIN_D2		GENMASK(23, 18)
+#define  IMAIN_DE_CLK		GENMASK(29, 24)
+#define PHY_DRIVER_IPRE		0x006c
+#define  IPRE_DE_D0		GENMASK(5, 0)
+#define  IPRE_DE_D1		GENMASK(11, 6)
+#define  IPRE_DE_D2		GENMASK(17, 12)
+#define PHY_DRIVER_RPRE		0x0074
+#define  RPRE_CLK		GENMASK(8, 6)
+#define  RPRE_D0		GENMASK(11, 9)
+#define  RPRE_D1		GENMASK(14, 12)
+#define  RPRE_D2		GENMASK(17, 15)
+#define  RPRE_FLAG		BIT(2)	/* 每个 rsel_pre 字段的最高位，原厂表单列一个开关 */
+#define PHY_RTERM_CTRL		0x0078
+#define  RT_CLK			GENMASK(7, 0)
+#define  RT_D0			GENMASK(15, 8)
+#define  RT_D1			GENMASK(23, 16)
+#define  RT_D2			GENMASK(31, 24)
+#define PHY_TEST_CTRL		0x0080
+#define  TEST_REG		GENMASK(15, 0)
+#define PHY_TXPLL_CTRL		0x008c
+#define  TXPLL_EN_SSCDIV	BIT(19)
+#define PHY_TXPLL_TEST		0x0090
+#define  TXPLL_TEST		GENMASK(19, 0)
+#define  TXPLL_TEST_SSC		0x30000	/* 原厂展频打开时写的值 */
+
 #define PHY_PLL_LOCK_STATUS	0x0098
 #define  PHY_CLK_FB_EXIST	BIT(0)
 #define  PHY_CLK_LOCK		BIT(20)
@@ -170,6 +224,10 @@
  * vendor names it after 25. Every 24-bit row of its table uses this one.
  */
 #define  FBSSC_LOOP_DIV_25	0x640000
+
+#define PHY_FBSSC_STEP		0x00b8
+#define  FBSSC_STEP		GENMASK(9, 0)
+#define  FBSSC_SPAN		GENMASK(23, 10)
 
 /*
  * Clock generator fields this device programs. Both hold a divider minus one.
@@ -191,6 +249,7 @@
  * @clk_l: per-lane pattern for the AFIFO data clock, low 30 bits
  * @clk_h: the same pattern's tenth bit of each lane, in the select register
  * @hdmi2: run the encoder in HDMI 2.0 timing
+ * @ref_mul: MV300 展频计算用的参考倍数（原厂分频表第 4 列，16/8/4/2/1），mv200 的行不用
  *
  * The rows are the vendor's, unchanged: the same fields for the same pixel
  * clock bands. The 200001 kHz row is the one a board was found using at
@@ -207,6 +266,7 @@ struct histb_hdmi_phy_cfg {
 	u32 clk_l;
 	u32 clk_h;
 	bool hdmi2;
+	u8 ref_mul;
 };
 
 /*
@@ -237,6 +297,80 @@ static const struct histb_hdmi_phy_cfg histb_hdmi_phy_cfgs[] = {
 	{     25000, 9, 0, 0, PHY_RATIO_1_10_L, 0x1f, false, },
 	{    200001, 9, 0, 0, PHY_RATIO_1_10_L, 0x1f, false, },
 	{    340001, 4, 0, 0, PHY_RATIO_1_40_L, 0x00, true,  },
+};
+
+/*
+ * Hi3798MV300 的行：原厂 PhyDivCfgGet 表的 24 位色行（fastboot VA 0xcc47e4，与原厂 3.18 内核 0xc1370800 的表逐字相同），列依次是 ssc_clk_div、tmds_clk_div（都已减一）、插值码、AFIFO 图样、HDMI 2.0、参考倍数。插值码与 tmds_clk_div 成对：PHY 插值 2^divsel 倍，CRG68 就分 2^divsel，把 VCO 留在同一区间。1080p60 落在 100001 行：CRG68[8:6] = 1、PHY_TOP_PD 插值码 1，fastboot 出图时读到的正是这两个值（captures/20261122-hdmi/A-fastboot.txt 的 0xf8a22110 = 0x41、0xf8d30064 = 0x00200830）；按 mv200 行写成 0/0 时 ACR 实测 CTS 翻倍、PACK_FIFO_ST 报 pclk 到 tclk 不稳，显示器无信号（同目录 B-driver-1080p.txt）。
+ */
+static const struct histb_hdmi_phy_cfg histb_hdmi_mv300_phy_cfgs[] = {
+	{     25000, 9, 7, 3, PHY_RATIO_1_10_L, 0x1f, false, 16 },
+	{     50001, 9, 3, 2, PHY_RATIO_1_10_L, 0x1f, false,  8 },
+	{    100001, 9, 1, 1, PHY_RATIO_1_10_L, 0x1f, false,  4 },
+	{    200001, 9, 0, 0, PHY_RATIO_1_10_L, 0x1f, false,  2 },
+	{    340001, 4, 0, 0, PHY_RATIO_1_40_L, 0x00, true,   1 },
+};
+
+/**
+ * struct histb_hdmi_mv300_drive - 一个 TMDS 时钟区间的驱动电流、预加重与终端
+ * @min_khz: 本行起始的 TMDS 时钟，kHz
+ * @de_clk: 时钟通道去加重电流（原厂电流码，写寄存器前经 histb_hdmi_mv300_cur() 换算）
+ * @de_data: 三条数据通道的去加重电流
+ * @main_clk: 时钟通道主驱动电流
+ * @main_data: 数据通道主驱动电流
+ * @pre_clk: 时钟通道 rsel_pre 的最高位
+ * @pre_data: 数据通道 rsel_pre 的最高位
+ * @rsel_clk: 时钟通道预加重电阻码
+ * @rsel_data: 数据通道预加重电阻码
+ * @rterm_mode_clk: 时钟通道终端模式 0–3，决定 PHY_TOP_PD 里该通道的两位终端关断
+ * @rterm_mode_data: 数据通道终端模式
+ * @rt_clk: 时钟通道终端电阻码
+ * @rt_data: 数据通道终端电阻码
+ * @test: PHY 测试字
+ *
+ * 原厂 MV300 表（fastboot VA 0xcc4cc8，PhySpecSet 对芯片号 5 选这张）每行给四条通道各一列，三条数据通道在每行都相等，所以这里合成一列。
+ */
+struct histb_hdmi_mv300_drive {
+	unsigned int min_khz;
+	u8 de_clk, de_data;
+	u8 main_clk, main_data;
+	bool pre_clk, pre_data;
+	u8 rsel_clk, rsel_data;
+	u8 rterm_mode_clk, rterm_mode_data;
+	u8 rt_clk, rt_data;
+	u16 test;
+};
+
+static const struct histb_hdmi_mv300_drive histb_hdmi_mv300_drives[] = {
+	{  25000, 0, 0, 0x16, 0x1c, false, false, 1, 1, 2, 3, 0x60, 0x20, 0x51 },
+	{ 100001, 0, 3, 0x16, 0x1d, false, false, 0, 0, 2, 3, 0x60, 0x20, 0x51 },
+	{ 165001, 0, 2, 0x16, 0x1d, false, true,  2, 2, 2, 3, 0x60, 0x10, 0x51 },
+	{ 340001, 0, 2, 0x16, 0x25, false, false, 1, 1, 2, 2, 0x60, 0x80, 0x51 },
+};
+
+/**
+ * struct histb_hdmi_mv300_ssc - 一个 TMDS 时钟区间的展频参数
+ * @min_khz: 本行起始的 TMDS 时钟，kHz
+ * @amp: 展频幅度，单位 0.001 %（步长 × 跨度 ≈ 环路分频 × amp / 100000）
+ * @freq_hz: 调制频率
+ *
+ * 原厂 MV300 表（fastboot VA 0xcc5028）。fastboot 出图时展频是开着的（A-fastboot.txt：FBSSC_SET bit27、TXPLL_CTRL bit19、TXPLL_TEST 0x30000，FBSSC_STEP 0x52813 即步长 19、跨度 330），这里照它打开；幅度为 0 的行仍进展频模式，只是步长与跨度为 0。
+ */
+struct histb_hdmi_mv300_ssc {
+	unsigned int min_khz;
+	u16 amp;
+	u16 freq_hz;
+};
+
+static const struct histb_hdmi_mv300_ssc histb_hdmi_mv300_sscs[] = {
+	{  25000,   0,     0 },
+	{  70001, 150, 45000 },
+	{  90001,  70, 45000 },
+	{ 110001,  50, 45000 },
+	{ 145001, 100, 45000 },
+	{ 180001,  40, 45000 },
+	{ 220001,  40, 45000 },
+	{ 250001,  40, 45000 },
+	{ 300001,   0,     0 },
 };
 
 /*
@@ -318,7 +452,37 @@ struct histb_hdmi_ddc {
 
 #define HISTB_HDMI_MAX_KHZ	600000
 
+struct histb_hdmi;
+
+/**
+ * struct histb_hdmi_variant - 芯片之间不同的编程
+ * @phy_cfgs: 按像素时钟分段的 PHY/CRG 分频表，升序
+ * @num_phy_cfgs: @phy_cfgs 的行数
+ * @set_phy: 按 @phy_cfgs 的一行与模式时钟（kHz）配置 PHY 并等锁定，通道驱动保持关闭
+ * @phy_drive_on: 视频通路配好之后打开 TMDS 通道驱动
+ * @vmux: VIDEO_DMUX_CTRL，4:4:4 输入
+ * @pack_fifo: PACK_FIFO_CTRL
+ * @avmixer: AVMIXER_CONFIG
+ * @avmute: AVMUTE_CTRL（General Control 包的 Set/Clear_AVMUTE）
+ * @pwd_running: 出图期间 TX_PWD_RST_CTRL 保持置位的复位请求
+ * @product: drm_bridge 的产品名
+ */
+struct histb_hdmi_variant {
+	const struct histb_hdmi_phy_cfg *phy_cfgs;
+	unsigned int num_phy_cfgs;
+	int (*set_phy)(struct histb_hdmi *hdmi,
+		       const struct histb_hdmi_phy_cfg *cfg, unsigned int khz);
+	void (*phy_drive_on)(struct histb_hdmi *hdmi, unsigned int khz);
+	u32 vmux;
+	u32 pack_fifo;
+	u32 avmixer;
+	u32 avmute;
+	u32 pwd_running;
+	const char *product;
+};
+
 struct histb_hdmi {
+	const struct histb_hdmi_variant *variant;
 	struct device *dev;
 	void __iomem *regs;
 	void __iomem *phy;
@@ -356,14 +520,16 @@ static void histb_hdmi_phy_write(struct histb_hdmi *hdmi, u32 offset, u32 val)
 	writel_relaxed(val, hdmi->phy + offset);
 }
 
-static const struct histb_hdmi_phy_cfg *histb_hdmi_phy_cfg(u32 khz)
+static const struct histb_hdmi_phy_cfg *
+histb_hdmi_phy_cfg(const struct histb_hdmi *hdmi, u32 khz)
 {
+	const struct histb_hdmi_variant *variant = hdmi->variant;
 	const struct histb_hdmi_phy_cfg *best = NULL;
 	unsigned int i;
 
-	for (i = 0; i < ARRAY_SIZE(histb_hdmi_phy_cfgs); i++)
-		if (khz >= histb_hdmi_phy_cfgs[i].min_khz)
-			best = &histb_hdmi_phy_cfgs[i];
+	for (i = 0; i < variant->num_phy_cfgs; i++)
+		if (khz >= variant->phy_cfgs[i].min_khz)
+			best = &variant->phy_cfgs[i];
 
 	return best;
 }
@@ -380,7 +546,8 @@ static const struct histb_hdmi_phy_cfg *histb_hdmi_phy_cfg(u32 khz)
  * derives yet.
  */
 static int histb_hdmi_set_phy(struct histb_hdmi *hdmi,
-			       const struct histb_hdmi_phy_cfg *cfg)
+			       const struct histb_hdmi_phy_cfg *cfg,
+			       unsigned int khz)
 {
 	u32 val;
 	int ret;
@@ -441,6 +608,237 @@ static int histb_hdmi_set_phy(struct histb_hdmi *hdmi,
 					  (val & PHY_CLK_FB_EXIST), 100, 20000);
 }
 
+/* Drive the pins last: from here a sink can find a clock. */
+static void histb_hdmi_phy_drive_on(struct histb_hdmi *hdmi, unsigned int khz)
+{
+	histb_hdmi_phy_write(hdmi, PHY_TOP_PD,
+			     histb_hdmi_phy_read(hdmi, PHY_TOP_PD) & ~PHY_GC_PD);
+}
+
+/* ------------------------------------------------------------------ */
+/* Hi3798MV300 变体                                                    */
+/* ------------------------------------------------------------------ */
+
+/*
+ * 依据是本机 p1 上实际运行的 fastboot（firmware/histb/TTL-mv300-64/fastboot-hi3798mv3dmw-64.bin，A32，VA = 文件偏移 + 0xc00000）的 HDMI PHY 代码，函数按与原厂 3.18 内核（有符号）逐条对照认出：HAL_HDMI_PhyTmdsSet @0xc6c15c、HAL_HDMI_PhySpecSet @0xc6b5c4、HAL_HDMI_PhySscSet @0xc6bd58、HAL_HDMI_PhyPowerSet @0xc6b14c、HAL_HDMI_PhyOeSet @0xc6b208、DRV_HDMI_ProdCrgDivSet @0xc70244、DRV_HDMI_ProdChipGet @0xc6fb24（Hi3798M + 版本 0x300 → 芯片号 5）。与 mv200 路径的差别：分频按原厂表成对设插值与 CRG68 分频；PHY 复位用 PHY 窗口里的 DPHY_RST，不脉冲 CRG68 bit4（原厂只对芯片号 3 即 MV200 脉冲后者，它会把模拟 PHY 的驱动与终端寄存器清回复位值）；写驱动电流、预加重、终端与测试字；打开展频。
+ */
+
+/* 原厂 PhyTransferCur2Hex：电流码到寄存器码 */
+static u32 histb_hdmi_mv300_cur(u8 cur)
+{
+	if (cur <= 15)
+		return cur;
+	if (cur <= 27)
+		return cur + 4;
+	if (cur <= 31)
+		return cur + 16;
+	if (cur <= 43)
+		return cur + 20;
+	return 0;
+}
+
+static const struct histb_hdmi_mv300_drive *histb_hdmi_mv300_drive(unsigned int khz)
+{
+	const struct histb_hdmi_mv300_drive *best = NULL;
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(histb_hdmi_mv300_drives); i++)
+		if (khz >= histb_hdmi_mv300_drives[i].min_khz)
+			best = &histb_hdmi_mv300_drives[i];
+
+	return best;
+}
+
+static const struct histb_hdmi_mv300_ssc *histb_hdmi_mv300_ssc(unsigned int khz)
+{
+	const struct histb_hdmi_mv300_ssc *best = NULL;
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(histb_hdmi_mv300_sscs); i++)
+		if (khz >= histb_hdmi_mv300_sscs[i].min_khz)
+			best = &histb_hdmi_mv300_sscs[i];
+
+	return best;
+}
+
+static void histb_hdmi_phy_rmw(struct histb_hdmi *hdmi, u32 offset, u32 mask,
+			       u32 val)
+{
+	histb_hdmi_phy_write(hdmi, offset,
+			     (histb_hdmi_phy_read(hdmi, offset) & ~mask) | val);
+}
+
+/*
+ * 原厂 PhySscSet 的打开分支：参考频率 = 像素时钟 × 参考倍数 ÷ (ssc_clk_div + 1)，跨度 = 参考频率 ÷ 调制频率 ÷ 4，步长 = 幅度 × (环路分频 ÷ 100) × (调制频率 ÷ 1000) ÷ (参考频率 ÷ 4)，整数运算的次序照原厂。1080p60：参考 59.4 MHz，跨度 330、步长 19。
+ */
+static void histb_hdmi_mv300_set_ssc(struct histb_hdmi *hdmi,
+				     const struct histb_hdmi_phy_cfg *cfg,
+				     unsigned int khz)
+{
+	const struct histb_hdmi_mv300_ssc *ssc = histb_hdmi_mv300_ssc(khz);
+	u32 ref = (u32)div_u64((u64)khz * cfg->ref_mul * 1000, cfg->ssc_div + 1);
+	u32 step = 0, span = 0;
+
+	if (ssc && ssc->freq_hz && ref >= 4) {
+		span = ref / ssc->freq_hz / 4;
+		step = (u32)div_u64((u64)ssc->amp * (FBSSC_LOOP_DIV_25 / 100) *
+				    (ssc->freq_hz / 1000), ref / 4);
+	}
+
+	histb_hdmi_phy_rmw(hdmi, PHY_FBSSC_STEP, FBSSC_STEP | FBSSC_SPAN,
+			   FIELD_PREP(FBSSC_STEP, step) |
+			   FIELD_PREP(FBSSC_SPAN, span));
+	histb_hdmi_phy_rmw(hdmi, PHY_FBSSC_SET, FBSSC_SSC_MODE | FBSSC_SET_LOAD,
+			   FBSSC_SSC_MODE);
+	histb_hdmi_phy_rmw(hdmi, PHY_FBSSC_SET, FBSSC_SET_LOAD, FBSSC_SET_LOAD);
+	histb_hdmi_phy_rmw(hdmi, PHY_FBSSC_SET, FBSSC_SET_LOAD, 0);
+	histb_hdmi_phy_rmw(hdmi, PHY_TXPLL_TEST, TXPLL_TEST, TXPLL_TEST_SSC);
+	histb_hdmi_phy_rmw(hdmi, PHY_TXPLL_CTRL, TXPLL_EN_SSCDIV, TXPLL_EN_SSCDIV);
+}
+
+/* 原厂 PhySpecSet 的芯片号 5 分支（PhyHWEnhanceSpecSet）；表按 TMDS 时钟查，24 位色下即像素时钟 */
+static void histb_hdmi_mv300_set_drive(struct histb_hdmi *hdmi,
+				       const struct histb_hdmi_mv300_drive *drv)
+{
+	u32 main_d = histb_hdmi_mv300_cur(drv->main_data);
+	u32 de_d = histb_hdmi_mv300_cur(drv->de_data);
+	u32 rsel_d = drv->rsel_data | (drv->pre_data ? RPRE_FLAG : 0);
+
+	histb_hdmi_phy_rmw(hdmi, PHY_DRIVER_IMAIN,
+			   IMAIN_CLK | IMAIN_D0 | IMAIN_D1 | IMAIN_D2 | IMAIN_DE_CLK,
+			   FIELD_PREP(IMAIN_CLK, histb_hdmi_mv300_cur(drv->main_clk)) |
+			   FIELD_PREP(IMAIN_D0, main_d) |
+			   FIELD_PREP(IMAIN_D1, main_d) |
+			   FIELD_PREP(IMAIN_D2, main_d) |
+			   FIELD_PREP(IMAIN_DE_CLK, histb_hdmi_mv300_cur(drv->de_clk)));
+	histb_hdmi_phy_rmw(hdmi, PHY_DRIVER_IPRE,
+			   IPRE_DE_D0 | IPRE_DE_D1 | IPRE_DE_D2,
+			   FIELD_PREP(IPRE_DE_D0, de_d) |
+			   FIELD_PREP(IPRE_DE_D1, de_d) |
+			   FIELD_PREP(IPRE_DE_D2, de_d));
+	histb_hdmi_phy_rmw(hdmi, PHY_DRIVER_RPRE,
+			   RPRE_CLK | RPRE_D0 | RPRE_D1 | RPRE_D2,
+			   FIELD_PREP(RPRE_CLK, drv->rsel_clk |
+				      (drv->pre_clk ? RPRE_FLAG : 0)) |
+			   FIELD_PREP(RPRE_D0, rsel_d) |
+			   FIELD_PREP(RPRE_D1, rsel_d) |
+			   FIELD_PREP(RPRE_D2, rsel_d));
+	histb_hdmi_phy_write(hdmi, PHY_RTERM_CTRL,
+			     FIELD_PREP(RT_CLK, drv->rt_clk) |
+			     FIELD_PREP(RT_D0, drv->rt_data) |
+			     FIELD_PREP(RT_D1, drv->rt_data) |
+			     FIELD_PREP(RT_D2, drv->rt_data));
+	histb_hdmi_phy_rmw(hdmi, PHY_TEST_CTRL, TEST_REG,
+			   FIELD_PREP(TEST_REG, drv->test));
+}
+
+/*
+ * 原厂 PhyTmdsSet 的次序：PHY 上电（txpll、rxsense、ldo 打开，bist 保持关）、插值码、CRG 两个分频、DPHY 软复位脉冲、等 1 ms、AFIFO 图样、环路分频、展频、驱动与终端。之后等 TX PLL 锁定（原厂不等，这里沿用 mv200 路径的判据）。进来先把四路驱动关掉：fastboot 留下的通道可能正在发。
+ */
+static int histb_hdmi_mv300_set_phy(struct histb_hdmi *hdmi,
+				    const struct histb_hdmi_phy_cfg *cfg,
+				    unsigned int khz)
+{
+	const struct histb_hdmi_mv300_drive *drv = histb_hdmi_mv300_drive(khz);
+	u32 val;
+	int ret;
+
+	if (!drv)
+		return -EINVAL;
+
+	histb_hdmi_phy_rmw(hdmi, PHY_TOP_PD, PHY_GC_PD, PHY_PD_ALL);
+	histb_hdmi_phy_rmw(hdmi, PHY_TOP_PD,
+			   PHY_PD_TXPLL | PHY_PD_RXSENSE | PHY_GC_PD_LDO |
+			   PHY_GC_PD_BIST, PHY_PD_BIST);
+	histb_hdmi_phy_rmw(hdmi, PHY_TOP_PD, PHY_DIVSEL,
+			   FIELD_PREP(PHY_DIVSEL, cfg->divsel));
+
+	ret = regmap_update_bits(hdmi->crg, CRG_HDMI_CTRL, CRG_SSC_CLK_DIV,
+				 FIELD_PREP(CRG_SSC_CLK_DIV, cfg->ssc_div));
+	if (ret)
+		return ret;
+	ret = regmap_update_bits(hdmi->crg, CRG_HDMI_PHY, CRG_TMDS_CLK_DIV,
+				 FIELD_PREP(CRG_TMDS_CLK_DIV, cfg->tmds_div));
+	if (ret)
+		return ret;
+
+	histb_hdmi_phy_rmw(hdmi, PHY_DPHY_RST, DPHY_SRST_REQ, DPHY_SRST_REQ);
+	histb_hdmi_phy_rmw(hdmi, PHY_DPHY_RST, DPHY_SRST_REQ, 0);
+	usleep_range(1000, 1200);
+
+	histb_hdmi_phy_rmw(hdmi, PHY_AFIFO_DATA_SEL, AFIFO_DATA_CLK_H,
+			   FIELD_PREP(AFIFO_DATA_CLK_H, cfg->clk_h));
+	histb_hdmi_phy_rmw(hdmi, PHY_AFIFO_CLK, AFIFO_DATA_CLK_L,
+			   FIELD_PREP(AFIFO_DATA_CLK_L, cfg->clk_l));
+	histb_hdmi_phy_rmw(hdmi, PHY_FBSSC_SET, FBSSC_SET_FB,
+			   FIELD_PREP(FBSSC_SET_FB, FBSSC_LOOP_DIV_25));
+
+	histb_hdmi_mv300_set_ssc(hdmi, cfg, khz);
+	histb_hdmi_mv300_set_drive(hdmi, drv);
+
+	return readl_relaxed_poll_timeout(hdmi->phy + PHY_PLL_LOCK_STATUS, val,
+					  (val & PHY_CLK_LOCK) &&
+					  (val & PHY_CLK_FB_EXIST), 100, 20000);
+}
+
+/*
+ * 原厂 PhyOeSet(1)：去加重电流为 0 的通道关掉去加重（clk 是 bit0、数据通道依次 bit1–3），终端按各通道的模式关断（模式 m 关掉该通道两位里的 3 - m 那几位，模式 3 全开），最后打开四路驱动。
+ */
+static void histb_hdmi_mv300_phy_drive_on(struct histb_hdmi *hdmi,
+					  unsigned int khz)
+{
+	const struct histb_hdmi_mv300_drive *drv = histb_hdmi_mv300_drive(khz);
+	u32 de_pd = 0, rterm_pd;
+
+	if (!drv)
+		return;
+
+	if (!drv->de_clk)
+		de_pd |= BIT(0);
+	if (!drv->de_data)
+		de_pd |= BIT(1) | BIT(2) | BIT(3);
+
+	rterm_pd = (3 - drv->rterm_mode_clk) |
+		   (3 - drv->rterm_mode_data) << 2 |
+		   (3 - drv->rterm_mode_data) << 4 |
+		   (3 - drv->rterm_mode_data) << 6;
+
+	histb_hdmi_phy_rmw(hdmi, PHY_TOP_PD,
+			   PHY_GC_PD_DE | PHY_GC_PD_RTERM | PHY_GC_PD,
+			   FIELD_PREP(PHY_GC_PD_DE, de_pd) |
+			   FIELD_PREP(PHY_GC_PD_RTERM, rterm_pd));
+}
+
+static const struct histb_hdmi_variant histb_hdmi_mv200_variant = {
+	.phy_cfgs	= histb_hdmi_phy_cfgs,
+	.num_phy_cfgs	= ARRAY_SIZE(histb_hdmi_phy_cfgs),
+	.set_phy	= histb_hdmi_set_phy,
+	.phy_drive_on	= histb_hdmi_phy_drive_on,
+	.vmux		= DMUX_NATIVE_RGB,
+	.pack_fifo	= PACK_FIFO_AUTO_RST_EN | PACK_FIFO_CK_DET_EN,
+	.avmixer	= AVMIX_HDMI_MODE | AVMIX_NULL_PKT_EN,
+	.avmute		= 0,
+	.pwd_running	= 0,
+	.product	= "Hi3798MV200 HDMI",
+};
+
+/*
+ * 发送器侧的几个字照 fastboot 出图时的读数（A-fastboot.txt），各自的原厂出处：VIDEO_DMUX_CTRL 直通（HAL_HDMI_CtrlVideoPathSet 的 4:4:4 分支，VDP 送 RGB 时同样直通）；PACK_FIFO_CTRL 保留复位值 0x7f14（原厂只写 tmds_pack_mode）；AVMIXER_CONFIG 只置 hdmi_mode（HAL_HDMI_CtrlTmdsModeSet），空包不开、bit8 保持复位值；General Control 包发 Clear_AVMUTE（CtrlAvmuteSet）；HDCP 2.2 的 MCU 一直按在复位里（只有 HDCP22_AuthStart 才放开）。
+ */
+static const struct histb_hdmi_variant histb_hdmi_mv300_variant = {
+	.phy_cfgs	= histb_hdmi_mv300_phy_cfgs,
+	.num_phy_cfgs	= ARRAY_SIZE(histb_hdmi_mv300_phy_cfgs),
+	.set_phy	= histb_hdmi_mv300_set_phy,
+	.phy_drive_on	= histb_hdmi_mv300_phy_drive_on,
+	.vmux		= DMUX_IDENTITY,
+	.pack_fifo	= FIELD_PREP_CONST(PACK_FIFO_DELAY_CNT, PACK_FIFO_DELAY_RESET) |
+			  PACK_FIFO_AUTO_RST_EN | PACK_FIFO_CK_DET_EN,
+	.avmixer	= AVMIX_HDMI_MODE | AVMIX_RESET_BIT8,
+	.avmute		= AVMUTE_CLR,
+	.pwd_running	= TX_MCU_SRST,
+	.product	= "Hi3798MV300 HDMI",
+};
+
 /*
  * A mode survives only if both halves of the clock chain accept it: the PHY has
  * a divider set for its band, and the display FPLL can synthesise the pixel
@@ -454,7 +852,7 @@ static enum drm_mode_status histb_hdmi_mode_valid(struct drm_bridge *bridge,
 {
 	struct histb_hdmi *hdmi = bridge_to_histb_hdmi(bridge);
 
-	if (!histb_hdmi_phy_cfg(mode->clock))
+	if (!histb_hdmi_phy_cfg(hdmi, mode->clock))
 		return MODE_CLOCK_RANGE;
 
 	if (mode->clock > HISTB_HDMI_MAX_KHZ)
@@ -480,13 +878,13 @@ static void histb_hdmi_color_csc(struct histb_hdmi *hdmi, bool yuv444, u32 khz)
 {
 	u32 val;
 
+	histb_hdmi_write(hdmi, VIDEO_DMUX_CTRL, hdmi->variant->vmux);
+
 	if (!yuv444) {
-		histb_hdmi_write(hdmi, VIDEO_DMUX_CTRL, DMUX_NATIVE_RGB);
 		val = CSC_MODE_RGB8;
 	} else {
 		u32 cm = khz > 27000 ? 1 : 0;
 
-		histb_hdmi_write(hdmi, VIDEO_DMUX_CTRL, DMUX_NATIVE_RGB);
 		val = ((BIT(7) | BIT(6) | cm << 4 | cm) << 4) |
 		      CSC_EN | CSC_SATURATE_EN;
 	}
@@ -499,9 +897,11 @@ static int histb_hdmi_atomic_check(struct drm_bridge *bridge,
 				   struct drm_crtc_state *crtc_state,
 				   struct drm_connector_state *conn_state)
 {
+	struct histb_hdmi *hdmi = bridge_to_histb_hdmi(bridge);
 	const struct drm_display_mode *mode = &crtc_state->mode;
 
-	if (!histb_hdmi_phy_cfg(mode->clock) || mode->clock > HISTB_HDMI_MAX_KHZ)
+	if (!histb_hdmi_phy_cfg(hdmi, mode->clock) ||
+	    mode->clock > HISTB_HDMI_MAX_KHZ)
 		return -EINVAL;
 
 	/* The converter always produces limited-range YCbCr. */
@@ -528,7 +928,7 @@ static void histb_hdmi_atomic_enable(struct drm_bridge *bridge,
 	int ret;
 
 	mode = &bridge->encoder->crtc->state->adjusted_mode;
-	cfg = histb_hdmi_phy_cfg(mode->clock);
+	cfg = histb_hdmi_phy_cfg(hdmi, mode->clock);
 	if (!cfg) {
 		drm_err(drm, "no HDMI PHY setting for %u kHz\n", mode->clock);
 		return;
@@ -565,7 +965,7 @@ static void histb_hdmi_atomic_enable(struct drm_bridge *bridge,
 	 */
 	histb_hdmi_write(hdmi, TX_PWD_RST_CTRL, TX_PWD_HELD);
 
-	ret = histb_hdmi_set_phy(hdmi, cfg);
+	ret = hdmi->variant->set_phy(hdmi, cfg, mode->clock);
 	if (ret) {
 		drm_err(drm, "HDMI PHY did not lock for %u kHz: %d\n",
 			mode->clock, ret);
@@ -595,18 +995,24 @@ static void histb_hdmi_atomic_enable(struct drm_bridge *bridge,
 	histb_hdmi_write(hdmi, VIDEO_PATH_CTRL, 0);
 	histb_hdmi_write(hdmi, HDMI_ENC_CTRL,
 			 cfg->hdmi2 ? ENC_HDMI2_ON | ENC_HDMI2_SEL : 0);
-	histb_hdmi_write(hdmi, AVMIXER_CONFIG,
-			 AVMIX_HDMI_MODE | AVMIX_NULL_PKT_EN);
-	histb_hdmi_write(hdmi, AVMUTE_CTRL, 0);
+	histb_hdmi_write(hdmi, AVMIXER_CONFIG, hdmi->variant->avmixer);
+	histb_hdmi_write(hdmi, AVMUTE_CTRL, hdmi->variant->avmute);
 
 	histb_hdmi_write(hdmi, TX_PWD_RST_CTRL,
+			 hdmi->variant->pwd_running |
 			 TX_HDMI_SRST | TX_AUD_SRST | TX_ACR_SRST |
 			 TX_AFIFO_SRST);
 	udelay(5);
-	histb_hdmi_write(hdmi, TX_PWD_RST_CTRL, 0);
-	histb_hdmi_write(hdmi, PACK_FIFO_CTRL,
-			 PACK_FIFO_AUTO_RST_EN | PACK_FIFO_CK_DET_EN);
+	histb_hdmi_write(hdmi, TX_PWD_RST_CTRL, hdmi->variant->pwd_running);
+	histb_hdmi_write(hdmi, PACK_FIFO_CTRL, hdmi->variant->pack_fifo);
 	usleep_range(1000, 2000);
+
+	/*
+	 * 原厂 HAL_HDMI_CtrlTmdsStableGet 的判据：像素时钟到 TMDS 时钟的打包 FIFO 稳定。MV300 上分频与插值不配对时它读 0，显示器那头是无信号，所以这里报出来。
+	 */
+	if (!(histb_hdmi_read(hdmi, PACK_FIFO_ST) & PACK_FIFO_PCLK2TCLK_STABLE))
+		drm_warn(drm, "HDMI pack FIFO not stable at %u kHz: %08x\n",
+			 mode->clock, histb_hdmi_read(hdmi, PACK_FIFO_ST));
 
 	/*
 	 * Push the infoframes the sink needs to interpret the lanes; without
@@ -619,10 +1025,7 @@ static void histb_hdmi_atomic_enable(struct drm_bridge *bridge,
 			drm_err(drm, "failed to update infoframes: %d\n", ret);
 	}
 
-	/* Drive the pins last: from here a sink can find a clock. */
-	histb_hdmi_phy_write(hdmi, PHY_TOP_PD,
-			     histb_hdmi_phy_read(hdmi, PHY_TOP_PD) & ~PHY_GC_PD);
-
+	hdmi->variant->phy_drive_on(hdmi, mode->clock);
 
 	return;
 
@@ -1482,6 +1885,9 @@ static int histb_hdmi_probe(struct platform_device *pdev)
 		return PTR_ERR(hdmi);
 
 	hdmi->dev = &pdev->dev;
+	hdmi->variant = device_get_match_data(&pdev->dev);
+	if (!hdmi->variant)
+		return -ENODEV;
 	platform_set_drvdata(pdev, hdmi);
 
 	ret = histb_hdmi_parse_dt(hdmi);
@@ -1501,7 +1907,7 @@ static int histb_hdmi_probe(struct platform_device *pdev)
 		BIT(DRM_OUTPUT_COLOR_FORMAT_YCBCR444);
 	hdmi->bridge.ddc = &hdmi->ddc.adapter;
 	hdmi->bridge.vendor = "HISI";
-	hdmi->bridge.product = "Hi3798MV200 HDMI";
+	hdmi->bridge.product = hdmi->variant->product;
 
 	ret = devm_drm_bridge_add(&pdev->dev, &hdmi->bridge);
 	if (ret)
@@ -1527,7 +1933,10 @@ static void histb_hdmi_remove(struct platform_device *pdev)
 }
 
 static const struct of_device_id histb_hdmi_of_table[] = {
-	{ .compatible = "hisilicon,hi3798mv200-hdmi", },
+	{ .compatible = "hisilicon,hi3798mv200-hdmi",
+	  .data = &histb_hdmi_mv200_variant, },
+	{ .compatible = "hisilicon,hi3798mv300-hdmi",
+	  .data = &histb_hdmi_mv300_variant, },
 	{ }
 };
 MODULE_DEVICE_TABLE(of, histb_hdmi_of_table);
