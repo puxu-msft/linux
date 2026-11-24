@@ -323,8 +323,12 @@ void __init __no_sanitize_address setup_arch(char **cmdline_p)
 	efi_init();
 
 	if (!efi_enabled(EFI_BOOT)) {
-		// if ((u64)_text % MIN_KIMG_ALIGN)
-		// 	pr_warn(FW_BUG "Kernel image misaligned at boot, please fix your bootloader!");
+		/*
+		 * 按头部 text_offset 放置的引导程序给出的落点，其 2 MiB 余数就是 text_offset 的余数；early_map_kernel 把物理落点的余数原样带进虚拟地址，所以按 _text 判。
+		 */
+		if ((u64)_text % MIN_KIMG_ALIGN !=
+		    CONFIG_ARM64_IMAGE_TEXT_OFFSET % MIN_KIMG_ALIGN)
+			pr_warn(FW_BUG "Kernel image misaligned at boot, please fix your bootloader!");
 		WARN_TAINT(mmu_enabled_at_boot, TAINT_FIRMWARE_WORKAROUND,
 			   FW_BUG "Booted with MMU enabled!");
 	}

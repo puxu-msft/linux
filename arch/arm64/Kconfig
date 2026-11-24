@@ -2550,6 +2550,18 @@ config CMDLINE_FORCE
 
 endchoice
 
+config ARM64_IMAGE_TEXT_OFFSET
+	hex "Image header text_offset for legacy bootloaders"
+	default 0x0
+	help
+	  写进 arm64 Image 头 text_offset 字段（Documentation/arch/arm64/booting.rst）的值。上游从 v5.8 起把它固定为 0，缺省值与上游相同。
+
+	  晶晨厂商 U-Boot（v2015.01 一代）的 booti 不看头部 flags，把内核搬到 DRAM 起点 + text_offset；为 0 时内核落进 DRAM 开头的保留区，这类板子设 0x01080000。头部 flags 的 bit3 照旧置位，按规范放置内核的引导程序把内核放在 2 MiB 对齐的基址 + 这个值处。
+
+	  值不是 2 MiB 的整数倍时，内核按这个余数落点是预期的：启动时的 "Kernel image misaligned" 告警只在实际落点的 2 MiB 余数与它不同时给出。
+
+	  拿不准就保持 0。
+
 config EFI_STUB
 	bool
 
